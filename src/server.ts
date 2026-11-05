@@ -7,6 +7,7 @@
 //   GET  /api/stream                      → WebSocket, pushes Event JSON as it happens
 //   POST /api/messages {text, reply_to?, attachments?}  → owner message: answers D-/P-/L- ids, otherwise becomes a task for `lead`
 //   GET|PUT|DELETE /api/members/<id> · POST /api/members {title, name?, about?, instructions}   local hub only for now
+//   GET|PUT|DELETE /api/routines/<name> · POST /api/routines {name, every, agent, prompt, ...}   local hub only for now
 //   GET|POST /api/plans · GET|PUT|DELETE /api/plans/<id> · POST /api/plans/<id>/{approve,pause,resume,retry,skip,cancel,continue}   local hub only for now
 //   GET|PUT|DELETE /api/projects/<id> · POST /api/projects {name, path, instructions?}   local hub only for now
 //   POST /api/uploads (multipart file)    → { url }   (the owner's images for a message: image/*, ≤ 10 MB)
@@ -22,6 +23,7 @@ import { basename, join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { accountsInfo } from "./accounts";
 import { RequestError, createMember, deleteMember, parseProfile, readMember, updateMember } from "./members";
+import { createRoutine, deleteRoutine, readRoutine, updateRoutine } from "./routines";
 import { createProject, deleteProject, listProjects, readProject, updateProject } from "./projects";
 import { type Plan, approvePlan, archivePlan, cancelPlan, continuePlan, createPlan, editSteps, listPlans, openPlans, pausePlan, readPlan, resumePlan, retryStep, skipStep, summary } from "./plans";
 import { locked, type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
@@ -259,7 +261,7 @@ export function settingsView() {
       agents: agents.map((a) => ({ id: a, ...agentRole(a), clis: allowedClis({ agent: a }, cfg), autonomy: cfg.autonomy?.agents?.[a] ?? cfg.autonomy?.level ?? "onboarding" })),
       autonomy: cfg.autonomy?.level ?? "onboarding",
       projects: listProjects(),
-      routines: (cfg.routine ?? []).map((r: any) => ({ name: r.name, desc: routineDesc(r), every: r.every, agent: r.agent, enabled: r.enabled !== false })),
+      routines: (cfg.routine ?? []).map((r: any) => ({ name: r.name, desc: routineDesc(r), every: r.every, agent: r.agent, enabled: r.enabled !== false, readonly: r.readonly === true, project: r.project, kind: r.kind })),
       max_parallel: cfg.host?.max_parallel ?? null,
       media_days: mediaDays(cfg),
     },
@@ -339,6 +341,8 @@ export async function planRoute(req: Request, id?: string, action?: string): Pro
 
 export const memberRoute = (req: Request, id?: string) =>
   recordRoute(req, id, "member", { read: readMember, create: createMember, update: updateMember, remove: (m) => deleteMember(m, loadConfig()) });
+export const routineRoute = (req: Request, id?: string) =>
+  recordRoute(req, id, "routine", { read: readRoutine, create: createRoutine, update: updateRoutine, remove: deleteRoutine });
 export const projectRoute = (req: Request, id?: string) =>
   recordRoute(req, id, "project", { read: readProject, create: (b) => createProject(b, hostName(loadConfig())), update: updateProject, remove: deleteProject });
 
@@ -552,6 +556,8 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
       if (member) return memberRoute(req, member[1]);
       const plan = url.pathname.match(/^\/api\/plans(?:\/(PL-[A-Z]?\d+)(?:\/([a-z]+))?)?$/);
       if (plan) return planRoute(req, plan[1], plan[2]);
+      const routine = url.pathname.match(/^\/api\/routines(?:\/([a-zA-Z0-9][\w-]{0,79}))?$/);
+      if (routine) return routineRoute(req, routine[1]);
       const project = url.pathname.match(/^\/api\/projects(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
       if (project) return projectRoute(req, project[1]);
       if (url.pathname === "/api/feed") return json({ events: feed(url.searchParams.get("since") ?? undefined) });

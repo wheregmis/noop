@@ -231,7 +231,7 @@ export type SettingsView = {
     agents: { id: string; title?: string; about?: string; clis: string[]; autonomy: Autonomy }[];
     projects?: Project[]; // absent from a hub that doesn't have them yet
     autonomy: Autonomy;
-    routines: { name: string; desc?: string; every: string; agent: string; enabled: boolean }[];
+    routines: { name: string; desc?: string; every: string; agent: string; enabled: boolean; readonly?: boolean; project?: string; kind?: string }[];
     max_parallel: number | null;
     media_days?: number;
   };

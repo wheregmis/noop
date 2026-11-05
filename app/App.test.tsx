@@ -1768,3 +1768,132 @@ describe("plans", () => {
     await app.waitFor("id:plans-page");
   });
 });
+
+describe("routines", () => {
+  function routines() {
+    const list = [{ name: "daily-report", desc: "Daily", every: "daily 18:00", agent: "lead", enabled: true }] as { name: string; desc?: string; every: string; agent: string; enabled: boolean; kind?: string }[];
+    const full: Record<string, Record<string, unknown>> = { "daily-report": { name: "daily-report", every: "daily 18:00", agent: "lead", project: "", prompt: "Write the report.", desc: "Daily", enabled: true, readonly: false, kind: "" }, learner: { name: "learner", every: "daily 04:00", agent: "", project: "", prompt: "", desc: "", enabled: false, readonly: false, kind: "learn" } };
+    const view = () => ({ current: {}, effective: { agents: [{ id: "lead", title: "Lead", clis: ["claude"], autonomy: "onboarding" }, { id: "writer", title: "Writer", clis: ["claude"], autonomy: "onboarding" }], projects: [{ id: "site", name: "Site", path: "/code/site", host: "mac", repo: "", instructions: "", exists: true }], autonomy: "onboarding", routines: list, max_parallel: null, media_days: 7 }, options: { clis: [["claude"]], autonomy: ["onboarding"] } });
+    const log: { creates: Record<string, unknown>[]; edits: Record<string, unknown>[]; deletes: string[] } = { creates: [], edits: [], deletes: [] };
+    const network = {
+      ...hub([]),
+      [`GET ${URL}/api/settings`]: () => ({ body: view() }),
+      [`POST ${URL}/api/routines`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        if (b.every === "soon") return { status: 400, body: { error: "Use a schedule like 30m" } };
+        log.creates.push(b);
+        list.push({ name: b.name, every: b.every, agent: b.agent, enabled: b.enabled });
+        full[b.name] = b;
+        return { body: { id: b.name, view: view() } };
+      },
+      [`GET ${URL}/api/routines/daily-report`]: () => ({ body: full["daily-report"] }),
+      [`GET ${URL}/api/routines/weekly-deps`]: () => ({ body: full["weekly-deps"] }),
+      [`GET ${URL}/api/routines/learner`]: () => ({ body: full.learner }),
+      [`PUT ${URL}/api/routines/daily-report`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        log.edits.push(b);
+        Object.assign(list[0]!, { every: b.every, enabled: b.enabled, desc: b.desc });
+        return { body: { id: "daily-report", view: view() } };
+      },
+      [`DELETE ${URL}/api/routines/weekly-deps`]: () => {
+        log.deletes.push("weekly-deps");
+        list.splice(list.findIndex((x) => x.name === "weekly-deps"), 1);
+        return { body: { id: "weekly-deps", view: view() } };
+      },
+    };
+    return { log, network, list };
+  }
+
+  test("settings creates, edits and deletes a routine", async () => {
+    const { log, network } = routines();
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network });
+    await app.press("id:settings");
+    await app.press("id:settings-tab-routines");
+    await app.waitFor("id:routine-new");
+    // create: the server's refusal keeps the dialog open
+    await app.press("id:routine-new");
+    await app.waitFor("id:routine-editor");
+    await app.type("id:routine-name", "Weekly Deps");
+    await app.clear("id:routine-every");
+    await app.type("id:routine-every", "soon");
+    await app.type("id:routine-prompt", "Check dependencies.");
+    await app.press("id:routine-agent");
+    await app.press("id:routine-agent-writer");
+    await app.press("id:routine-project");
+    await app.press("id:routine-project-site");
+    await app.press("id:routine-save");
+    await app.waitFor("Use a schedule like 30m");
+    expect(app.shows("id:routine-editor")).toBe(true);
+    await app.clear("id:routine-every");
+    await app.type("id:routine-every", "weekly MON 09:00");
+    await app.press("id:routine-readonly");
+    await app.press("id:routine-save");
+    await app.waitFor("id:routine-weekly-deps");
+    await app.waitUntil(() => !app.shows("id:routine-editor"));
+    expect(log.creates).toEqual([{ name: "weekly-deps", every: "weekly MON 09:00", agent: "writer", project: "site", prompt: "Check dependencies.", desc: "", enabled: true, readonly: true }]);
+    // edit opens with what's saved, including the prompt
+    await app.press("id:routine-edit-daily-report");
+    await app.waitFor("id:routine-editor");
+    expect(app.value("id:routine-prompt")).toBe("Write the report.");
+    expect(app.value("id:routine-every")).toBe("daily 18:00");
+    await app.press("id:routine-enabled");
+    await app.press("id:routine-save");
+    await app.waitUntil(() => log.edits.length === 1);
+    expect(log.edits[0]).toMatchObject({ name: "daily-report", enabled: false, prompt: "Write the report." });
+    // delete asks first
+    await app.press("id:routine-edit-weekly-deps");
+    await app.waitFor("id:routine-delete");
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Cancel" : null));
+    await app.press("id:routine-delete");
+    expect(log.deletes.length).toBe(0);
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Delete" : null));
+    await app.press("id:routine-delete");
+    await app.waitUntil(() => log.deletes.length === 1);
+    await app.waitUntil(() => !app.shows("id:routine-weekly-deps"));
+  });
+
+  test("a learn routine hides what doesn't apply and can still be saved", async () => {
+    const { log, network, list } = routines();
+    list[0] = { name: "learner", every: "daily 04:00", agent: "", enabled: false, kind: "learn" };
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: { ...network, [`PUT ${URL}/api/routines/learner`]: (r: { body?: string | null }) => { log.edits.push(JSON.parse(r.body!)); return { body: { id: "learner", view: { current: {}, effective: { agents: [], routines: list, autonomy: "onboarding", max_parallel: null, media_days: 7 }, options: { clis: [], autonomy: [] } } } }; } } });
+    await app.press("id:settings");
+    await app.press("id:settings-tab-routines");
+    await app.press("id:routine-edit-learner");
+    await app.waitFor("id:routine-editor");
+    expect(app.shows("id:routine-prompt")).toBe(false);
+    expect(app.shows("id:routine-readonly")).toBe(false);
+    await app.press("id:routine-save");
+    await app.waitUntil(() => log.edits.length === 1);
+  });
+
+  test("a phone creates a routine and edits one from its page; an old hub says it can't", async () => {
+    const { log, network } = routines();
+    const app = await open("./App.tsx", { storage: { ...STORAGE, "hub.notifyAsked": "1" }, width: 390, height: 844, platform: "ios", network });
+    await app.waitFor("id:composer");
+    await app.press("id:settings-top");
+    await app.waitFor("id:routine-new");
+    await app.press("id:routine-new");
+    await app.waitFor("id:routine-editor");
+    await app.type("id:routine-name", "weekly-deps");
+    await app.type("id:routine-prompt", "Check.");
+    await app.press("id:routine-save");
+    await app.waitUntil(() => log.creates.length === 1);
+    await app.waitFor("id:routine-row-weekly-deps");
+    await app.press("id:routine-row-weekly-deps");
+    await app.waitFor("id:routine-edit-weekly-deps");
+    await app.press("id:routine-edit-weekly-deps");
+    await app.waitFor("id:routine-delete");
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Delete" : null));
+    await app.press("id:routine-delete");
+    await app.waitUntil(() => log.deletes.length === 1);
+    await app.waitUntil(() => !app.shows("id:phone-routine"));
+    const old = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: { ...network, [`POST ${URL}/api/routines`]: { status: 404, body: { error: "not found" } } } });
+    await old.press("id:settings");
+    await old.press("id:settings-tab-routines");
+    await old.press("id:routine-new");
+    await old.type("id:routine-name", "x");
+    await old.type("id:routine-prompt", "y");
+    await old.press("id:routine-save");
+    await old.waitFor("Routines can only be edited on a local hub for now");
+  });
+});

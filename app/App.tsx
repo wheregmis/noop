@@ -2498,21 +2498,22 @@ function createSettings(hub: Hub) {
     d.title.set(String(m.title ?? "")); d.name.set(String(m.name ?? "")); d.about.set(String(m.about ?? "")); d.instructions.set(String(m.instructions ?? "")); d.note.set("");
     d.editing.set(id);
   }
-  /** Sends a member change; true once it's saved, else the dialog stays open with the reason. */
-  async function writeMember(method: string, path: string, body?: unknown): Promise<boolean> {
-    memberDraft.busy.set(true);
-    memberDraft.note.set("");
+  /** Sends an editor's change; true once it's saved, else the dialog stays open with the reason. */
+  const writer = (d: { busy: Signal<boolean>; note: Signal<string>; editing: Signal<string | undefined> }, localOnly: string) => async (method: string, path: string, body?: unknown): Promise<boolean> => {
+    d.busy.set(true);
+    d.note.set("");
     const r = await hub.api(method, path, body);
-    memberDraft.busy.set(false);
+    d.busy.set(false);
     if (!r.ok) {
-      memberDraft.note.set(r.status === 404 ? "Members can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
+      d.note.set(r.status === 404 ? localOnly : String(r.data.error ?? "Couldn't reach the server"));
       return false;
     }
     confirmed = r.data.view as SettingsView;
     refresh();
-    memberDraft.editing.set(undefined);
+    d.editing.set(undefined);
     return true;
-  }
+  };
+  const writeMember = writer(memberDraft, "Members can only be edited on a local hub for now");
   /** The project editor: `editing` is undefined when closed, "" for a new project, else the id being edited. */
   const projectDraft = { name: signal(""), path: signal(""), instructions: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
   function openProject(p?: Project) {
@@ -2520,21 +2521,26 @@ function createSettings(hub: Hub) {
     d.name.set(p?.name ?? ""); d.path.set(p?.path ?? ""); d.instructions.set(p?.instructions ?? ""); d.note.set("");
     d.editing.set(p?.id ?? "");
   }
-  /** Sends a project change; on success the dialog closes, else it stays open with the reason. */
-  async function writeProject(method: string, path: string, body?: unknown) {
-    const d = projectDraft;
-    d.busy.set(true);
-    d.note.set("");
-    const r = await hub.api(method, path, body);
-    d.busy.set(false);
-    if (!r.ok) return d.note.set(r.status === 404 ? "Projects can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
-    confirmed = r.data.view as SettingsView;
-    refresh();
-    d.editing.set(undefined);
+  const writeProject = writer(projectDraft, "Projects can only be edited on a local hub for now");
+  /** The routine editor: `editing` is undefined when closed, "" for a new routine, else the name being edited. */
+  const routineDraft = { name: signal(""), every: signal("daily 09:00"), agent: signal("lead"), project: signal(""), prompt: signal(""), desc: signal(""), enabled: signal(true), readonly: signal(false), kind: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
+  async function openRoutine(name = "") {
+    const d = routineDraft;
+    error.set("");
+    let m: Record<string, unknown> = {};
+    if (name) {
+      const r = await hub.api("GET", `/api/routines/${encodeURIComponent(name)}`);
+      if (!r.ok) return error.set(r.status === 404 ? "Routines can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
+      m = r.data;
+    }
+    d.name.set(String(m.name ?? "")); d.every.set(String(m.every ?? "daily 09:00")); d.agent.set(String(m.agent ?? "lead")); d.project.set(String(m.project ?? ""));
+    d.prompt.set(String(m.prompt ?? "")); d.desc.set(String(m.desc ?? "")); d.enabled.set(m.enabled !== false); d.readonly.set(m.readonly === true); d.kind.set(String(m.kind ?? "")); d.note.set("");
+    d.editing.set(name);
   }
+  const writeRoutine = writer(routineDraft, "Routines can only be edited on a local hub for now");
   /** The section the wide settings page shows (its sidebar picks it). */
   const tab = signal<SettingsTab>("notify");
-  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, projectDraft, openProject, writeProject, tab };
+  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, projectDraft, openProject, writeProject, routineDraft, openRoutine, writeRoutine, tab };
 }
 type Settings = ReturnType<typeof createSettings>;
 
@@ -2671,10 +2677,13 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
                         selected={r().every}
                         onPick={(iv) => save(patches.routine(r().name, { every: iv }))}
                       />
+                      <Btn label="Edit" kind="ghost" onPress={() => void props.settings.openRoutine(r().name)} testID={`routine-edit-${r().name}`} />
                     </View>
                   )}
                 </Each>
+                <SetRow first={!e().routines.length} label="New routine" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openRoutine()} testID="routine-new" />
               </Group>
+              <RoutineEditor settings={props.settings} />
               </If>
 
               <If when={on("parallel")}>
@@ -2952,6 +2961,105 @@ function TextArea(props: { label: string; value: string; onChange: (v: string) =
         <Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>{props.hint}</Text>
       </If>
     </View>
+  );
+}
+
+/** New / edit / delete one routine, in a dialog: what it does, who does it, and when. */
+function RoutineEditor(props: { settings: Settings; onGone?: () => void }) {
+  const { name, every, agent, project, prompt, desc, enabled, readonly, kind, editing, note, busy } = props.settings.routineDraft;
+  const eff = () => props.settings.view()?.effective;
+  const isNew = () => editing() === "";
+  const learn = () => kind() === "learn";
+  const close = () => editing.set(undefined);
+  const clean = () => name().trim().toLowerCase().replace(/\s+/g, "-");
+  const ok = () => !!clean() && !!every().trim() && (learn() || (!!prompt().trim() && !!agent())) && !busy();
+  const clear = () => note.set("");
+  const submit = () => {
+    const body = { name: clean(), every: every(), agent: agent(), project: project(), prompt: prompt(), desc: desc(), enabled: enabled(), readonly: readonly() };
+    void (isNew() ? props.settings.writeRoutine("POST", "/api/routines", body) : props.settings.writeRoutine("PUT", `/api/routines/${encodeURIComponent(editing()!)}`, body));
+  };
+  const remove = async () => {
+    const id = editing()!;
+    const r = await AlertDialog.show({
+      title: `Delete ${id}?`,
+      description: "It stops creating tasks. Anything it already started carries on. A copy moves to archive/routines/ in your data folder, where you can restore it by hand.",
+      actions: [
+        { id: "cancel", label: "Cancel", role: "cancel" },
+        { id: "delete", label: "Delete", role: "destructive" },
+      ],
+    });
+    if (r.action === "delete" && (await props.settings.writeRoutine("DELETE", `/api/routines/${encodeURIComponent(id)}`))) props.onGone?.();
+  };
+  return (
+    <Dialog
+      testID="routine-editor"
+      open={editing() !== undefined}
+      animation="fade"
+      onOpenChange={({ open }) => !open && close()}
+      backdropClass="bg-scrim"
+      style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}
+    >
+      <View style={{ width: "100%", maxWidth: 620, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: 20, paddingRight: 10, height: 56, borderBottomWidth: 0.5, borderBottomColor: surfaceEdge() }}>
+          <Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>{isNew() ? "New routine" : "Edit routine"}</Text>
+          <ToolButton icon="close" label="Close" shortcut="Esc" onPress={close} />
+        </View>
+        <Scroll style={{ flexShrink: 1 }}>
+          <View style={{ gap: 16, padding: 20 }}>
+            <Field label="Name" value={name()} onChange={(v) => { name.set(v); clear(); }} placeholder="e.g. weekly-deps" testID="routine-name" autoFocus={isNew()} />
+            <Field label="Schedule" value={every()} onChange={(v) => { every.set(v); clear(); }} placeholder="e.g. daily 09:00" testID="routine-every" hint="30m, hourly, daily 09:00, weekdays 09:00 or weekly MON 09:00, in this machine's time. Frequent routines use more quota." />
+            <If when={!learn()} else={<Text style={{ fontSize: 13.5, lineHeight: 19, color: colors.muted }}>This routine learns from each machine's local Claude and Codex sessions, so it has no member or instructions to set.</Text>}>
+              <>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <Dropdown
+                    testID="routine-agent"
+                    label="Member"
+                    value={eff()?.agents.find((a) => a.id === agent())?.title ?? (agent() || "Choose")}
+                    options={(eff()?.agents ?? []).map((a) => ({ id: a.id, label: a.title ?? a.id, testID: `routine-agent-${a.id}` }))}
+                    selected={agent()}
+                    onPick={(id) => { agent.set(id); clear(); }}
+                  />
+                  <Dropdown
+                    testID="routine-project"
+                    label="Project"
+                    value={eff()?.projects?.find((p) => p.id === project())?.name ?? (project() || "None")}
+                    options={[{ id: "", label: "None", testID: "routine-project-none" }, ...(eff()?.projects ?? []).map((p) => ({ id: p.id, label: p.name, testID: `routine-project-${p.id}` }))]}
+                    selected={project()}
+                    onPick={(id) => { project.set(id); clear(); }}
+                  />
+                </View>
+                <TextArea label="What should it do?" testID="routine-prompt" height={140} value={prompt()} onChange={(v) => { prompt.set(v); clear(); }} placeholder="e.g. Check for outdated dependencies and report what's worth updating." />
+              </>
+            </If>
+            <Field label="Description (optional)" value={desc()} onChange={(v) => { desc.set(v); clear(); }} placeholder="Shown in the routines list" testID="routine-desc" />
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+              <Toggle testID="routine-enabled" label="On" value={enabled()} onChange={(on) => enabled.set(on)} />
+              <Text style={{ flex: 1, fontSize: 14, color: colors.text }}>On</Text>
+            </View>
+            <If when={!learn()}>
+              <View style={{ flexDirection: "row", gap: 10 }}>
+                <Toggle testID="routine-readonly" label="Only observe" value={readonly()} onChange={(on) => readonly.set(on)} />
+                <View style={{ flex: 1, gap: 2 }}>
+                  <Text style={{ fontSize: 14, color: colors.text }}>Only observe</Text>
+                  <Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>It's told to report and change nothing, so it can run without your approval. Changes it suggests come back to you as follow-ups.</Text>
+                </View>
+              </View>
+            </If>
+            <If when={note()}>
+              <Text testID="routine-note" style={{ fontSize: 13.5, lineHeight: 19, color: colors.danger }}>{note()}</Text>
+            </If>
+          </View>
+        </Scroll>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 20, paddingVertical: 16, borderTopWidth: 0.5, borderTopColor: surfaceEdge() }}>
+          <If when={!isNew()}>
+            <Btn label="Delete" kind="danger" icon="trash" onPress={() => void remove()} testID="routine-delete" />
+          </If>
+          <View style={{ flex: 1 }} />
+          <Btn label="Cancel" kind="ghost" onPress={close} testID="routine-cancel" />
+          <Btn label={isNew() ? "Add" : "Save"} kind="primary" disabled={!ok()} busy={busy()} onPress={submit} testID="routine-save" />
+        </View>
+      </View>
+    </Dialog>
   );
 }
 
@@ -3357,7 +3465,9 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
                   />
                 )}
               </Each>
+              <SetRow first={!e().routines.length} label="New routine" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openRoutine()} testID="routine-new" />
             </Section>
+            <RoutineEditor settings={props.settings} />
             <Section title="Parallel" hint="Tasks each machine runs at once, 1 to 32.">
               <SetRow
                 first
@@ -3490,7 +3600,7 @@ function PhoneMember(props: { id: string; settings: Settings; onGone: () => void
 }
 
 /** A routine on a phone: on or off, and how often. */
-function PhoneRoutine(props: { name: string; settings: Settings }) {
+function PhoneRoutine(props: { name: string; settings: Settings; onGone: () => void }) {
   const { view, save } = props.settings;
   const routine = () => view()?.effective.routines.find((r) => r.name === props.name);
   return (
@@ -3505,6 +3615,10 @@ function PhoneRoutine(props: { name: string; settings: Settings }) {
                 trailing={<Toggle testID={`routine-${props.name}`} label="Enabled" value={r().enabled} onChange={(on) => save(patches.routine(props.name, { enabled: on }))} />}
               />
             </Section>
+            <Section>
+              <SetRow first label="Edit routine" chevron onPress={() => void props.settings.openRoutine(props.name)} testID={`routine-edit-${props.name}`} />
+            </Section>
+            <RoutineEditor settings={props.settings} onGone={props.onGone} />
             <Section title="Run interval">
               <Choices
                 label="Run interval"
@@ -4727,7 +4841,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
         );
       case "notify": return <PhoneNotify push={push} settings={settings} />;
       case "member": return <PhoneMember id={r.id} settings={settings} onGone={() => nav.pop()} />;
-      case "routine": return <PhoneRoutine name={r.routine} settings={settings} />;
+      case "routine": return <PhoneRoutine name={r.routine} settings={settings} onGone={() => nav.pop()} />;
       case "rules": return <RulesList hub={hub} onOpen={(path) => nav.push({ name: "doc", path })} />;
       case "doc": return <RuleDoc hub={hub} path={r.path} wide={wide()} />;
     }
