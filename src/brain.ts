@@ -10,7 +10,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { DATA, HOME_DIR, P, _commitPush, _pull, journal, locked, now, readDoc, writeDoc } from "./core";
-import { type Ev, type FileRow, type ToolStore, type WriteOp, isWrite, listDecisions, listRoutines, listProjects, listTasks, editMemoryEntry, runTool, toolsFor, writeOp } from "../cloud/src/tools";
+import { type Ev, type FileRow, type ToolStore, type WriteOp, isWrite, listDecisions, listRoutines, listPlansView, listProjects, listTasks, editMemoryEntry, runTool, toolsFor, writeOp } from "../cloud/src/tools";
 
 // ---------------------------------------------------------------- the local tool store (the data repo on this machine)
 
@@ -22,7 +22,7 @@ export function localStore(o: { acts: Acts; status: () => any; feed: () => { ts:
   const row = (abs: string): FileRow => ({ path: relative(root, abs).replaceAll("\\", "/"), text: readFileSync(abs, "utf8"), updated: statSync(abs).mtime.toISOString() });
   const walk = (dir: string): string[] => {
     if (!existsSync(dir)) return [];
-    return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(dir, e.name)) : e.name.endsWith(".md") || e.name.endsWith(".toml") ? [join(dir, e.name)] : []);
+    return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(dir, e.name)) : e.name.endsWith(".md") || e.name.endsWith(".toml") || /\/plans\/?$/.test(dir) && e.name.endsWith(".json") ? [join(dir, e.name)] : []);
   };
   const safe = (p: string) => !p.includes("..") && !p.startsWith("/");
   return {
@@ -176,6 +176,8 @@ How to decide:
 - Real work (code, PR review, release prep, investigation, anything that takes more than a minute): create_task with a
   clear title, project when it belongs to a connected project, and the owner's request in details (quote it; add the context that the agent needs, e.g. which PR/repo,
   and "follows" when it continues or corrects a task from the channel). Agents do the work; you never claim to do it.
+- The owner asks for a plan, or describes work in several stages they want to see first: create_plan, not create_task. More for an
+  existing plan, or "continue the X plan": continue_plan. approve_plan only when this message plainly says to approve or start it.
 - About an existing task, open or finished (corrections, "no, that's wrong", "also…", more requirements): amend_task on it with the owner's
   words, not a new task. A task is one conversation: amending a finished one reopens it under the same id. When it is
   waiting on the owner's decision card, the text answers that card. Use create_task with follows=<that task> only for
@@ -231,6 +233,7 @@ export function context(st: ToolStore, m: BrainIn): string {
     `Now: ${new Date().toISOString()}`,
     `Routines: ${listRoutines(st).map((r) => `${r.name} (${r.every ?? r.at ?? "?"}, ${r.agent}${r.enabled ? "" : ", off"})`).join("; ") || "(none)"}`,
     `Connected projects (pass the id as create_task's project when the work belongs to one):\n${listProjects(st).map((p) => `- ${p.id}: ${p.name}${p.repo ? ` (${p.repo})` : ""}`).join("\n") || "(none)"}`,
+    `Plans not yet finished:\n${listPlansView(st).filter((p) => p.status !== "done" && p.status !== "cancelled").map((p) => `- ${p.id} [${p.status}]: ${p.goal.split("\n")[0].slice(0, 100)}`).join("\n") || "(none)"}`,
     `Machines online: ${(s.hosts ?? []).filter((h: any) => h.online !== false).map((h: any) => h.host).join(", ") || "unknown"}`,
     `Open tasks:\n${open.map((t) => `- ${t.id} [${t.state}${t.agent ? `, ${t.agent}` : ""}${t.host ? ` on ${t.host}` : ""}${t.priority ? `, ${t.priority}` : ""}] ${t.title}`).join("\n") || "(none)"}`,
     `Recently finished:\n${done.map((t) => `- ${t.id} ${t.title}`).join("\n") || "(none)"}`,

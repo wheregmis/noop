@@ -20,6 +20,16 @@ fi
 if grep -q "Decision D-" <<<"$p"; then echo '```json
 {"status":"done","summary":"followed owner decision"}
 ```'
+elif grep -q "Draft the steps of this plan" <<<"$p"; then echo '```json
+{"status":"done","summary":"three steps","followups":[{"title":"PLANSTEP one","body":"first","agent":"lead"},{"title":"PLANSTEP two","agent":"reviewer"},{"title":"PLANSTEP three","agent":"lead"}]}
+```'
+elif grep -q "^# Task T-[0-9]*: PLANSTEP" <<<"$p"; then
+  n=$(grep -m1 -oE "^# Task T-[0-9]*: PLANSTEP [a-z]+" <<<"$p" | awk '{print $NF}'); printf '%s' "$p" > "$(dirname "$0")/prompt-$n.txt"
+  if [ "$n" = two ] && [ ! -e "$(dirname "$0")/two-failed" ]; then touch "$(dirname "$0")/two-failed"; echo '```json
+{"status":"failed","summary":"step two broke"}
+```'; else echo '```json
+{"status":"done","summary":"finished '"$n"'"}
+```'; fi
 elif grep -q "^# Task T-[0-9]*: SPLIT" <<<"$p" && ! grep -q "Results from delegated subtasks" <<<"$p"; then echo '```json
 {"status":"delegated","summary":"split in two","followups":[{"title":"part one","agent":"reviewer"},{"title":"part two","agent":"rust-maintainer"}]}
 ```'
@@ -93,6 +103,26 @@ grep -q "^project: site" "tasks/done/$PJ.md" && grep -q "^repo: $W/site" "tasks/
 KIDS=$(grep -l "^parent: $PJ\|source: followup:$PJ" tasks/done/*.md)
 test "$(echo "$KIDS" | wc -l | tr -d ' ')" = 2
 for k in $KIDS; do grep -q "^project: site" "$k" && grep -q "^repo: $W/site" "$k" && grep -q "^host: pc" "$k"; done
+# a plan: drafted, approved, one step at a time with each seeing the last. Every tick is a fresh process, so it survives restarts
+PL=$(hub plan new "E2E plan goal" --project site | cut -d' ' -f1)
+pstat() { hub plan show "$PL" | bun -e 'const p=JSON.parse(await Bun.stdin.text()); console.log(p.status, p.steps.map((s)=>s.status).join(","))'; }
+tick_until 'pstat | grep -q "^review"'
+test "$(pstat)" = "review pending,pending,pending"
+hub plan approve "$PL" >/dev/null
+tick_until 'test -f "$W/prompt-one.txt" && pstat | grep -q "done,"'
+tick_until 'pstat | grep -q "^done"'
+test "$(pstat)" = "done done,done,done"
+grep -q "\[YOUR STEP\] PLANSTEP one" "$W/prompt-one.txt"
+grep -q "\[done\] PLANSTEP one" "$W/prompt-three.txt" && grep -q "Result: finished one" "$W/prompt-three.txt" && grep -q "Result: finished two" "$W/prompt-three.txt"
+grep -q "agent/plan-$PL" "$W/prompt-three.txt" && grep -q "SITE-RULE" "$W/prompt-three.txt"
+test -f "$W/two-failed"   # step two failed once, the engine retried it, and the plan waited instead of stopping
+test "$(grep -l "^plan: $PL" tasks/done/*.md | wc -l | tr -d ' ')" = 3
+! grep -l "^plan: $PL" tasks/inbox/*.md tasks/active/*.md 2>/dev/null
+test "$(ls tasks/done | xargs -I{} grep -l "plan_draft: $PL" tasks/done/{} | wc -l | tr -d ' ')" = 1
+# continuing goes back through the planner
+hub plan continue "$PL" also do more >/dev/null
+tick_until 'pstat | grep -q "^review"'
+test "$(pstat)" = "review done,done,done,pending,pending,pending"
 # a second host joins and mirrors the same data
 HUB_DATA="$W/w2/data" HUB_HOST=w2 bun "$SRC/src/cli.ts" init --worker http://unused --token x >/dev/null
 cmp tasks/done/T-0001.md "$W/w2/data/tasks/done/T-0001.md"

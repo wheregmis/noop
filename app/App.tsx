@@ -109,6 +109,9 @@ import {
   commandItems,
   savedCommands,
   BUILTIN_COMMANDS,
+  PLAN_STATUS,
+  type PlanInfo,
+  type PlanStepInfo,
   type Project,
   plural,
   slashQuery,
@@ -535,6 +538,7 @@ function Mark(props: { size?: number }) {
 
 /** Opens a task's page from a T-0000 in any text (set by the channel). */
 let taskLink: (id: string) => void = () => {};
+let planLink: (id: string) => void = () => {};
 
 /** A task's state from the hub's status (set by the channel), for the chips' dots. */
 let taskState: (id: string) => string | undefined = () => undefined;
@@ -544,6 +548,7 @@ const EXTENSIONS: MarkdownExtension[] = [
   // ids minted on a non-primary host carry its letter (T-M0001, D-H0002)
   { name: "task", pattern: "\\bT-[A-Z]?\\d{4}\\b" },
   { name: "item", pattern: "\\b[DP]-[A-Z]?\\d{4}\\b" },
+  { name: "plan", pattern: "\\bPL-[A-Z]?\\d{4}\\b" },
 ];
 const GH = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(pull|issues)\/(\d+)\/?$/;
 
@@ -639,6 +644,14 @@ function Custom(props: { node: TextViewCustomNode; small: boolean }) {
         <If when={st()}>
           <View style={{ cursor: "pointer", width: 6, height: 6, borderRadius: 3, backgroundColor: st()?.[1] ?? colors.muted }} />
         </If>
+        <Text style={{ ...chipText, fontFamily: MONO, fontSize: fs, lineHeight: 16, color: colors.text }}>{n.text}</Text>
+      </View>
+    );
+  }
+  if (n.name === "plan") {
+    return (
+      <View role="link" testID={`plan-chip-${n.text}`} accessibilityLabel={`Plan ${n.text}`} onPress={() => planLink(n.text!)}
+        hoverStyle={chipHover} style={{ ...chipFrame, paddingHorizontal: 7, borderRadius: 999 }}>
         <Text style={{ ...chipText, fontFamily: MONO, fontSize: fs, lineHeight: 16, color: colors.text }}>{n.text}</Text>
       </View>
     );
@@ -1187,6 +1200,286 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
   );
 }
 
+const PLANS_LOCAL_ONLY = "Plans only work on a local hub for now";
+/** Plans change as their steps run: keep asking while the page is open. */
+function poll(fn: () => void, ms = 4000) {
+  fn();
+  const timer = setInterval(fn, ms);
+  cleanup(() => clearInterval(timer));
+}
+
+/** Plans: every plan with its progress, and a new one from a goal. */
+function PlansPage(props: { hub: Hub; settings: Settings; wide: boolean; onPlan: (id: string) => void }) {
+  const plans = signal<PlanInfo[] | null>(null);
+  const error = signal("");
+  props.settings.load();
+  poll(() => void props.hub.api("GET", "/api/plans").then((r) => {
+    if (r.ok) { plans.set((r.data.plans as PlanInfo[] | undefined) ?? []); error.set(""); }
+    else error.set(r.status === 404 ? PLANS_LOCAL_ONLY : r.status ? `Couldn't load (${r.status})` : "can't reach the server");
+  }));
+  const goal = signal(""), project = signal(""), agent = signal("lead"), note = signal(""), busy = signal(false);
+  const eff = () => props.settings.view()?.effective;
+  const create = async () => {
+    busy.set(true);
+    note.set("");
+    const r = await props.hub.api("POST", "/api/plans", { goal: goal(), project: project() || undefined, agent: agent() });
+    busy.set(false);
+    if (!r.ok) return note.set(r.status === 404 ? PLANS_LOCAL_ONLY : String(r.data.error ?? "Couldn't reach the server"));
+    goal.set("");
+    props.onPlan((r.data.plan as PlanInfo).id);
+  };
+  return (
+    <Scroll testID="plans-page" style={{ flex: 1 }}>
+      <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 24, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
+        <Group title="New plan" hint="Say what you want to achieve. A member drafts the steps, and nothing runs until you approve them.">
+          <View style={{ gap: 12, padding: 16 }}>
+            <TextArea label="Goal" testID="plan-goal" height={96} value={goal()} onChange={(v) => { goal.set(v); note.set(""); }} placeholder="e.g. Add a dark mode to the website, including the settings page and emails" />
+            <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+              <Dropdown
+                testID="plan-project"
+                label="Project"
+                value={eff()?.projects?.find((p) => p.id === project())?.name ?? "None"}
+                options={[{ id: "", label: "None", testID: "plan-project-none" }, ...(eff()?.projects ?? []).map((p) => ({ id: p.id, label: p.name, testID: `plan-project-${p.id}` }))]}
+                selected={project()}
+                onPick={(id) => project.set(id)}
+              />
+              <Dropdown
+                testID="plan-agent"
+                label="Drafted by"
+                value={eff()?.agents.find((a) => a.id === agent())?.title ?? agent()}
+                options={(eff()?.agents ?? []).map((a) => ({ id: a.id, label: a.title ?? a.id, testID: `plan-agent-${a.id}` }))}
+                selected={agent()}
+                onPick={(id) => agent.set(id)}
+              />
+              <View style={{ flex: 1 }} />
+              <Btn label="Draft the steps" kind="primary" disabled={!goal().trim() || busy()} busy={busy()} onPress={() => void create()} testID="plan-create" />
+            </View>
+            <If when={note()}><Text testID="plan-note" style={{ fontSize: 13.5, lineHeight: 19, color: colors.danger }}>{note()}</Text></If>
+          </View>
+        </Group>
+        <If when={error()}><Text testID="plans-error" style={{ fontSize: 14, color: colors.danger }}>{error()}</Text></If>
+        <If when={plans()?.length}>
+          <View>
+            <Each of={plans() ?? []} key={(p) => p.id}>
+              {(p) => (
+                <View
+                  role="button"
+                  testID={`plan-${p().id}`}
+                  accessibilityLabel={`${p().id} ${p().goal}`}
+                  onPress={() => props.onPlan(p().id)}
+                  hoverStyle={hovered()}
+                  style={{ minHeight: size.row, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 10, marginHorizontal: -10, borderRadius: 7 }}
+                >
+                  <Dot tone={planTone(p().status)} />
+                  <Text style={{ fontFamily: MONO, fontSize: 12.5, color: colors.faint }}>{p().id}</Text>
+                  <Text style={{ flex: 1, fontSize: 14.5, color: colors.text, numberOfLines: 1 }}>{p().goal.split("\n")[0]}</Text>
+                  <Text style={{ fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{`${PLAN_STATUS[p().status]}${p().steps.length ? ` · ${p().steps.filter((s) => s.status === "done" || s.status === "skipped").length}/${p().steps.length}` : ""}`}</Text>
+                </View>
+              )}
+            </Each>
+          </View>
+        </If>
+      </View>
+    </Scroll>
+  );
+}
+
+const planTone = (s: PlanInfo["status"]): "run" | "wait" | "off" | "bad" | "on" => (s === "running" || s === "drafting" ? "run" : s === "review" || s === "paused" ? "wait" : s === "done" ? "on" : "off");
+const STEP_TONE: Record<PlanStepInfo["status"], "run" | "off" | "bad" | "on" | "queue"> = { pending: "queue", running: "run", done: "on", stopped: "bad", skipped: "off" };
+const STEP_LABEL: Record<PlanStepInfo["status"], string> = { pending: "Not started", running: "Running", done: "Done", stopped: "Stopped", skipped: "Skipped" };
+type DraftStep = { key: number; title: string; details: string; agent: string; checkpoint: boolean };
+
+/** One plan: its goal, its steps with where each stands, and what you can do next. */
+function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boolean; onTask: (id: string) => void; onGone: () => void }) {
+  const plan = signal<PlanInfo | null>(null);
+  const error = signal("");
+  const busy = signal(false);
+  props.settings.load();
+  const agents = () => props.settings.view()?.effective.agents ?? [];
+  const agentTitle = (id: string) => agents().find((a) => a.id === id)?.title ?? id;
+  const projectName = (id?: string) => props.settings.view()?.effective.projects?.find((p) => p.id === id)?.name ?? id;
+  /** The steps being edited; null when not editing. Polling leaves them alone. */
+  const draft = signal<DraftStep[] | null>(null);
+  let nextKey = 1;
+  const editable = (p: PlanInfo): DraftStep[] => p.steps.filter((s) => s.status === "pending").map((s) => ({ key: nextKey++, title: s.title, details: s.details, agent: s.agent, checkpoint: s.checkpoint }));
+  const continuing = signal(false), instructions = signal("");
+  let seen: PlanInfo["status"] | undefined;
+  const take = (p: PlanInfo) => {
+    if (p.status === "review" && seen !== "review") draft.set(editable(p)); // a fresh draft opens for editing
+    if (p.status !== "review" && seen === "review") draft.set(null);
+    seen = p.status;
+    plan.set(p);
+  };
+  poll(() => void props.hub.api("GET", `/api/plans/${props.id}`).then((r) => {
+    if (r.ok) { take(r.data.plan as PlanInfo); if (!busy()) error.set(""); }
+    else if (!busy()) error.set(r.status === 404 ? "This plan isn't here any more, or the hub doesn't have plans" : r.status ? `Couldn't load (${r.status})` : "can't reach the server");
+  }));
+  const act = async (method: string, path: string, body?: unknown) => {
+    busy.set(true);
+    error.set("");
+    const r = await props.hub.api(method, `/api/plans/${props.id}${path}`, body);
+    busy.set(false);
+    if (!r.ok) { error.set(String(r.data.error ?? "Couldn't reach the server")); return false; }
+    if (r.data.plan) take(r.data.plan as PlanInfo);
+    return true;
+  };
+  const sendable = () => (draft() ?? []).filter((s) => s.title.trim()).map(({ title, details, agent, checkpoint }) => ({ title, details, agent, checkpoint }));
+  const saveDraft = () => act("PUT", "", { steps: sendable() });
+  const approve = async () => { if ((await saveDraft()) && (await act("POST", "/approve"))) draft.set(null); };
+  const saveEdits = async () => { if (await saveDraft()) draft.set(null); };
+  const change = (key: number, patch: Partial<DraftStep>) => draft.update((d) => (d ?? []).map((s) => (s.key === key ? { ...s, ...patch } : s)));
+  const move = (key: number, by: number) => draft.update((d) => {
+    const list = [...(d ?? [])], i = list.findIndex((s) => s.key === key), j = i + by;
+    if (i < 0 || j < 0 || j >= list.length) return list;
+    [list[i], list[j]] = [list[j]!, list[i]!];
+    return list;
+  });
+  const submitContinue = async () => {
+    if (await act("POST", "/continue", { instructions: instructions() })) { instructions.set(""); continuing.set(false); draft.set(null); }
+  };
+  const cancelPlan = async () => {
+    const r = await AlertDialog.show({
+      title: "Cancel this plan?",
+      description: "A running step is stopped and no further steps start. Work already done stays in the project.",
+      actions: [{ id: "keep", label: "Keep it", role: "cancel" }, { id: "cancel", label: "Cancel plan", role: "destructive" }],
+    });
+    if (r.action === "cancel") await act("POST", "/cancel");
+  };
+  const remove = async () => {
+    const r = await AlertDialog.show({
+      title: "Remove this plan?",
+      description: "It leaves this list and moves to archive/plans/ in your data folder. Its tasks and any work done stay as they are.",
+      actions: [{ id: "keep", label: "Keep it", role: "cancel" }, { id: "remove", label: "Remove", role: "destructive" }],
+    });
+    if (r.action === "remove" && (await act("DELETE", ""))) props.onGone();
+  };
+  const stopped = () => plan()?.steps.find((s) => s.status === "stopped");
+  const canEdit = () => { const s = plan()?.status; return s === "running" || s === "paused"; };
+  const finishedSteps = () => (plan()?.steps ?? []).filter((s) => s.status !== "pending" || !draft());
+  return (
+    <Scroll testID="plan-page" style={{ flex: 1 }}>
+      <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 20, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
+        <If when={plan()} else={<Text style={{ fontSize: 14, color: error() ? colors.danger : colors.faint }}>{error() || "Loading…"}</Text>}>
+          {(p) => (
+            <>
+              <View style={{ gap: 8 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <Dot tone={planTone(p().status)} />
+                  <Text testID="plan-status" style={{ fontSize: 13.5, fontWeight: "600", color: colors.muted }}>{PLAN_STATUS[p().status]}</Text>
+                  <If when={p().project}><Text style={{ fontSize: 13.5, color: colors.faint }}>{`· ${projectName(p().project)}`}</Text></If>
+                </View>
+                <Text testID="plan-goal-text" style={{ fontSize: 18, lineHeight: 26, fontWeight: "600", color: colors.text }}>{p().goal}</Text>
+                <Each of={p().notes} key={(n) => n}>
+                  {(n) => <Text style={{ fontSize: 14, lineHeight: 20, color: colors.muted }}>{`Then: ${n()}`}</Text>}
+                </Each>
+                <If when={p().reason}>
+                  <Text testID="plan-reason" style={{ fontSize: 14, lineHeight: 20, color: stopped() || p().status === "review" ? colors.danger : colors.muted }}>{p().reason}</Text>
+                </If>
+                <If when={error()}><Text testID="plan-error" style={{ fontSize: 14, lineHeight: 20, color: colors.danger }}>{error()}</Text></If>
+              </View>
+
+              <If when={p().status === "drafting"}>
+                <Text testID="plan-drafting" style={{ fontSize: 14, color: colors.muted }}>{`${agentTitle(p().agent)} is drafting the steps. You'll be notified when they're ready to review.`}</Text>
+              </If>
+
+              <If when={finishedSteps().length}>
+                <Group title="Steps" hint={p().status === "running" && p().project ? "Other tasks can still run in this folder at the same time." : undefined}>
+                  <Each of={finishedSteps()} key={(s) => s.id}>
+                    {(s, i) => (
+                      <View testID={`step-${s().id}`} style={{ flexDirection: "row", gap: 10, paddingHorizontal: 16, paddingVertical: 12, borderTopWidth: i() === 0 ? 0 : 0.5, borderTopColor: surfaceEdge() }}>
+                        <View style={{ paddingTop: 7 }}><Dot tone={STEP_TONE[s().status]} /></View>
+                        <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+                          <Text style={{ fontSize: 15, lineHeight: 21, fontWeight: "500", color: s().status === "skipped" ? colors.faint : colors.text }}>{s().title}</Text>
+                          <Text style={{ fontSize: 13, color: colors.faint }}>{`${agentTitle(s().agent)} · ${STEP_LABEL[s().status]}${s().checkpoint ? " · Pauses after this step" : ""}`}</Text>
+                          <If when={s().result}><Text style={{ fontSize: 13.5, lineHeight: 19, color: colors.muted, numberOfLines: 4 }}>{s().result}</Text></If>
+                        </View>
+                        <If when={s().task}>
+                          <Btn label={s().task!} kind="ghost" onPress={() => props.onTask(s().task!)} testID={`step-task-${s().id}`} />
+                        </If>
+                      </View>
+                    )}
+                  </Each>
+                </Group>
+              </If>
+
+              <If when={draft()}>
+                <Group title={p().status === "review" ? "Steps to approve" : "Steps still to come"} hint="Edit, reorder, reassign or remove them. They run one at a time, in this order.">
+                  <Each of={draft() ?? []} key={(s) => s.key}>
+                    {(s, i) => (
+                      <View testID={`draft-step-${i()}`} style={{ gap: 8, padding: 14, borderTopWidth: i() === 0 ? 0 : 0.5, borderTopColor: surfaceEdge() }}>
+                        <Field label={`Step ${i() + 1 + (plan()?.steps.filter((x) => x.status !== "pending").length ?? 0)}`} value={s().title} onChange={(v) => change(s().key, { title: v })} testID={`draft-title-${i()}`} />
+                        <TextArea label="Details" height={72} value={s().details} onChange={(v) => change(s().key, { details: v })} testID={`draft-details-${i()}`} />
+                        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+                          <Dropdown
+                            testID={`draft-agent-${i()}`}
+                            label="Member"
+                            value={agentTitle(s().agent)}
+                            options={agents().map((a) => ({ id: a.id, label: a.title ?? a.id, testID: `draft-agent-${i()}-${a.id}` }))}
+                            selected={s().agent}
+                            onPick={(id) => change(s().key, { agent: id })}
+                          />
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                            <Toggle testID={`draft-checkpoint-${i()}`} label="Pause after this step" value={s().checkpoint} onChange={(on) => change(s().key, { checkpoint: on })} />
+                            <Text style={{ fontSize: 13.5, color: colors.muted }}>Pause after</Text>
+                          </View>
+                          <View style={{ flex: 1 }} />
+                          <ToolButton icon="arrow-up" label="Move up" onPress={() => move(s().key, -1)} />
+                          <ToolButton icon="arrow-down" label="Move down" onPress={() => move(s().key, 1)} />
+                          <ToolButton icon="trash" label="Remove step" onPress={() => draft.update((d) => (d ?? []).filter((x) => x.key !== s().key))} testID={`draft-remove-${i()}`} />
+                        </View>
+                      </View>
+                    )}
+                  </Each>
+                  <SetRow first={!(draft() ?? []).length} label="Add a step" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => draft.update((d) => [...(d ?? []), { key: nextKey++, title: "", details: "", agent: plan()?.agent ?? "lead", checkpoint: false }])} testID="draft-add" />
+                </Group>
+              </If>
+
+              <If when={continuing()}>
+                <View style={{ gap: 10 }}>
+                  <TextArea label="What should happen next?" testID="plan-instructions" height={96} value={instructions()} onChange={(v) => instructions.set(v)} placeholder="e.g. Also cover the mobile navigation" hint="The planner proposes the remaining steps, and you approve them. A running step carries on meanwhile." />
+                  <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
+                    <Btn label="Never mind" kind="ghost" onPress={() => continuing.set(false)} testID="plan-continue-cancel" />
+                    <Btn label="Draft next steps" kind="primary" disabled={!instructions().trim() || busy()} onPress={() => void submitContinue()} testID="plan-continue-send" />
+                  </View>
+                </View>
+              </If>
+
+              <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+                <If when={p().status === "review"}>
+                  <Btn label="Approve and start" kind="primary" disabled={busy() || !sendable().length} onPress={() => void approve()} testID="plan-approve" />
+                </If>
+                <If when={p().status === "running"}><Btn label="Pause" kind="secondary" disabled={busy()} onPress={() => void act("POST", "/pause")} testID="plan-pause" /></If>
+                <If when={p().status === "paused" && !stopped()}><Btn label="Resume" kind="primary" disabled={busy()} onPress={() => void act("POST", "/resume")} testID="plan-resume" /></If>
+                <If when={stopped() && p().status === "paused"}>
+                  <>
+                    <Btn label="Retry step" kind="primary" disabled={busy()} onPress={() => void act("POST", "/retry")} testID="plan-retry" />
+                    <Btn label="Skip step" kind="secondary" disabled={busy()} onPress={() => void act("POST", "/skip")} testID="plan-skip" />
+                  </>
+                </If>
+                <If when={canEdit() && !draft()}>
+                  <Btn label="Edit steps" kind="secondary" onPress={() => draft.set(editable(plan()!))} testID="plan-edit" />
+                </If>
+                <If when={canEdit() && draft()}>
+                  <>
+                    <Btn label="Save steps" kind="primary" disabled={busy()} onPress={() => void saveEdits()} testID="plan-edit-save" />
+                    <Btn label="Discard edits" kind="ghost" onPress={() => draft.set(null)} testID="plan-edit-cancel" />
+                  </>
+                </If>
+                <If when={p().status !== "drafting" && p().status !== "cancelled" && !continuing()}>
+                  <Btn label="Continue with instructions" kind="secondary" onPress={() => continuing.set(true)} testID="plan-continue" />
+                </If>
+                <View style={{ flex: 1 }} />
+                <If when={p().status === "done" || p().status === "cancelled"}><Btn label="Remove" kind="ghost" onPress={() => void remove()} testID="plan-remove" /></If>
+                <If when={p().status !== "done" && p().status !== "cancelled"}><Btn label="Cancel plan" kind="ghost" disabled={busy()} onPress={() => void cancelPlan()} testID="plan-cancel" /></If>
+              </View>
+            </>
+          )}
+        </If>
+      </View>
+    </Scroll>
+  );
+}
+
 function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
   // a task past the status snapshot's newest few is read on its own
   const older = signal<(TaskInfo & { decisions?: string[]; events?: HubEvent[] }) | null>(null);
@@ -1564,6 +1857,10 @@ function Sidebar(props: {
   onRules: () => void;
   tasks: () => boolean;
   onTasks: () => void;
+  plan: () => string | null;
+  plans: () => boolean;
+  onPlans: () => void;
+  onPlan: (id: string) => void;
   onHelp: () => void;
   onClose?: () => void;
   chrome?: boolean;
@@ -1684,6 +1981,19 @@ function Sidebar(props: {
             </Each>
           </If>
 
+          <SideRow onPress={props.onPlans} selected={props.plans()} title="Plans">
+            <Icon name="form" size={17} tint={colors.muted} />
+            <Text style={{ ...rowText(), color: colors.muted }}>Plans</Text>
+          </SideRow>
+          <Each of={s()?.plans ?? []} key={(p) => p.id}>
+            {(p) => (
+              <SideRow onPress={() => props.onPlan(p().id)} selected={props.plan() === p().id} title={p().goal}>
+                <Dot tone={p().status === "running" || p().status === "drafting" ? "run" : "wait"} />
+                <Text style={rowText()}>{p().goal.split("\n")[0]}</Text>
+                <Text style={{ flexShrink: 0, fontSize: 12.5, color: colors.faint, fontVariant: ["tabular-nums"] }}>{p().status === "review" || p().status === "paused" ? PLAN_STATUS[p().status].replace("Needs your review", "Review") : `${p().done}/${p().total}`}</Text>
+              </SideRow>
+            )}
+          </Each>
           <SideRow onPress={props.onTasks} selected={props.tasks()} title="All tasks">
             <Icon name="layers" size={17} tint={colors.muted} />
             <Text style={{ ...rowText(), color: colors.muted }}>All tasks</Text>
@@ -3402,6 +3712,8 @@ type Route =
   | { name: "channel" }
   | { name: "team" }
   | { name: "task"; id: string }
+  | { name: "plans" }
+  | { name: "plan"; id: string }
   | { name: "host"; host: string }
   | { name: "notify" }
   | { name: "member"; id: string }
@@ -3460,10 +3772,11 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   /** A task: from a machine's page it goes on top (back returns to the machine), else in place. */
   const openTask = (id: string) => {
     const t = untracked(top);
-    if (t.name === "host" || t.name === "tasks") { drawer.set(false); nav.push({ name: "task", id }); }
+    if (t.name === "host" || t.name === "tasks" || t.name === "plan") { drawer.set(false); nav.push({ name: "task", id }); }
     else show({ name: "task", id });
   };
   taskLink = openTask;
+  planLink = (id) => show({ name: "plans" }, { name: "plan", id });
   const repos = computed(() => { const m = new Map<string, string>(); for (const e of props.hub.events()) reposIn(`${e.text}\n${(e.options ?? []).join("\n")}`, m); return m; });
   knownRepos = repos;
   taskState = (id) => { const s = props.hub.status(); return [...(s?.active ?? []), ...(s?.recent ?? [])].find((t) => t.id === id)?.state ?? (s?.active.some((t) => t.id === id) ? "active" : undefined); };
@@ -3981,6 +4294,10 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       onRules={() => openRules()}
       tasks={() => top().name === "tasks"}
       onTasks={() => show({ name: "tasks" })}
+      plan={() => { const t = top(); return t.name === "plan" ? t.id : null; }}
+      plans={() => top().name === "plans"}
+      onPlans={() => show({ name: "plans" })}
+      onPlan={(id) => show({ name: "plans" }, { name: "plan", id })}
       onHelp={() => help.set(true)}
       onClose={inDrawer ? () => drawer.set(false) : undefined}
       chrome={!inDrawer}
@@ -4319,6 +4636,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       case "team": return wide() ? "Team settings" : "Settings";
       case "task": return `Task ${r.id}`;
       case "tasks": return "All tasks";
+      case "plans": return "Plans";
+      case "plan": return `Plan ${r.id}`;
       case "host": return `Machine ${r.host}`;
       case "notify": return "Notifications";
       case "member": return settings.view()?.effective.agents.find((a) => a.id === r.id)?.title ?? r.id;
@@ -4328,7 +4647,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     }
   };
   /** The back button's label, the page below's short name. */
-  const backTitle = (r: Route | undefined) => (!r ? "" : r.name === "channel" ? "Main chat" : r.name === "team" ? "Settings" : r.name === "host" ? "Machine" : r.name === "rules" ? "Memory" : r.name === "tasks" ? "All tasks" : titleOf(r));
+  const backTitle = (r: Route | undefined) => (!r ? "" : r.name === "channel" ? "Main chat" : r.name === "team" ? "Settings" : r.name === "host" ? "Machine" : r.name === "rules" ? "Memory" : r.name === "tasks" ? "All tasks" : r.name === "plans" ? "Plans" : titleOf(r));
   const below = (r: Route) => { const rs = nav.routes(); const i = rs.indexOf(r); return i > 0 ? rs[i - 1] : undefined; };
   const connPill = () => (
     <View
@@ -4394,6 +4713,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       case "channel": return channelPage();
       case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} />;
       case "tasks": return <TaskHistory hub={hub} wide={wide()} onTask={openTask} />;
+      case "plans": return <PlansPage hub={hub} settings={settings} wide={wide()} onPlan={(id) => nav.push({ name: "plan", id })} />;
+      case "plan": return <PlanPage hub={hub} settings={settings} id={r.id} wide={wide()} onTask={openTask} onGone={() => nav.pop()} />;
       case "host": return <MachineDetail hub={hub} host={r.host} wide={wide()} onTask={openTask} />;
       case "team":
         return (

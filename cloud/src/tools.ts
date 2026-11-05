@@ -19,7 +19,10 @@ export type WriteOp =
   | { tool: "reassign_task"; id: string; agent: string }
   | { tool: "remember"; text: string; file: string }
   | { tool: "edit_memory"; file: string; match: string; text: string }
-  | { tool: "answer_decision"; id: string; answer: string };
+  | { tool: "answer_decision"; id: string; answer: string }
+  | { tool: "create_plan"; goal: string; project?: string; agent?: string }
+  | { tool: "continue_plan"; id: string; instructions: string }
+  | { tool: "approve_plan"; id: string };
 
 export interface ToolStore {
   /** One data-repo file (path relative to the data root), or null. */
@@ -37,6 +40,7 @@ export interface ToolStore {
 
 export const TASK_STATES = ["inbox", "active", "waiting", "blocked", "failed", "done"] as const;
 export const TASK_ID = /^T-[\w-]*\d{4}$/, DECISION_ID = /^[DP]-[\w]*\d{4}$/;
+const PLAN_ID = /^PL-[A-Z]?\d+$/;
 export const PRIORITIES = ["urgent", "high", "normal", "low"] as const;
 type Priority = (typeof PRIORITIES)[number];
 /** Where `remember` and `edit_memory` may write: the shared memory files, or one agent's memory. */
@@ -159,6 +163,15 @@ export function listProjects(st: ToolStore) {
     return { id: f.path.slice("projects/".length, -".md".length), name: meta.name, repo: meta.repo || undefined, instructions: body.trim().slice(0, 400) || undefined };
   });
 }
+/** The owner's plans: goal, status, and each step's progress. */
+export function listPlansView(st: ToolStore) {
+  return st.list("plans/").filter((f) => /\/PL-[^/]*\.json$/.test(f.path)).flatMap((f) => {
+    try {
+      const p = JSON.parse(f.text);
+      return [{ id: p.id, goal: p.goal, status: p.status, project: p.project, reason: p.reason, steps: (p.steps ?? []).map((x: any) => ({ title: x.title, status: x.status, task: x.task })) }];
+    } catch { return []; }
+  });
+}
 /** Routines from config.toml ([[routine]] blocks): name, schedule, agent, enabled, and the first line of the prompt. */
 export function listRoutines(st: ToolStore) {
   const toml = st.read("config.toml")?.text ?? "";
@@ -254,6 +267,8 @@ export const TOOLS: Tool[] = [
     description: "Blocks until the fleet emits new events after `cursor` (or the timeout passes) and returns them. For clients that do not receive MCP notifications." },
   { name: "list_projects", title: "List projects", annotations: RO, inputSchema: obj({}),
     description: "The projects the owner connected: id, name, GitHub repo and the owner's instructions. Pass an id as create_task's project." },
+  { name: "list_plans", title: "List plans", annotations: RO, inputSchema: obj({}),
+    description: "The owner's plans: goal, status (drafting, review, running, paused, done, cancelled) and each step's progress." },
   { name: "list_agents", title: "List agents", annotations: RO, inputSchema: obj({}),
     description: "The agent roster: each agent's name, what it is for, and how much memory it keeps. Use the names with create_task/reassign_task." },
   { name: "list_routines", title: "List routines", annotations: RO, inputSchema: obj({}),
@@ -279,6 +294,15 @@ export const TOOLS: Tool[] = [
       repo: str("Optional repo that isn't a connected project, e.g. owner/repo"), agent: str("Optional agent name from list_agents (default: lead, who plans and delegates)"),
       follows: str("Optional: the task (T-…) this continues or corrects; the new task reads its result") }, ["title"]),
     description: "Hand a piece of work to the fleet. An agent picks it up, does it and reports back in the feed. Use for anything that takes more than a quick answer (code, reviews, releases, research)." },
+  { name: "create_plan", title: "Create a plan", annotations: RW, write: true,
+    inputSchema: obj({ goal: str("What the plan should achieve, in the owner's words"), project: str("Optional project id from list_projects"), agent: str("Optional member who drafts it (default: lead)") }, ["goal"]),
+    description: "Start a plan for a goal with several stages, when the owner asks for a plan or wants to review steps first. A member drafts the steps; nothing runs until the owner approves them. Use create_task for a single piece of work." },
+  { name: "continue_plan", title: "Continue a plan", annotations: RW, write: true,
+    inputSchema: obj({ id: str("A plan, e.g. PL-0001"), instructions: str("What should happen next, in the owner's words") }, ["id", "instructions"]),
+    description: "Add the owner's instructions to a plan that isn't still being drafted, even a finished one. The planner proposes the remaining steps and the owner approves them again." },
+  { name: "approve_plan", title: "Approve a plan", annotations: DESTRUCTIVE, write: true,
+    inputSchema: obj({ id: str("A plan in review, e.g. PL-0001") }, ["id"]),
+    description: "Start a reviewed plan's steps. Only when the owner has plainly said, in this message, to approve or start that plan; never on your own judgement." },
   { name: "amend_task", title: "Add to a task", annotations: RW, write: true,
     inputSchema: obj({ id: str("A task, open or finished, e.g. T-0184"), text: str("What to add or change, in the owner's words") }, ["id", "text"]),
     description: "Add the owner's follow-up to a task: an extra requirement, a correction, more context. The running agent gets it; a waiting task is woken; a finished task reopens under the same id; a task waiting on a decision card takes it as the answer." },
@@ -326,6 +350,19 @@ export function writeOp(name: string, a: any, st: ToolStore): WriteOp | string {
       if (project && !st.read(`projects/${project}.md`)) return `unknown project ${project} (see list_projects)`;
       return { tool: name, title: s(a.title).slice(0, 120), details: s(a.details).slice(0, 20_000) || undefined, repo: s(a.repo) || undefined, project: project || undefined,
         agent: agent || undefined, follows: TASK_ID.test(s(a.follows)) ? s(a.follows) : undefined };
+    }
+    case "create_plan": {
+      if (!s(a.goal)) return "goal required";
+      if (s(a.project) && !st.read(`projects/${s(a.project)}.md`)) return `unknown project ${s(a.project)} (see list_projects)`;
+      if (s(a.agent) && !st.read(`agents/${s(a.agent)}/profile.md`)) return `unknown agent ${s(a.agent)} (see list_agents)`;
+      return { tool: name, goal: s(a.goal).slice(0, 4000), project: s(a.project) || undefined, agent: s(a.agent) || undefined };
+    }
+    case "continue_plan": case "approve_plan": {
+      const id = s(a.id);
+      if (!PLAN_ID.test(id)) return "id (PL-…) required";
+      if (!st.read(`plans/${id}.json`)) return `unknown plan ${id} (see list_plans)`;
+      if (name === "approve_plan") return { tool: name, id };
+      return s(a.instructions) ? { tool: name, id, instructions: s(a.instructions).slice(0, 4000) } : "instructions required";
     }
     case "amend_task": {
       const id = s(a.id);
@@ -402,6 +439,7 @@ export async function runTool(st: ToolStore, name: string, a: any, base = ""): P
     case "list_decisions": return ok({ decisions: listDecisions(st, a.which === "closed" ? "closed" : "open", Number(a.limit) || 30) });
     case "get_feed": return ok(feedView(st, a.cursor === undefined || a.cursor === null ? undefined : Number(a.cursor), Number(a.limit) || 50));
     case "list_projects": return ok({ projects: listProjects(st) });
+    case "list_plans": return ok({ plans: listPlansView(st) });
     case "list_agents": return ok({ agents: listAgents(st) });
     case "list_routines": return ok({ routines: listRoutines(st) });
     case "read_memory": {

@@ -1572,3 +1572,199 @@ describe("projects", () => {
     await old.waitFor("Projects can only be edited on a local hub for now");
   });
 });
+
+describe("plans", () => {
+  type S = { id: string; title: string; details: string; agent: string; checkpoint: boolean; status: string; task?: string; result?: string };
+  function plans() {
+    const plan = { id: "PL-0001", goal: "Add dark mode", project: "site", agent: "lead", status: "drafting", branch: "agent/plan-PL-0001", notes: [] as string[], steps: [] as S[], reason: undefined as string | undefined };
+    const log: { creates: Record<string, unknown>[]; puts: Record<string, unknown>[]; calls: string[]; refuse: boolean } = { creates: [], puts: [], calls: [], refuse: false };
+    const list = () => (log.creates.length ? [plan] : []);
+    const settings = { current: {}, effective: { agents: [{ id: "lead", title: "Lead", clis: ["claude"], autonomy: "onboarding" }, { id: "writer", title: "Writer", clis: ["claude"], autonomy: "onboarding" }], projects: [{ id: "site", name: "Site", path: "/code/site", host: "mac", repo: "", instructions: "", exists: true }], autonomy: "onboarding", routines: [], max_parallel: null, media_days: 7 }, options: { clis: [["claude"]], autonomy: ["onboarding"] } };
+    const action = (name: string, change: () => void) => ({
+      [`POST ${URL}/api/plans/PL-0001/${name}`]: (r: { body?: string | null }) => {
+        log.calls.push(name);
+        if (log.refuse) return { status: 409, body: { error: "Plan PL-0001 is busy" } };
+        if (name === "continue") plan.notes.push(JSON.parse(r.body!).instructions);
+        change();
+        return { body: { plan } };
+      },
+    });
+    const network = {
+      ...hub([]),
+      [`GET ${URL}/api/settings`]: () => ({ body: settings }),
+      [`GET ${URL}/api/status`]: () => ({ body: { ...status, plans: list().map((p) => ({ id: p.id, goal: p.goal, status: p.status, done: 0, total: p.steps.length })) } }),
+      [`GET ${URL}/api/plans`]: () => ({ body: { plans: list() } }),
+      [`POST ${URL}/api/plans`]: (r: { body?: string | null }) => { log.creates.push(JSON.parse(r.body!)); return { body: { plan } }; },
+      [`GET ${URL}/api/plans/PL-0001`]: () => ({ body: { plan } }),
+      [`PUT ${URL}/api/plans/PL-0001`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        log.puts.push(b);
+        plan.steps = [...plan.steps.filter((s) => s.status !== "pending"), ...b.steps.map((s: Omit<S, "id" | "status">, i: number) => ({ ...s, id: `n${i}`, status: "pending" }))];
+        return { body: { plan } };
+      },
+      [`DELETE ${URL}/api/plans/PL-0001`]: () => { log.calls.push("delete"); return { body: { ok: true } }; },
+      ...action("approve", () => { plan.status = "running"; plan.steps[0]!.status = "running"; plan.steps[0]!.task = "T-0031"; }),
+      ...action("pause", () => { plan.status = "paused"; plan.reason = "Paused by you"; }),
+      ...action("resume", () => { plan.status = "running"; plan.reason = undefined; }),
+      ...action("retry", () => { plan.status = "running"; plan.reason = undefined; plan.steps[0]!.status = "running"; }),
+      ...action("skip", () => { plan.status = "running"; plan.reason = undefined; plan.steps[0]!.status = "skipped"; }),
+      ...action("continue", () => { plan.status = "drafting"; }),
+      ...action("cancel", () => { plan.status = "cancelled"; }),
+    };
+    const draft = (...titles: string[]) => {
+      plan.status = "review";
+      plan.steps = titles.map((title, i) => ({ id: `s${i + 1}`, title, details: `about ${title}`, agent: "lead", checkpoint: false, status: "pending" }));
+    };
+    return { plan, log, network, draft };
+  }
+  const desk = (network: unknown) => open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network } as never);
+
+  test("create from a goal, review and edit the steps, approve, and see it run", async () => {
+    const { plan, log, network, draft } = plans();
+    const app = await desk(network);
+    await app.press("label:Plans");
+    await app.waitFor("id:plans-page");
+    await app.type("id:plan-goal", "Add dark mode");
+    await app.press("id:plan-project");
+    await app.press("id:plan-project-site");
+    await app.press("id:plan-agent");
+    await app.press("id:plan-agent-writer");
+    await app.press("id:plan-create");
+    await app.waitFor("id:plan-page");
+    expect(log.creates).toEqual([{ goal: "Add dark mode", project: "site", agent: "writer" }]);
+    await app.waitFor("id:plan-drafting");
+    expect(app.shows("id:plan-approve")).toBe(false);
+    // the poll picks up the drafted steps, ready to edit
+    draft("Tokens", "Settings page", "Emails");
+    await app.waitFor("id:draft-title-2", { timeout: 6000 });
+    expect(app.value("id:draft-details-0")).toBe("about Tokens");
+    await app.clear("id:draft-title-0");
+    await app.type("id:draft-title-0", "Theme tokens");
+    await app.press("id:draft-remove-2");
+    await app.press("id:draft-checkpoint-1");
+    await app.press("id:draft-agent-1");
+    await app.press("id:draft-agent-1-writer");
+    await app.press("id:draft-add");
+    await app.type("id:draft-title-2", "Docs");
+    await app.press("id:plan-approve");
+    await app.waitUntil(() => log.calls.includes("approve"));
+    expect(log.puts[0]).toEqual({ steps: [
+      { title: "Theme tokens", details: "about Tokens", agent: "lead", checkpoint: false },
+      { title: "Settings page", details: "about Settings page", agent: "writer", checkpoint: true },
+      { title: "Docs", details: "", agent: "lead", checkpoint: false },
+    ] });
+    await app.waitFor("id:step-task-n0");
+    await app.waitUntil(() => !app.shows("id:draft-title-0"));
+    expect(app.shows("id:plan-pause")).toBe(true);
+    expect(plan.status).toBe("running");
+  });
+
+  test("while running: pause, resume, edit what hasn't started, open a step's task", async () => {
+    const { plan, log, network, draft } = plans();
+    log.creates.push({});
+    draft("One", "Two");
+    plan.status = "running";
+    plan.steps[0]!.status = "running";
+    plan.steps[0]!.task = "T-0001";
+    const app = await desk(network);
+    await app.press("label:Plans");
+    await app.press("id:plan-PL-0001");
+    await app.waitFor("id:plan-pause");
+    expect(app.shows("id:draft-title-0")).toBe(false);
+    await app.press("id:plan-pause");
+    await app.waitFor("id:plan-resume");
+    await app.waitFor("id:plan-reason");
+    await app.press("id:plan-resume");
+    await app.waitFor("id:plan-pause");
+    await app.press("id:plan-edit");
+    await app.waitFor("id:draft-title-0");
+    expect(app.value("id:draft-title-0")).toBe("Two");
+    await app.clear("id:draft-title-0");
+    await app.type("id:draft-title-0", "Two, better");
+    await app.press("id:plan-edit-save");
+    await app.waitUntil(() => log.puts.length === 1);
+    expect(log.puts[0]).toEqual({ steps: [{ title: "Two, better", details: "about Two", agent: "lead", checkpoint: false }] });
+    await app.press("id:step-task-s1");
+    await app.waitFor("Task T-0001");
+  });
+
+  test("a stopped step says why and offers retry or skip; refusals show", async () => {
+    const { plan, log, network, draft } = plans();
+    log.creates.push({});
+    draft("One", "Two");
+    plan.status = "paused";
+    plan.reason = "tests are red";
+    plan.steps[0]!.status = "stopped";
+    const app = await desk(network);
+    await app.press("label:Plans");
+    await app.press("id:plan-PL-0001");
+    await app.waitFor("tests are red");
+    expect(app.shows("id:plan-resume")).toBe(false);
+    log.refuse = true;
+    await app.press("id:plan-retry");
+    await app.waitFor("Plan PL-0001 is busy");
+    log.refuse = false;
+    await app.press("id:plan-skip");
+    await app.waitUntil(() => log.calls.includes("skip"));
+    await app.waitFor("id:plan-pause");
+  });
+
+  test("continue with instructions; cancel and remove ask first", async () => {
+    const { plan, log, network, draft } = plans();
+    log.creates.push({});
+    draft("One");
+    plan.status = "done";
+    plan.steps[0]!.status = "done";
+    const app = await desk(network);
+    await app.press("label:Plans");
+    await app.press("id:plan-PL-0001");
+    await app.press("id:plan-continue");
+    await app.type("id:plan-instructions", "Also mobile");
+    await app.press("id:plan-continue-send");
+    await app.waitUntil(() => plan.notes.length === 1);
+    expect(plan.notes).toEqual(["Also mobile"]);
+    await app.waitFor("id:plan-drafting");
+    app.onDialog((d) => (d.title === "Cancel this plan?" ? "Keep it" : null));
+    await app.press("id:plan-cancel");
+    expect(log.calls.includes("cancel")).toBe(false);
+    app.onDialog((d) => (d.title === "Cancel this plan?" ? "Cancel plan" : null));
+    await app.press("id:plan-cancel");
+    await app.waitUntil(() => log.calls.includes("cancel"));
+    await app.waitFor("id:plan-remove");
+    app.onDialog((d) => (d.title === "Remove this plan?" ? "Remove" : null));
+    await app.press("id:plan-remove");
+    await app.waitUntil(() => log.calls.includes("delete"));
+    await app.waitFor("id:plans-page");
+  });
+
+  test("open plans show in the sidebar and their id links from chat; an old hub says it can't", async () => {
+    const { log, network, draft } = plans();
+    log.creates.push({});
+    draft("One");
+    const app = await desk({ ...network, ...hub([], [{ id: "e9", ts: new Date().toISOString(), from: "hub", kind: "notice", text: "Plan PL-0001 is ready for your review" }]), [`GET ${URL}/api/status`]: network[`GET ${URL}/api/status`] });
+    await app.waitFor("id:plan-chip-PL-0001");
+    await app.press("id:plan-chip-PL-0001");
+    await app.waitFor("id:plan-page");
+    const old = await desk({ ...hub([]), [`GET ${URL}/api/settings`]: { status: 500 }, [`GET ${URL}/api/plans`]: { status: 404, body: { error: "not found" } } });
+    await old.press("label:Plans");
+    await old.waitFor("Plans only work on a local hub for now");
+  });
+
+  test("a phone reaches plans from the sidebar", async () => {
+    const { log, network, draft } = plans();
+    log.creates.push({});
+    draft("One");
+    const app = await open("./App.tsx", { storage: { ...STORAGE, "hub.notifyAsked": "1" }, width: 390, height: 844, platform: "ios", network } as never);
+    await app.waitFor("id:composer");
+    await app.press("label:Menu");
+    await app.press("label:Plans");
+    await app.waitFor("id:plans-page");
+    await app.press("id:plan-PL-0001");
+    await app.waitFor("id:draft-title-0");
+    await app.press("id:plan-approve");
+    await app.waitUntil(() => log.calls.includes("approve"));
+    await app.waitFor("id:plan-pause");
+    await app.back();
+    await app.waitFor("id:plans-page");
+  });
+});

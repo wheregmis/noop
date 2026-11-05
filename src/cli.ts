@@ -8,18 +8,19 @@ import {
 } from "./core";
 import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
-import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
+import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent, stopOrphanedAgent } from "./runner";
 import { writeRules } from "./rules";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { addRole, init, install, listRoles, selfUpdate } from "./setup";
+import { type Plan, advancePlans, approvePlan, continuePlan, createPlan, listPlans, pausePlan, readPlan, resumePlan, retryStep, saveDraft, skipStep, summary } from "./plans";
 import { computeMetrics } from "./metrics";
 import { collect, LEARN_PROMPT } from "./sessions";
 import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
-import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
+import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, onPlanChanged, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
 import { reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataActs, localStore, logBrain, think } from "./brain";
 import { runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
@@ -178,6 +179,10 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   await _pull();
 
   remember(agent, res.lessons, meta.id);
+  if (meta.plan_draft && res.followups?.length) { // a plan's draft: these steps wait for the owner's approval, they aren't tasks yet
+    if (saveDraft(meta.plan_draft, res.followups)) planReady(meta.plan_draft, cfg);
+    res = { ...res, status: "done", followups: [] };
+  }
   const depth = Number(meta.depth ?? 0) + 1;
   const maxDepth = cfg.fleet?.max_followup_depth ?? 4;
   const ownerWork = meta.origin === "owner" || /^owner/.test(meta.source ?? "");
@@ -408,6 +413,11 @@ async function handleFailure(meta: Record<string, string>, body: string, summary
   await notify(`Couldn't finish "${meta.title}": ${reason}. I'll follow up in the daily report; tell me if you want a different approach.`, cfg,
     { kind: "notice", ref: meta.id, from: `${agentName(meta.agent || "lead")}@${host}` });
 }
+/** The planner's steps are saved: the owner can review them. */
+function planReady(id: string, cfg: Cfg) {
+  const p = readPlan(id);
+  void notify(`Plan ${id} is ready for your review (${p.steps.filter((s) => s.status === "pending").length} steps): ${p.goal.split("\n")[0].slice(0, 120)}`, cfg, { kind: "notice", from: "hub" });
+}
 const GH_HEAVY = new Set(["dispatcher", "reviewer", "ops-watcher", "oss-triage", "release-manager"]);
 
 /** Parent tasks waiting on delegated children: when every child is finished, requeue the parent to consolidate. */
@@ -520,6 +530,7 @@ export async function tick(cfg: Cfg, background = false) {
       runRoutines(cfg, host, primary);
       reapStale(cfg, host);
       wakeParents(host, ready);
+      advancePlans({ maxAttempts: cfg.fleet?.max_attempts ?? 2, notify: (text) => { if (text) void notify(text, cfg, { kind: "notice", from: "hub" }); } });
       await proposeBatch(cfg, host);
       noteUnservable(cfg, host);
     } else reapStale(cfg, host, true);
@@ -555,11 +566,12 @@ export async function tick(cfg: Cfg, background = false) {
     const active = await claim(t, host);
     if (!active) { if (tried.has(t)) break; tried.add(t); continue; } // e.g. offline: don't spin on the same task
     running++;
-    const tid = readDoc(active).meta.id;
+    const { id: tid, plan, plan_draft } = readDoc(active).meta;
+    const planTask = plan || plan_draft;
     runningIds.add(tid);
     const job = processTask(active, cfg, host)
       .catch((e) => { console.error(e); journal(host, `💥 worker crashed on ${active}: ${e}`); })
-      .finally(() => { running--; runningIds.delete(tid); });
+      .finally(() => { running--; runningIds.delete(tid); if (planTask) wakeDaemon(); }); // a plan's next step needn't wait for the next tick
     jobs.push(job);
   }
   if (!background) await Promise.all(jobs);
@@ -711,10 +723,25 @@ async function daemon(cfg: Cfg) {
     queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
     return { ok: true, id, ...(prevFile ? { follows: prev } : {}) };
   });
+  const planOp = async (what: string, fn: () => Plan) => {
+    const p = await locked(async () => {
+      await _pull();
+      const done = fn();
+      journal(host, `🗺️ plan ${what}: ${done.id} ${done.status}`);
+      await _commitPush(`[${host}] plan ${what}`);
+      return done;
+    });
+    queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
+    return { ok: true, id: p.id, status: p.status };
+  };
+  onPlanChanged(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
   const store = localStore({
     status: hubStatus, feed: () => feed("", 2000),
     acts: {
       ...dataActs(host),
+      create_plan: (op) => planOp(`create ${op.goal.slice(0, 40)}`, () => createPlan(op)),
+      continue_plan: (op) => planOp(`continue ${op.id}`, () => continuePlan(op.id, op)),
+      approve_plan: (op) => planOp(`approve ${op.id}`, () => approvePlan(op.id)),
       // said on a task's page: it stays in that conversation, however the model read it
       create_task: async (op) => {
         const m = chatNow;
@@ -757,6 +784,7 @@ async function daemon(cfg: Cfg) {
     for (const p of list(P("tasks", "active"), /^T-.*\.md$/)) {
       const { meta, body } = readDoc(p);
       if (meta.claimed_by !== host) continue;
+      if (await stopOrphanedAgent(meta.id)) journal(host, `🧹 stopped ${meta.id}'s old agent, left running by the last daemon`);
       // the note goes in meta (shown to the agent, not to the owner as part of the request)
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, requeued: now(),
         requeue_note: `Requeued after daemon restart on ${host}; check for partial work.` }, body);
@@ -838,6 +866,7 @@ const HELP = `Noop — your own AI team
   noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--project id] [--repo ~/work/x] [-p high] [--cli claude|codex]
   noop decide D-0001 "A"      answer a decision from the terminal
   noop status                 queue / decision / accounts / resources overview
+  noop plan [...]             goals broken into approved steps: new, show, approve, pause, resume, retry, skip, continue
   noop role [add <id>]        list optional specialist roles, or add one (its routines stay off until you enable them)
   noop learn [--full] [--dry]  learn from your local Claude/Codex sessions (digest stays local; principles go to memory)
   noop metrics [days]         per-agent success, judge vs owner decisions (feeds self-evolution)
@@ -873,6 +902,20 @@ async function main() {
       writeFileSync(P("..", "restart-requested"), `${new Date().toISOString()}${force ? " force" : ""}`);
       return void console.log(force ? "noop restarts as soon as its running tasks finish"
         : "noop restarts once its running tasks finish (at most once per hour; --force to skip the limit)");
+    }
+    case "plan": {
+      const [act, id, ...more] = rest;
+      await pull();
+      try {
+        if (!act || act === "list") { for (const p of listPlans().map(summary)) console.log(`${p.id}  ${p.status.padEnd(9)} ${p.done}/${p.total}  ${p.goal.split("\n")[0]}`); return; }
+        const add = act === "new" ? parseArgs({ args: rest.slice(1), allowPositionals: true, options: { project: { type: "string" }, agent: { type: "string" } } }) : null;
+        const p = add ? createPlan({ goal: add.positionals.join(" "), ...add.values })
+          : act === "approve" ? approvePlan(id) : act === "pause" ? pausePlan(id) : act === "resume" ? resumePlan(id) : act === "retry" ? retryStep(id) : act === "skip" ? skipStep(id)
+          : act === "continue" ? continuePlan(id, { instructions: more.join(" ") }) : act === "show" ? readPlan(id) : null;
+        if (!p) { console.error("noop plan [list | new <goal> [--project id] | show|approve|pause|resume|retry|skip <id> | continue <id> <instructions>]"); process.exitCode = 1; return; }
+        await commitPush(`[${host}] plan ${act} ${p.id}`);
+        return console.log(act === "show" ? JSON.stringify(p, null, 2) : `${p.id} ${p.status}`);
+      } catch (e) { console.error((e as Error).message); process.exitCode = 1; return; }
     }
     case "role": {
       if (rest[0] !== "add") {

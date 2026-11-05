@@ -1,11 +1,12 @@
 // Builds the prompt for an agent, runs Claude Code / Codex headless, parses the structured result.
-import { existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
 import { claudeDisallowed } from "./gates";
+import { planSection } from "./plans";
 import { listProjects } from "./projects";
 
 export type Result = {
@@ -77,7 +78,7 @@ Git commits you create must carry the trailer:  Agent: ${agent}
 
 # Resource budget
 ${resourceNote}
-${projectsSection(meta)}
+${projectsSection(meta)}${planSection(meta)}
 # Task ${meta.id}: ${meta.title}
 Working directory: ${meta.repo || ROOT}   Scratch space (checkouts, worktrees, build targets): ~/.agent-hub/work — never inside the hub folder ${ROOT}, which syncs to the cloud   Host capabilities: ${meta.host_caps ?? ""}
 Priority: ${meta.priority}   Source: ${meta.source}
@@ -139,6 +140,29 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
   throw new Error(`unknown cli ${cli}`);
 }
 
+const pidFile = (tid: string) => P("logs", "pids", `${tid}.pid`);
+function notePid(tid: string, pid: number) {
+  mkdirSync(P("logs", "pids"), { recursive: true });
+  writeFileSync(pidFile(tid), String(pid));
+}
+/**
+ * A daemon that died hard can leave its agent running. Before the task runs again, stop that agent, or two would edit one
+ * folder at once. Only a process that is still an agent: its pid may have been reused since. Returns whether one was stopped.
+ */
+export async function stopOrphanedAgent(tid: string): Promise<boolean> {
+  if (!existsSync(pidFile(tid))) return false;
+  const pid = Number(readFileSync(pidFile(tid), "utf8"));
+  rmSync(pidFile(tid), { force: true });
+  const isAgent = () => {
+    try { return /\b(claude|codex)\b/.test(Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(pid)]).stdout.toString()); } catch { return false; } // /bin/ps: launchd's PATH is short
+  };
+  if (!pid || !isAgent()) return false;
+  try { process.kill(pid, "SIGTERM"); } catch { return false; }
+  for (let i = 0; i < 20 && isAgent(); i++) await Bun.sleep(250);
+  if (isAgent()) try { process.kill(pid, "SIGKILL"); } catch { /* it just went */ }
+  return true;
+}
+
 /** Running agent processes by task id (so the owner can cancel one). */
 export const agentProcs = new Map<string, { kill: (sig?: number | NodeJS.Signals) => void }>();
 
@@ -164,8 +188,8 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
     env: { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0", ...extraEnv, HUB_DATA: ROOT },
   });
   const tid = logFile.split("/").pop()!.match(/^([A-Z]-[\w]*?\d{4})-\d{10,}/)?.[1];
-  if (tid) agentProcs.set(tid, proc);
-  void proc.exited.then(() => { if (tid && agentProcs.get(tid) === proc) agentProcs.delete(tid); });
+  if (tid) { agentProcs.set(tid, proc); notePid(tid, proc.pid); }
+  void proc.exited.then(() => { if (tid && agentProcs.get(tid) === proc) { agentProcs.delete(tid); rmSync(pidFile(tid), { force: true }); } });
 
   // what the agent is doing: every chunk of output is a sign of life; Claude's stream also names each step
   const json = cmd.includes("stream-json");

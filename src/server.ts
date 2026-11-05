@@ -7,6 +7,7 @@
 //   GET  /api/stream                      → WebSocket, pushes Event JSON as it happens
 //   POST /api/messages {text, reply_to?, attachments?}  → owner message: answers D-/P-/L- ids, otherwise becomes a task for `lead`
 //   GET|PUT|DELETE /api/members/<id> · POST /api/members {title, name?, about?, instructions}   local hub only for now
+//   GET|POST /api/plans · GET|PUT|DELETE /api/plans/<id> · POST /api/plans/<id>/{approve,pause,resume,retry,skip,cancel,continue}   local hub only for now
 //   GET|PUT|DELETE /api/projects/<id> · POST /api/projects {name, path, instructions?}   local hub only for now
 //   POST /api/uploads (multipart file)    → { url }   (the owner's images for a message: image/*, ≤ 10 MB)
 //   GET  /api/status                      → queue, decisions, hosts, accounts
@@ -22,7 +23,8 @@ import type { ServerWebSocket } from "bun";
 import { accountsInfo } from "./accounts";
 import { RequestError, createMember, deleteMember, parseProfile, readMember, updateMember } from "./members";
 import { createProject, deleteProject, listProjects, readProject, updateProject } from "./projects";
-import { type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
+import { type Plan, approvePlan, archivePlan, cancelPlan, continuePlan, createPlan, editSteps, listPlans, openPlans, pausePlan, readPlan, resumePlan, retryStep, skipStep, summary } from "./plans";
+import { locked, type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
 import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "../cloud/src/uploads";
 import { readable, validPath } from "../cloud/src/files";
 import { parseTaskBody, taskHistory, taskInfo } from "../cloud/src/tools";
@@ -197,6 +199,7 @@ export function status() {
     })(),
     decisions: list(P("decisions", "open")).map((p) => { const m = readDoc(p).meta; return { id: m.id, kind: m.kind ?? "decision", question: m.question, held: !!m.held }; }),
     hosts: hostViews(active, others.filter((t) => t.state === "done" || t.state === "failed")),
+    plans: (() => { try { return openPlans().map(summary); } catch { return []; } })(),
     /** The owner's latest "update every machine" (each host reports its progress on it in `hosts[].update`). */
     update: (() => { try { return { at: String(JSON.parse(readFileSync(UPDATE_REQUEST(), "utf8")).at ?? "") }; } catch { return undefined; } })(),
   };
@@ -298,6 +301,42 @@ async function recordRoute(req: Request, id: string | undefined, kind: string, r
     throw e;
   }
 }
+let planHook: (() => void) | null = null;
+/** The daemon starts drafting and the next step right away instead of on its next tick. */
+export const onPlanChanged = (fn: () => void) => { planHook = fn; };
+const PLAN_ACTIONS: Record<string, (id: string, body: unknown) => Plan> = {
+  approve: approvePlan, pause: pausePlan, resume: resumePlan, retry: retryStep, skip: skipStep, continue: continuePlan,
+};
+/** The plans API (see docs/plans-design.md). Plans are shared with the daemon's tick, so every write takes its lock. */
+export async function planRoute(req: Request, id?: string, action?: string): Promise<Response> {
+  const write = async (what: string, fn: () => Plan): Promise<Response> => {
+    const plan = await locked(fn);
+    await settingsHook?.(`plan ${plan.id} ${what}`);
+    planHook?.();
+    return Response.json({ plan });
+  };
+  const body = () => req.json().catch(() => null);
+  try {
+    if (!id && req.method === "GET") return Response.json({ plans: listPlans() });
+    if (!id && req.method === "POST") { const b = await body(); return await write("created", () => createPlan(b)); }
+    if (id && !action && req.method === "GET") return Response.json({ plan: readPlan(id) });
+    if (id && !action && req.method === "PUT") { const b = await body(); return await write("edited", () => editSteps(id, b)); }
+    if (id && !action && req.method === "DELETE") { await locked(() => archivePlan(id)); await settingsHook?.(`plan ${id} archived`); return Response.json({ ok: true }); }
+    if (id && action === "cancel" && req.method === "POST") {
+      const { plan, tasks } = await locked(() => cancelPlan(id));
+      for (const t of tasks) await cancelTask(t);
+      await settingsHook?.(`plan ${id} cancelled`);
+      return Response.json({ plan });
+    }
+    const act = action ? PLAN_ACTIONS[action] : undefined;
+    if (id && act && req.method === "POST") { const b = await body(); return await write(action!, () => act(id, b)); }
+    return Response.json({ error: "not found" }, { status: 404 });
+  } catch (e) {
+    if (e instanceof RequestError) return Response.json({ error: e.message }, { status: e.status });
+    throw e;
+  }
+}
+
 export const memberRoute = (req: Request, id?: string) =>
   recordRoute(req, id, "member", { read: readMember, create: createMember, update: updateMember, remove: (m) => deleteMember(m, loadConfig()) });
 export const projectRoute = (req: Request, id?: string) =>
@@ -511,6 +550,8 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
       }
       const member = url.pathname.match(/^\/api\/members(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
       if (member) return memberRoute(req, member[1]);
+      const plan = url.pathname.match(/^\/api\/plans(?:\/(PL-[A-Z]?\d+)(?:\/([a-z]+))?)?$/);
+      if (plan) return planRoute(req, plan[1], plan[2]);
       const project = url.pathname.match(/^\/api\/projects(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
       if (project) return projectRoute(req, project[1]);
       if (url.pathname === "/api/feed") return json({ events: feed(url.searchParams.get("since") ?? undefined) });

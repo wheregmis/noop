@@ -28,6 +28,7 @@
 | `templates/`, `roles/` | what a new team is seeded with (routines off); optional specialists added with `noop role add` |
 | `src/cli.ts` | CLI entry and the daemon loop (`pull → routines → replies → judge → run tasks → push`) |
 | `src/members.ts` | add, edit and archive members: a member is `agents/<id>/profile.md`, whose text goes into its prompts |
+| `src/plans.ts` | plans: a goal and approved steps. Creates one task at a time and watches it, working out what to do from the files each tick (`docs/plans-design.md`) |
 | `src/projects.ts` | connected projects: `projects/<id>.md` holds a folder, its machine, its repo and instructions; a task with a project runs there |
 | `src/core.ts` | config, local paths (`HOME_DIR`), tasks, claims, journal, `locked()` |
 | `src/sync.ts` | file sync with the Worker (CAS commit, pull, merge of append-only files) |

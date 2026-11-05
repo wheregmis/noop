@@ -59,7 +59,13 @@ export type TaskInfo = {
   steps?: { day?: string; time?: string; host?: string; kind?: string; text: string }[];
 };
 
+export type PlanStepInfo = { id: string; title: string; details: string; agent: string; checkpoint: boolean; status: "pending" | "running" | "done" | "stopped" | "skipped"; task?: string; result?: string };
+export type PlanInfo = { id: string; goal: string; project?: string; agent: string; status: "drafting" | "review" | "running" | "paused" | "done" | "cancelled"; branch: string; notes: string[]; steps: PlanStepInfo[]; reason?: string };
+export type PlanSummary = { id: string; goal: string; status: PlanInfo["status"]; project?: string; reason?: string; done: number; total: number };
+/** What a plan's status says to the owner. */
+export const PLAN_STATUS: Record<PlanInfo["status"], string> = { drafting: "Drafting", review: "Needs your review", running: "Running", paused: "Paused", done: "Done", cancelled: "Cancelled" };
 export type Status = {
+  plans?: PlanSummary[]; // absent from a hub that doesn't have them yet
   tasks: Record<"proposed" | "inbox" | "active" | "blocked" | "failed" | "done", number>;
   active: TaskInfo[];
   recent?: TaskInfo[];

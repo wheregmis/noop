@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
 import { P, list, readDoc, writeDoc, ROOT } from "./core";
 import { RequestError, newId } from "./members";
+import { openPlans } from "./plans";
 
 const file = (id: string) => P("projects", `${id}.md`);
 const OPEN = ["inbox", "active", "waiting", "blocked", "proposed"];
@@ -72,6 +73,8 @@ export function deleteProject(id: string) {
   readProject(id);
   const open = OPEN.flatMap((s) => list(P("tasks", s), /^T-.*\.md$/)).map((f) => readDoc(f).meta).filter((m) => m.project === id).map((m) => m.id);
   if (open.length) throw new RequestError(409, `Can't remove yet: open tasks: ${open.join(", ")}`);
+  const plans = openPlans().filter((x) => x.project === id).map((x) => x.id);
+  if (plans.length) throw new RequestError(409, `Can't remove yet: plans: ${plans.join(", ")}`);
   mkdirSync(P("archive", "projects"), { recursive: true });
   renameSync(file(id), P("archive", "projects", `${id}-${new Date().toISOString().replace(/\W/g, "")}.md`));
 }

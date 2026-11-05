@@ -1,6 +1,7 @@
 // The team's members: each is a folder in agents/ whose profile.md is injected into its prompts. The app edits them here.
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { type Cfg, P, list, readDoc } from "./core";
+import { openPlans } from "./plans";
 
 export type MemberFields = { title: string; name: string; about: string; instructions: string };
 export class RequestError extends Error {
@@ -76,6 +77,8 @@ export function deleteBlockers(id: string, cfg: Cfg): string[] {
   const open = ["inbox", "active", "waiting", "blocked", "proposed"]
     .flatMap((s) => list(P("tasks", s), /^T-.*\.md$/)).map((f) => readDoc(f).meta).filter((m) => m.agent === id).map((m) => m.id);
   if (open.length) out.push(`open tasks: ${open.join(", ")}`);
+  const plans = openPlans().filter((p) => p.agent === id || p.steps.some((x) => x.agent === id && (x.status === "pending" || x.status === "running"))).map((p) => p.id);
+  if (plans.length) out.push(`plans: ${plans.join(", ")}`);
   return out;
 }
 
