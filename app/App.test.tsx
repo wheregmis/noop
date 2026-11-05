@@ -1354,3 +1354,121 @@ describe("commands", () => {
     expect(puts[2]).toEqual({ commands: [{ name: "today", text: "Summarize today's progress on each project into a daily report and send it to me" }] });
   });
 });
+
+describe("members", () => {
+  function members() {
+    const agent = (id: string, title: string) => ({ id, title, about: `${title} summary`, clis: ["claude"], autonomy: "onboarding" });
+    const view = () => ({ current: {}, effective: { agents: list.map((a) => agent(a.id, a.title)), autonomy: "onboarding", routines: [], max_parallel: null, media_days: 7 }, options: { clis: [["claude"], ["codex"]], autonomy: ["onboarding", "assisted", "autonomous"] } });
+    const list = [{ id: "lead", title: "Lead" }];
+    const log: { creates: Record<string, string>[]; edits: Record<string, string>[]; deletes: string[]; blockDelete: boolean } = { creates: [], edits: [], deletes: [], blockDelete: false };
+    const network = {
+      ...hub([]),
+      [`GET ${URL}/api/settings`]: () => ({ body: view() }),
+      [`POST ${URL}/api/members`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        if (b.title === "Taken (x)") return { status: 400, body: { error: "A role is one short line, without parentheses or dashes" } };
+        log.creates.push(b);
+        list.push({ id: "writer", title: b.title });
+        return { body: { id: "writer", view: view() } };
+      },
+      [`GET ${URL}/api/members/writer`]: () => ({ body: { id: "writer", title: list[1]!.title, name: "Ada", about: "words", instructions: "Write well." } }),
+      [`PUT ${URL}/api/members/writer`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        log.edits.push(b);
+        list[1]!.title = b.title;
+        return { body: { id: "writer", view: view() } };
+      },
+      [`DELETE ${URL}/api/members/writer`]: () => {
+        if (log.blockDelete) return { status: 409, body: { error: "Can't delete yet: open tasks: T-0001" } };
+        log.deletes.push("writer");
+        list.pop();
+        return { body: { id: "writer", view: view() } };
+      },
+    };
+    return { log, network };
+  }
+
+  test("settings adds, edits and deletes a member", async () => {
+    const { log, network } = members();
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network });
+    await app.press("id:settings");
+    await app.press("id:settings-tab-members");
+    await app.waitFor("id:member-lead");
+    // add: the server's refusal keeps the dialog open
+    await app.press("id:member-new");
+    await app.waitFor("id:member-editor");
+    await app.type("id:member-title", "Taken (x)");
+    await app.type("id:member-instructions", "Write well.");
+    await app.press("id:member-save");
+    await app.waitFor("id:member-note");
+    expect(app.shows("id:member-editor")).toBe(true);
+    await app.clear("id:member-title");
+    await app.type("id:member-title", "Writer");
+    await app.type("id:member-name", "Ada");
+    await app.press("id:member-save");
+    await app.waitFor("id:member-writer");
+    await app.waitUntil(() => !app.shows("id:member-editor"));
+    expect(log.creates).toEqual([{ title: "Writer", name: "Ada", about: "", instructions: "Write well." }]);
+    // edit: opens with what's saved
+    await app.press("id:member-edit-writer");
+    await app.waitFor("id:member-editor");
+    expect(app.value("id:member-instructions")).toBe("Write well.");
+    expect(app.value("id:member-name")).toBe("Ada");
+    await app.clear("id:member-title");
+    await app.type("id:member-title", "Senior Writer");
+    await app.press("id:member-save");
+    await app.waitUntil(() => log.edits.length === 1);
+    expect(log.edits[0]).toEqual({ title: "Senior Writer", name: "Ada", about: "words", instructions: "Write well." });
+    await app.waitFor("Senior Writer");
+    // delete asks first; cancelling keeps them; a refusal says why
+    await app.press("id:member-edit-writer");
+    await app.waitFor("id:member-delete");
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Cancel" : null));
+    await app.press("id:member-delete");
+    expect(log.deletes.length).toBe(0);
+    log.blockDelete = true;
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Delete" : null));
+    await app.press("id:member-delete");
+    await app.waitFor("Can't delete yet: open tasks: T-0001");
+    log.blockDelete = false;
+    await app.press("id:member-delete");
+    await app.waitUntil(() => log.deletes.length === 1);
+    await app.waitUntil(() => !app.shows("id:member-writer"));
+  });
+
+  test("on a phone: add a member, then delete them from their page and return to the list", async () => {
+    const { log, network } = members();
+    const app = await open("./App.tsx", { storage: { ...STORAGE, "hub.notifyAsked": "1" }, width: 390, height: 844, platform: "ios", network });
+    await app.waitFor("id:composer");
+    await app.press("id:settings-top");
+    await app.waitFor("id:member-new");
+    await app.press("id:member-new");
+    await app.waitFor("id:member-editor");
+    await app.type("id:member-title", "Writer");
+    await app.type("id:member-instructions", "Write well.");
+    await app.press("id:member-save");
+    await app.waitUntil(() => log.creates.length === 1);
+    await app.waitFor("id:member-writer");
+    // deleting from the member's page returns to the list
+    await app.press("id:member-writer");
+    await app.waitFor("id:phone-member");
+    await app.press("id:member-edit-writer");
+    await app.waitFor("id:member-delete");
+    app.onDialog((d) => (d.title?.startsWith("Delete") ? "Delete" : null));
+    await app.press("id:member-delete");
+    await app.waitUntil(() => log.deletes.length === 1);
+    await app.waitUntil(() => !app.shows("id:phone-member"));
+  });
+
+  test("a hub without the members API says so", async () => {
+    const { network } = members();
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: { ...network, [`POST ${URL}/api/members`]: { status: 404, body: { error: "not found" } } } });
+    await app.press("id:settings");
+    await app.press("id:settings-tab-members");
+    await app.press("id:member-new");
+    await app.type("id:member-title", "Writer");
+    await app.type("id:member-instructions", "Write well.");
+    await app.press("id:member-save");
+    await app.waitFor("Members can only be edited on a local hub for now");
+  });
+});

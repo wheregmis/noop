@@ -2173,9 +2173,38 @@ function createSettings(hub: Hub) {
   // the command being added in Commands (kept here: the settings page may be laid out again while typing)
   /** The command editor: `editing` is undefined when closed, "" for a new command, else the name being edited. */
   const commandDraft = { name: signal(""), text: signal(""), editing: signal<string | undefined>(undefined), note: signal("") };
+  /** The member editor: `editing` is undefined when closed, "" for a new member, else the id being edited. */
+  const memberDraft = { title: signal(""), name: signal(""), about: signal(""), instructions: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
+  async function openMember(id = "") {
+    const d = memberDraft;
+    error.set("");
+    let m: Record<string, unknown> = {};
+    if (id) {
+      const r = await hub.api("GET", `/api/members/${id}`);
+      if (!r.ok) return error.set(String(r.data.error ?? `Couldn't load this member (${r.status})`));
+      m = r.data;
+    }
+    d.title.set(String(m.title ?? "")); d.name.set(String(m.name ?? "")); d.about.set(String(m.about ?? "")); d.instructions.set(String(m.instructions ?? "")); d.note.set("");
+    d.editing.set(id);
+  }
+  /** Sends a member change; true once it's saved, else the dialog stays open with the reason. */
+  async function writeMember(method: string, path: string, body?: unknown): Promise<boolean> {
+    memberDraft.busy.set(true);
+    memberDraft.note.set("");
+    const r = await hub.api(method, path, body);
+    memberDraft.busy.set(false);
+    if (!r.ok) {
+      memberDraft.note.set(r.status === 404 ? "Members can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
+      return false;
+    }
+    confirmed = r.data.view as SettingsView;
+    refresh();
+    memberDraft.editing.set(undefined);
+    return true;
+  }
   /** The section the wide settings page shows (its sidebar picks it). */
   const tab = signal<SettingsTab>("notify");
-  return { view, error, saved, saving, load, save, commandDraft, tab };
+  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, tab };
 }
 type Settings = ReturnType<typeof createSettings>;
 
@@ -2236,19 +2265,14 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
           {(e) => (
             <View style={{ gap: 28 }}>
               <If when={on("members")}>
-              <Group title="Members" hint="Each role on the team. The model decides who does the work; autonomy decides how much needs your approval first.">
+              <Group title="Members" hint="Each role on the team. Instructions say how they work; the model decides who does the work; autonomy decides how much needs your approval first.">
                 <Each of={e().agents} key={(a) => a.id}>
                   {(a, i) => (
                     <View testID={`member-${a().id}`} style={{ flexDirection: props.wide ? "row" : "column", alignItems: props.wide ? "center" : "stretch", gap: 12, paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: i() === 0 ? 0 : 0.5, borderTopColor: surfaceEdge() }}>
                       <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 12 }}>
                         <Avatar from={a().id} />
                         <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
-                          <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
-                            <Text style={{ fontSize: 15.5, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{a().title ?? a().id}</Text>
-                            <If when={a().title && a().title !== a().id}>
-                              <Text style={{ fontFamily: MONO, fontSize: 12.5, color: colors.faint, numberOfLines: 1 }}>{a().id}</Text>
-                            </If>
-                          </View>
+                          <Text style={{ fontSize: 15.5, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{a().title ?? a().id}</Text>
                           <If when={a().about}>
                             <Text testID={`member-about-${a().id}`} style={{ fontSize: 13.5, lineHeight: 19, color: colors.muted, numberOfLines: 2 }}>{a().about}</Text>
                           </If>
@@ -2271,11 +2295,14 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
                           selected={a().autonomy}
                           onPick={(l) => save(patches.autonomy(a().id, l))}
                         />
+                        <Btn label="Edit" kind="ghost" onPress={() => void props.settings.openMember(a().id)} testID={`member-edit-${a().id}`} />
                       </View>
                     </View>
                   )}
                 </Each>
+                <SetRow label="New member" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openMember()} testID="member-new" />
               </Group>
+              <MemberEditor settings={props.settings} />
               </If>
 
               <If when={on("routines")}>
@@ -2515,7 +2542,6 @@ function CommandEditor(props: { settings: Settings }) {
     close();
     await save({ commands: savedCommands(view()).filter((c) => c.name !== n) });
   };
-  const focused = signal(false);
   return (
     <Dialog
       testID="command-editor"
@@ -2532,32 +2558,14 @@ function CommandEditor(props: { settings: Settings }) {
         </View>
         <View style={{ gap: 16, padding: 20 }}>
           <Field label="Name" value={name()} onChange={(v) => { name.set(v); note.set(""); }} placeholder="e.g. daily-report" testID="command-name" autoFocus={isNew()} hint={clean() ? `Type /${clean()} in the composer to use it` : "Type / and the name in the composer to use it"} />
-          <View style={{ gap: 7 }}>
-            <Text style={{ fontSize: 14, fontWeight: "600", color: colors.text }}>Message to the team</Text>
-            <Input
-              testID="command-text"
-              multiline
-              value={text()}
-              onChange={({ value }) => { text.set(value); note.set(""); }}
-              onFocus={() => focused.set(true)}
-              onBlur={() => focused.set(false)}
-              placeholder={"e.g. Summarize today's progress on each project into a daily report and send it to me,\none section per project, conclusion first."}
-              class="placeholder:text-faint"
-              style={{
-                height: 140,
-                paddingHorizontal: 14,
-                paddingVertical: 10,
-                borderRadius: radius.control,
-                borderWidth: 1,
-                borderColor: focused() ? colors.accent : colors.fieldBorder,
-                backgroundColor: colors.field,
-                fontSize: 15.5,
-                lineHeight: 23,
-                color: colors.text,
-                ...(focused() ? { outlineStyle: "solid", outlineWidth: 3, outlineColor: alpha(colors.accent, 0.12) } : {}),
-              }}
-            />
-          </View>
+          <TextArea
+            label="Message to the team"
+            testID="command-text"
+            height={140}
+            value={text()}
+            onChange={(v) => { text.set(v); note.set(""); }}
+            placeholder={"e.g. Summarize today's progress on each project into a daily report and send it to me,\none section per project, conclusion first."}
+          />
           <If when={note()}>
             <Text testID="command-note" style={{ fontSize: 13.5, color: colors.danger }}>{note()}</Text>
           </If>
@@ -2569,6 +2577,109 @@ function CommandEditor(props: { settings: Settings }) {
           <View style={{ flex: 1 }} />
           <Btn label="Cancel" kind="ghost" onPress={close} testID="command-cancel" />
           <Btn label={isNew() ? "Add" : "Save"} kind="primary" disabled={!ok()} onPress={() => void submit()} testID="command-save" />
+        </View>
+      </View>
+    </Dialog>
+  );
+}
+
+/** A labelled multi-line field. */
+function TextArea(props: { label: string; value: string; onChange: (v: string) => void; height: number; placeholder?: string; testID?: string; hint?: string }) {
+  const focused = signal(false);
+  return (
+    <View style={{ gap: 7 }}>
+      <Text style={{ fontSize: 14, fontWeight: "600", color: colors.text }}>{props.label}</Text>
+      <Input
+        testID={props.testID}
+        multiline
+        value={props.value}
+        onChange={({ value }) => props.onChange(value)}
+        onFocus={() => focused.set(true)}
+        onBlur={() => focused.set(false)}
+        placeholder={props.placeholder}
+        class="placeholder:text-faint"
+        style={{
+          height: props.height,
+          paddingHorizontal: 14,
+          paddingVertical: 10,
+          borderRadius: radius.control,
+          borderWidth: 1,
+          borderColor: focused() ? colors.accent : colors.fieldBorder,
+          backgroundColor: colors.field,
+          fontSize: 15.5,
+          lineHeight: 23,
+          color: colors.text,
+          ...(focused() ? { outlineStyle: "solid", outlineWidth: 3, outlineColor: alpha(colors.accent, 0.12) } : {}),
+        }}
+      />
+      <If when={props.hint}>
+        <Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>{props.hint}</Text>
+      </If>
+    </View>
+  );
+}
+
+/** New / edit / delete one member, in a dialog: who they are and how they work. The instructions go into every prompt they run with. */
+function MemberEditor(props: { settings: Settings; onGone?: () => void }) {
+  const { title, name, about, instructions, editing, note, busy } = props.settings.memberDraft;
+  const isNew = () => editing() === "";
+  const close = () => editing.set(undefined);
+  const ok = () => !!title().trim() && !!instructions().trim() && !busy();
+  const submit = () => {
+    const body = { title: title(), name: name(), about: about(), instructions: instructions() };
+    void (isNew() ? props.settings.writeMember("POST", "/api/members", body) : props.settings.writeMember("PUT", `/api/members/${editing()}`, body));
+  };
+  const remove = async () => {
+    const id = editing()!;
+    const r = await AlertDialog.show({
+      title: `Delete ${title() || id}?`,
+      description: "They leave the team and stop getting work. Their profile and memory move to archive/agents/ in your data folder, where you can restore them by hand.",
+      actions: [
+        { id: "cancel", label: "Cancel", role: "cancel" },
+        { id: "delete", label: "Delete", role: "destructive" },
+      ],
+    });
+    if (r.action === "delete" && (await props.settings.writeMember("DELETE", `/api/members/${id}`))) props.onGone?.();
+  };
+  return (
+    <Dialog
+      testID="member-editor"
+      open={editing() !== undefined}
+      animation="fade"
+      onOpenChange={({ open }) => !open && close()}
+      backdropClass="bg-scrim"
+      style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}
+    >
+      <View style={{ width: "100%", maxWidth: 620, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: 20, paddingRight: 10, height: 56, borderBottomWidth: 0.5, borderBottomColor: surfaceEdge() }}>
+          <Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>{isNew() ? "New member" : "Edit member"}</Text>
+          <ToolButton icon="close" label="Close" shortcut="Esc" onPress={close} />
+        </View>
+        <Scroll style={{ flexShrink: 1 }}>
+          <View style={{ gap: 16, padding: 20 }}>
+            <Field label="Role" value={title()} onChange={(v) => { title.set(v); note.set(""); }} placeholder="e.g. Backend Engineer" testID="member-title" autoFocus={isNew()} />
+            <Field label="Name (optional)" value={name()} onChange={(v) => { name.set(v); note.set(""); }} placeholder="e.g. Ada" testID="member-name" hint="Shown on their messages. Uses the role if empty." />
+            <Field label="Summary (optional)" value={about()} onChange={(v) => { about.set(v); note.set(""); }} placeholder="e.g. owns the API and database" testID="member-about" hint="One line. Other members and the chat use it to decide who should get a task." />
+            <TextArea
+              label="Instructions"
+              testID="member-instructions"
+              height={200}
+              value={instructions()}
+              onChange={(v) => { instructions.set(v); note.set(""); }}
+              placeholder={"How this member should work: what they own, how they test, when to ask you.\ne.g. Run the test suite before finishing. Never change the database schema without asking."}
+            />
+            <If when={note()}>
+              <Text testID="member-note" style={{ fontSize: 13.5, lineHeight: 19, color: colors.danger }}>{note()}</Text>
+            </If>
+          </View>
+        </Scroll>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 20, paddingVertical: 16, borderTopWidth: 0.5, borderTopColor: surfaceEdge() }}>
+          <If when={!isNew()}>
+            <Btn label="Delete" kind="danger" icon="trash" onPress={() => void remove()} testID="member-delete" />
+          </If>
+          <View style={{ flex: 1 }} />
+          <Btn label="Cancel" kind="ghost" onPress={close} testID="member-cancel" />
+          <Btn label={isNew() ? "Add" : "Save"} kind="primary" disabled={!ok()} busy={busy()} onPress={submit} testID="member-save" />
         </View>
       </View>
     </Dialog>
@@ -2786,14 +2897,14 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
       <If when={eff()} else={<Text style={{ paddingHorizontal: 32, fontSize: 14, color: colors.faint }}>{error() ? "Couldn't load settings" : "Loading…"}</Text>}>
         {(e) => (
           <View style={{ gap: 28 }}>
-            <Section title="Members" hint="Model: which to use first and which to switch to on failure or when quota runs out. Autonomy: how much needs your approval first.">
+            <Section title="Members" hint="Open a member to edit their instructions, model and autonomy.">
               <Each of={e().agents} key={(a) => a.id}>
                 {(a, i) => (
                   <SetRow
                     first={i() === 0}
                     inset={58}
                     leading={<Avatar from={a().id} />}
-                    label={a().id}
+                    label={a().title ?? a().id}
                     detail={`${cliLabel(a().clis)} · ${autonomyLabel(a().autonomy)}`}
                     chevron
                     onPress={() => props.onOpen({ name: "member", id: a().id })}
@@ -2801,7 +2912,9 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
                   />
                 )}
               </Each>
+              <SetRow label="New member" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openMember()} testID="member-new" />
             </Section>
+            <MemberEditor settings={props.settings} />
             <Section title="Routines" hint="Things the team does on its own schedule.">
               <Each of={e().routines} key={(r) => r.name}>
                 {(r, i) => (
@@ -2913,7 +3026,7 @@ function PhoneNotify(props: { push: Push; settings: Settings }) {
 }
 
 /** A member on a phone: its models and its autonomy. */
-function PhoneMember(props: { id: string; settings: Settings }) {
+function PhoneMember(props: { id: string; settings: Settings; onGone: () => void }) {
   const { view, save } = props.settings;
   const agent = () => view()?.effective.agents.find((a) => a.id === props.id);
   return (
@@ -2921,6 +3034,10 @@ function PhoneMember(props: { id: string; settings: Settings }) {
       <If when={agent()} else={<Text style={{ paddingHorizontal: 32, fontSize: 14, color: colors.faint }}>No such member</Text>}>
         {(a) => (
           <>
+            <Section hint={a().about}>
+              <SetRow first label="Role and instructions" chevron onPress={() => void props.settings.openMember(props.id)} testID={`member-edit-${props.id}`} />
+            </Section>
+            <MemberEditor settings={props.settings} onGone={props.onGone} />
             <Section title="Model" hint="Which to use first; the next one takes over on failure or when quota runs out.">
               <Choices
                 label="Model"
@@ -4086,7 +4203,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       case "tasks": return "All tasks";
       case "host": return `Machine ${r.host}`;
       case "notify": return "Notifications";
-      case "member": return r.id;
+      case "member": return settings.view()?.effective.agents.find((a) => a.id === r.id)?.title ?? r.id;
       case "routine": return r.routine;
       case "rules": return "Memory";
       case "doc": return r.path.split("/").pop()!.replace(/\.md$/i, "");
@@ -4170,7 +4287,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
           </If>
         );
       case "notify": return <PhoneNotify push={push} settings={settings} />;
-      case "member": return <PhoneMember id={r.id} settings={settings} />;
+      case "member": return <PhoneMember id={r.id} settings={settings} onGone={() => nav.pop()} />;
       case "routine": return <PhoneRoutine name={r.routine} settings={settings} />;
       case "rules": return <RulesList hub={hub} onOpen={(path) => nav.push({ name: "doc", path })} />;
       case "doc": return <RuleDoc hub={hub} path={r.path} wide={wide()} />;

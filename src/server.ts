@@ -6,6 +6,7 @@
 //   GET  /api/feed?since=<iso>            → { events: Event[] }        chat timeline (newest last)
 //   GET  /api/stream                      → WebSocket, pushes Event JSON as it happens
 //   POST /api/messages {text, reply_to?, attachments?}  → owner message: answers D-/P-/L- ids, otherwise becomes a task for `lead`
+//   GET|PUT|DELETE /api/members/<id> · POST /api/members {title, name?, about?, instructions}   local hub only for now
 //   POST /api/uploads (multipart file)    → { url }   (the owner's images for a message: image/*, ≤ 10 MB)
 //   GET  /api/status                      → queue, decisions, hosts, accounts
 //   POST /api/fleet/update               → every machine updates to the latest code; the primary redeploys the cloud
@@ -18,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { accountsInfo } from "./accounts";
+import { MemberError, createMember, deleteMember, parseProfile, readMember, updateMember } from "./members";
 import { type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
 import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "../cloud/src/uploads";
 import { readable, validPath } from "../cloud/src/files";
@@ -219,9 +221,8 @@ const ROLE: Record<string, { title: string; about: string }> = {
 
 export function agentRole(agent: string): { title?: string; about?: string } {
   const p = P("agents", agent, "profile.md");
-  const head = existsSync(p) ? (readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("# ")) ?? "") : "";
-  const m = head.match(/^#\s+(.+?)\s*(?:\(([^)]+)\))?\s*(?:\s[—–-]+\s+(.+))?$/);
-  return { title: (m?.[2] ?? ROLE[agent]?.title ?? m?.[1])?.trim(), about: (m?.[3] ?? ROLE[agent]?.about)?.trim() };
+  const f = existsSync(p) ? parseProfile(readFileSync(p, "utf8")) : null;
+  return { title: f?.title ?? ROLE[agent]?.title, about: f?.about ?? ROLE[agent]?.about };
 }
 
 /** What each built-in routine does, for the settings page (a routine's own `desc` in config.toml wins). */
@@ -275,6 +276,24 @@ export async function saveSettings(patch: Record<string, unknown>) {
   writeFileSync(P("settings.json"), JSON.stringify(next, null, 2) + "\n");
   await settingsHook?.(JSON.stringify(clean));
   return settingsView();
+}
+
+/** The members API: GET one, POST to create, PUT to edit, DELETE to archive. Writes answer with the new settings view. */
+export async function memberRoute(req: Request, id: string | undefined): Promise<Response> {
+  const changed = async (member: string, what: string) => {
+    await settingsHook?.(`member ${member} ${what}`);
+    return Response.json({ id: member, view: settingsView() });
+  };
+  try {
+    if (req.method === "GET" && id) return Response.json(readMember(id));
+    if (req.method === "POST" && !id) { const made = createMember(await req.json().catch(() => null)); return await changed(made, "added"); }
+    if (req.method === "PUT" && id) { updateMember(id, await req.json().catch(() => null)); return await changed(id, "edited"); }
+    if (req.method === "DELETE" && id) { deleteMember(id, loadConfig()); return await changed(id, "archived"); }
+    return Response.json({ error: "not found" }, { status: 404 });
+  } catch (e) {
+    if (e instanceof MemberError) return Response.json({ error: e.message }, { status: e.status });
+    throw e;
+  }
 }
 
 const ID = /^\s*([DLP]-[A-Z]?\d{4})\b[\s:：,，\-]*([\s\S]*)$/;
@@ -483,6 +502,8 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
         const f = join(MEDIA, basename(url.pathname));
         return existsSync(f) ? new Response(Bun.file(f)) : json({ error: "not found" }, 404);
       }
+      const member = url.pathname.match(/^\/api\/members(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
+      if (member) return memberRoute(req, member[1]);
       if (url.pathname === "/api/feed") return json({ events: feed(url.searchParams.get("since") ?? undefined) });
       if (url.pathname === "/api/status") return json(status());
       if (url.pathname === "/api/files/list" && req.method === "GET") {
