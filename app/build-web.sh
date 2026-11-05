@@ -17,5 +17,7 @@ mv "$TMP"/* "$OUT"
 rmdir "$TMP"
 cp web/sw.js "$OUT/sw.js"
 cp "$OUT"/icons/192.*.png "$OUT/icons/192.png"
-sed -i 's/"background_color": "[^"]*"/"background_color": "#f7f7f4"/; s/"theme_color": "[^"]*"/"theme_color": "#f7f7f4"/' "$OUT/manifest.webmanifest"
+# -i.bak: BSD sed (macOS) needs a suffix where GNU sed doesn't
+sed -i.bak 's/"background_color": "[^"]*"/"background_color": "#f7f7f4"/; s/"theme_color": "[^"]*"/"theme_color": "#f7f7f4"/' "$OUT/manifest.webmanifest"
+rm "$OUT/manifest.webmanifest.bak"
 echo "✓ added sw.js, icons/192.png, manifest colors"

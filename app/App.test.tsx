@@ -482,7 +482,7 @@ describe("channel", () => {
       storage: STORAGE, width: 1200, height: 800, platform: "macos",
       network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, recent: [nohost, ...status.recent] } } },
     });
-    await app.waitFor("Waiting for a Windows machine");
+    await app.waitFor("Needs a Windows machine");
     await app.press("label:T-0097 · Waiting for machine");
     await app.waitFor("id:task-nohost");
     expect(app.shows("id:cancel-task")).toBe(true);

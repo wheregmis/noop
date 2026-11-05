@@ -4589,7 +4589,7 @@ function App() {
             />
           }
         >
-          {(c) => <Connected config={c()} openRef={openRef} onExpired={() => forget("Your session expired. Please sign in again")} onLogout={() => forget("")} />}
+          {(c) => <Connected config={c()} openRef={openRef} onExpired={() => forget("Your session expired. Please sign in again.")} onLogout={() => forget("")} />}
         </If>
       </If>
     </View>
