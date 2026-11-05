@@ -53,3 +53,10 @@ test("a role without routines joins; an unknown or escaping id is refused", () =
   expect(() => addRole("nope")).toThrow(/no optional role/);
   expect(() => addRole("../templates")).toThrow(/no optional role/);
 });
+
+test("the machine name works with launchd's bare PATH", () => {
+  const code = 'import { machineName } from "./src/core"; console.log(machineName())';
+  const r = Bun.spawnSync([process.execPath, "-e", code], { cwd: CODE, env: { ...process.env, PATH: "/nonexistent" } });
+  expect(r.exitCode).toBe(0);
+  expect(r.stdout.toString().trim()).not.toBe("");
+});

@@ -58,9 +58,10 @@ export function loadConfig(): Cfg {
 
 let machine = "";
 /** This machine's short name. macOS's `hostname` follows the network (ip-10-0-0-1…); its LocalHostName stays put. */
+// scutil by full path: launchd's PATH doesn't include /usr/sbin.
 export function machineName(): string {
   if (machine) return machine;
-  const local = process.platform === "darwin" ? Bun.spawnSync(["scutil", "--get", "LocalHostName"]).stdout.toString().trim() : "";
+  const local = process.platform === "darwin" ? Bun.spawnSync(["/usr/sbin/scutil", "--get", "LocalHostName"]).stdout.toString().trim() : "";
   return (machine = local || hostname().split(".")[0]);
 }
 
