@@ -27,7 +27,7 @@ task("active", "T-0204", "noop app: voice input stop button on iOS", { agent: "l
 task("inbox", "T-0207", "Review nsh#831 (Select focus ring)", { agent: "reviewer", repo: "longbridge/nsh", priority: "normal" });
 task("done", "T-0186", "noop: router writes the chat acknowledgement", { agent: "lead", repo: "huacnlee/noop" }, "Done: the router model writes a one-line ack.");
 task("done", "T-0198", "gpui-kit v0.9.0 release notes", { agent: "release-manager", repo: "longbridge/gpui-kit" });
-put("decisions/open/D-0030.md", "---\nid: D-0030\ntask: T-0205\nquestion: 合并 nsh #830（iOS keyboard sync）吗？\nrecommendation: A\noptions: A: 合并 — 已在 iOS/Android 验证 | B: 先不合并 — 等 Android 再测\n---\n## Context\nreviewer 验证通过。\n");
+put("decisions/open/D-0030.md", "---\nid: D-0030\ntask: T-0205\nquestion: Merge nsh #830 (iOS keyboard sync)?\nrecommendation: A\noptions: A: Merge — verified on iOS/Android | B: Don't merge yet — wait for another Android test\n---\n## Context\nreviewer verified it.\n");
 put("journal/2026-11-03.md", "- 09:10 [huacnlee-omarchy-lb] ▶️ T-0203 started\n- 09:40 [macbook] ▶️ T-0204 started\n- 08:00 [huacnlee-omarchy-lb] ✅ T-0198 done: release notes published\n");
 put("config.toml", `[[routine]]\nname = "triage-inbound"\nevery = "30m"\nagent = "dispatcher"\nprompt = "Scan inbound signals"\n\n[[routine]]\nname = "pr-review"\nevery = "30m"\nagent = "reviewer"\nprompt = "Review open PRs on core repos"\n`);
 
@@ -36,7 +36,7 @@ const feed = [
   { id: "e2", ts: "2026-11-03T09:50:00Z", from: "lead", kind: "notice", text: "T-0203: shared tool module done, writing the brain loop" },
 ];
 const status = () => ({ hosts: [{ host: "huacnlee-omarchy-lb", online: true, running: [{ id: "T-0203" }] }, { host: "macbook", online: true, running: [{ id: "T-0204" }] }],
-  decisions: [{ id: "D-0030", question: "合并 nsh #830 吗？" }], tasks: { active: 2, inbox: 1 } });
+  decisions: [{ id: "D-0030", question: "Merge nsh #830?" }], tasks: { active: 2, inbox: 1 } });
 let did: WriteOp[] = [];
 const rec = async (op: any) => { did.push(op); return { ok: true, id: op.id ?? "T-0300" }; };
 const st = localStore({ root, status, feed: () => feed,
@@ -47,27 +47,27 @@ type Case = { name: string; text: string; chat?: string[]; replyTo?: string; ans
 const W = (w: WriteOp[], tool: string) => w.filter((x) => x.tool === tool);
 const noWrites = (_: BrainOut, w: WriteOp[]) => w.length === 0;
 const cases: Case[] = [
-  { name: "greeting", text: "早", want: "reply, no writes", expect: (o, w) => noWrites(o, w) },
-  { name: "thanks", text: "辛苦了，谢谢", want: "no writes", expect: noWrites },
+  { name: "greeting", text: "morning", want: "reply, no writes", expect: (o, w) => noWrites(o, w) },
+  { name: "thanks", text: "great work, thanks", want: "no writes", expect: noWrites },
   { name: "bare ok", text: "ok", want: "no writes, no reply", expect: (o, w) => noWrites(o, w) && !o.reply },
-  { name: "status: what's running", text: "现在在跑什么？", want: "reply mentions T-0203/T-0204, no writes", expect: (o, w) => noWrites(o, w) && /T-0203|T-0204|chat brain|voice|语音/.test(o.reply) },
-  { name: "status: one task", text: "T-0204 进展如何", want: "reply about T-0204, no writes", expect: (o, w) => noWrites(o, w) && o.reply.length > 0 },
-  { name: "remember (shared)", text: "记住：以后 PR 的截图都放到 PR 描述里", want: "remember", expect: (_, w) => W(w, "remember").length === 1 && W(w, "create_task").length === 0 },
-  { name: "remember (one agent)", text: "以后发版的 release notes 都保留 GitHub 自动生成的 New Contributors 部分，这条让 release-manager 记住", want: "remember → agents/release-manager/memory.md",
+  { name: "status: what's running", text: "what's running right now?", want: "reply mentions T-0203/T-0204, no writes", expect: (o, w) => noWrites(o, w) && /T-0203|T-0204|chat brain|voice/.test(o.reply) },
+  { name: "status: one task", text: "how is T-0204 going", want: "reply about T-0204, no writes", expect: (o, w) => noWrites(o, w) && o.reply.length > 0 },
+  { name: "remember (shared)", text: "Remember: from now on, put PR screenshots in the PR description", want: "remember", expect: (_, w) => W(w, "remember").length === 1 && W(w, "create_task").length === 0 },
+  { name: "remember (one agent)", text: "From now on, keep the auto-generated New Contributors section from GitHub in release notes; have release-manager remember this", want: "remember → agents/release-manager/memory.md",
     expect: (_, w) => W(w, "remember").some((x: any) => x.file === "agents/release-manager/memory.md") },
-  { name: "delete a memory", text: "memory/taste.md 里那条 Restrained radii 的记忆记错了，删掉", want: "edit_memory or read_memory first, no remember", expect: (_, w) => W(w, "remember").length === 0 && W(w, "create_task").length === 0 },
-  { name: "amend running task", text: "T-0204 顺便在 Android 上也验证一下", want: "amend_task T-0204", expect: (_, w) => W(w, "amend_task").some((x: any) => x.id === "T-0204") && W(w, "create_task").length === 0 },
-  { name: "amend by context", text: "语音那个，停止按钮做成方形的", chat: ["lead: T-0204: stop button wired, testing on the iOS simulator"], want: "amend_task T-0204",
+  { name: "delete a memory", text: "The Restrained radii entry in memory/taste.md is wrong, delete it", want: "edit_memory or read_memory first, no remember", expect: (_, w) => W(w, "remember").length === 0 && W(w, "create_task").length === 0 },
+  { name: "amend running task", text: "T-0204: also verify it on Android", want: "amend_task T-0204", expect: (_, w) => W(w, "amend_task").some((x: any) => x.id === "T-0204") && W(w, "create_task").length === 0 },
+  { name: "amend by context", text: "the voice one: make the stop button square", chat: ["lead: T-0204: stop button wired, testing on the iOS simulator"], want: "amend_task T-0204",
     expect: (_, w) => W(w, "amend_task").some((x: any) => x.id === "T-0204") },
-  { name: "new dev request", text: "帮我给 disktree 加一个按文件类型过滤的功能", want: "create_task (disktree)", expect: (_, w) => W(w, "create_task").length === 1 && W(w, "amend_task").length === 0 },
-  { name: "correct finished task", text: "不行，回复太长了，一句话就够", chat: ["lead: T-0186 done: the router model writes a one-line ack", "hub: 好，我去把 MCP 接上，做完给你看。"],
+  { name: "new dev request", text: "add a filter-by-file-type feature to disktree", want: "create_task (disktree)", expect: (_, w) => W(w, "create_task").length === 1 && W(w, "amend_task").length === 0 },
+  { name: "correct finished task", text: "no, the reply is too long, one sentence is enough", chat: ["lead: T-0186 done: the router model writes a one-line ack", "hub: ok, I'll wire up MCP and show you when it's done."],
     want: "create_task follows T-0186 (or amend T-0203)", expect: (_, w) => W(w, "create_task").some((x: any) => x.follows === "T-0186") || W(w, "amend_task").some((x: any) => x.id === "T-0203") },
-  { name: "decision answer in words", text: "nsh #830 那个可以合并", want: "answer_decision D-0030 A", expect: (_, w) => W(w, "answer_decision").some((x: any) => x.id === "D-0030" && /^A\b|合并/.test(x.answer)) },
-  { name: "decision amend", text: "等等，还是先等 Android 测完", answered: "D-0030", want: "answer_decision D-0030 B", expect: (_, w) => W(w, "answer_decision").some((x: any) => x.id === "D-0030" && /^B|Android|等/.test(x.answer)) },
-  { name: "cancel", text: "T-0207 不用做了", want: "cancel_task T-0207", expect: (_, w) => W(w, "cancel_task").some((x: any) => x.id === "T-0207") },
-  { name: "reprioritise", text: "nsh#831 的 review 优先处理", want: "set_priority T-0207 urgent|high", expect: (_, w) => W(w, "set_priority").some((x: any) => x.id === "T-0207" && /urgent|high/.test(x.priority)) },
-  { name: "reassign", text: "T-0207 交给 lead 来做", want: "reassign_task T-0207 lead", expect: (_, w) => W(w, "reassign_task").some((x: any) => x.id === "T-0207" && x.agent === "lead") },
-  { name: "routines question", text: "我们现在有哪些定时任务？", want: "reply lists routines, no writes", expect: (o, w) => noWrites(o, w) && /pr-review|triage/.test(o.reply) },
+  { name: "decision answer in words", text: "nsh #830 is fine to merge", want: "answer_decision D-0030 A", expect: (_, w) => W(w, "answer_decision").some((x: any) => x.id === "D-0030" && /^A\b|merge/i.test(x.answer)) },
+  { name: "decision amend", text: "wait, let's hold off until Android testing is done", answered: "D-0030", want: "answer_decision D-0030 B", expect: (_, w) => W(w, "answer_decision").some((x: any) => x.id === "D-0030" && /^B|Android|wait|hold/i.test(x.answer)) },
+  { name: "cancel", text: "T-0207 no need to do it", want: "cancel_task T-0207", expect: (_, w) => W(w, "cancel_task").some((x: any) => x.id === "T-0207") },
+  { name: "reprioritise", text: "prioritise the nsh#831 review", want: "set_priority T-0207 urgent|high", expect: (_, w) => W(w, "set_priority").some((x: any) => x.id === "T-0207" && /urgent|high/.test(x.priority)) },
+  { name: "reassign", text: "give T-0207 to lead", want: "reassign_task T-0207 lead", expect: (_, w) => W(w, "reassign_task").some((x: any) => x.id === "T-0207" && x.agent === "lead") },
+  { name: "routines question", text: "which scheduled routines do we have?", want: "reply lists routines, no writes", expect: (o, w) => noWrites(o, w) && /pr-review|triage/.test(o.reply) },
 ];
 
 const model = new ClaudeModel(MODEL);

@@ -176,5 +176,5 @@ Distill durable, actionable knowledge — how the owner works, judges and decide
    your summary which agents look ready for more autonomy (the architect proposes graduation; you never change config).
 
 Rules: merge with existing entries (strengthen counts/dates) instead of appending duplicates; keep each file < 200 lines; date everything;
-prefer patterns seen ≥ 2 times; mark single-observation items "(weak)". Owner's corrections of AI ("不对", "不要", "revert", "太慢") are the
+prefer patterns seen ≥ 2 times; mark single-observation items "(weak)". Owner's corrections of AI ("wrong", "don't", "revert", "too slow") are the
 most valuable signal — capture what was wrong and what they wanted instead. Summary: top 5 new or strengthened insights.`;

@@ -19,8 +19,8 @@ test("quiet hours hold back all but logins and urgent decisions", () => {
   const prefs = { quiet_hours: quiet, tz: "UTC" };
   const now = at("23:30");
   expect(notificationFor({ kind: "decision", text: "merge?" }, prefs, now)).toBe(null);
-  expect(notificationFor({ kind: "decision", text: "merge?", priority: "urgent" }, prefs, now)?.title).toBe("需要你拍板");
-  expect(notificationFor({ kind: "login", text: "code" }, prefs, now)?.title).toBe("登录提醒");
+  expect(notificationFor({ kind: "decision", text: "merge?", priority: "urgent" }, prefs, now)?.title).toBe("Needs your decision");
+  expect(notificationFor({ kind: "login", text: "code" }, prefs, now)?.title).toBe("Sign-in alert");
 });
 
 test("the settings' switches reach their kinds, notices being the results", () => {

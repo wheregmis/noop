@@ -38,9 +38,9 @@ const supported = () =>
 
 function deviceLabel() {
   const u = ua();
-  const device = /iPhone/.test(u) ? "iPhone" : /iPad/.test(u) || (isIos() && /Macintosh/.test(u)) ? "iPad" : /Android/.test(u) ? "Android" : /Mac OS X/.test(u) ? "Mac" : /Windows/.test(u) ? "Windows" : /Linux/.test(u) ? "Linux" : "设备";
-  const browser = /Edg\//.test(u) ? "Edge" : /Firefox\//.test(u) ? "Firefox" : /Chrome\//.test(u) ? "Chrome" : /Safari\//.test(u) ? "Safari" : "浏览器";
-  return `${device} · ${standalone() ? "主屏幕应用" : browser}`;
+  const device = /iPhone/.test(u) ? "iPhone" : /iPad/.test(u) || (isIos() && /Macintosh/.test(u)) ? "iPad" : /Android/.test(u) ? "Android" : /Mac OS X/.test(u) ? "Mac" : /Windows/.test(u) ? "Windows" : /Linux/.test(u) ? "Linux" : "Device";
+  const browser = /Edg\//.test(u) ? "Edge" : /Firefox\//.test(u) ? "Firefox" : /Chrome\//.test(u) ? "Chrome" : /Safari\//.test(u) ? "Safari" : "Browser";
+  return `${device} · ${standalone() ? "Home screen app" : browser}`;
 }
 
 function urlBase64ToUint8Array(base64) {

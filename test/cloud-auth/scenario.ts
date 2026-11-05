@@ -24,8 +24,8 @@ let r = await post("/api/auth/start", { email: OWNER });
 ok(r.status === 200, `start (owner) → ${r.status}`); await wait();
 ok(mails().length === n0 + 1, "one mail captured");
 let mail = lastCode();
-ok(mail.subj === `Agent Hub 登录验证码：${mail.code}`, `subject: ${mail.subj}`);
-ok(mail.body.includes(mail.code) && mail.body.includes("10 分钟内有效") && mail.body.includes("如果不是你本人操作，请忽略这封邮件。"), "body has code + validity + ignore line");
+ok(mail.subj === `Noop sign-in code: ${mail.code}`, `subject: ${mail.subj}`);
+ok(mail.body.includes(mail.code) && mail.body.includes("Valid for 10 minutes.") && mail.body.includes("If this wasn't you, ignore this email."), "body has code + validity + ignore line");
 ok(/^Date: /m.test(mail.m) && /^Message-ID: <.+@example\.com>/m.test(mail.m) && /^To: owner@example\.com/m.test(mail.m), "Date / Message-ID / To headers");
 
 const wrong = mail.code === "000000" ? "111111" : "000000";

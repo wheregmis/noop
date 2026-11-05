@@ -65,7 +65,7 @@ export function feed(since?: string, limit = 300): Event[] {
   return evs.filter((e) => !since || e.ts > since).slice(-limit);
 }
 
-/** The channel's last few hours as plain lines, oldest first: what a new chat message ("不行", "这个细节记下来") refers to.
+/** The channel's last few hours as plain lines, oldest first: what a new chat message ("no", "note this detail down") refers to.
  * The message being handled (the owner's last event, `text`) is left out. */
 export function recentChat(text = "", opts: { limit?: number; hours?: number } = {}): string[] {
   const since = new Date(Date.now() - (opts.hours ?? 6) * 3600_000).toISOString();
@@ -201,52 +201,45 @@ export function status() {
 // ---------------------------------------------------------------- settings (UI-adjustable, shared via data repo)
 const SETTABLE = ["clis", "autonomy", "routines", "host", "idle", "judge", "resources", "notify_prefs", "commands", "media_days"]; // whitelisted top-level keys
 
-/** What an agent is for, from its profile's first line: "# Name (中文名) — what it does". */
-/** Chinese titles and one-liners for the built-in roles (a profile's own Chinese "(标题)" and text still win where present). */
-const ROLE_ZH: Record<string, { title: string; about: string }> = {
-  apprentice: { title: "学徒", about: "从你自己的 AI 会话里学习你怎么做事、怎么判断、偏好什么" },
-  architect: { title: "团队架构师", about: "持续调整这个团队的规则、提示词、记忆和角色，贴合你真实的工作" },
-  "chief-of-staff": { title: "幕僚长", about: "团队空闲时给你列出可以直接开干的下一步选项" },
-  dispatcher: { title: "分诊调度", about: "扫描所有进来的信号，拆成任务交给对应成员" },
-  lead: { title: "负责人", about: "任务的默认负责人，决定一件事需要走多少流程" },
-  "ops-watcher": { title: "线上值守", about: "盯线上告警和 CI 健康" },
-  "oss-triage": { title: "开源社区", about: "处理你的开源项目里的 issue" },
-  "release-manager": { title: "发布", about: "版本号、CHANGELOG、Homebrew 和软件包发布" },
-  reporter: { title: "日报 / 周报", about: "根据日志、提交和 GitHub 动态写日报、周报和 OKR 进展" },
-  reviewer: { title: "PR 审查", about: "仔细审查并实际验证你项目上的 PR，尤其是别人提的" },
-  "rust-maintainer": { title: "Rust / GPUI 维护", about: "维护 nsh、gpui-kit、gpui-fast 等 Rust 项目" },
+/** What an agent is for, from its profile's first line: "# Name (Title) — what it does" (the parenthetical is optional). */
+/** Titles and one-liners for the built-in roles, used where a profile's first line gives none. */
+const ROLE: Record<string, { title: string; about: string }> = {
+  apprentice: { title: "Apprentice", about: "Learns how you work, judge and what you prefer from your own AI sessions" },
+  architect: { title: "Team Architect", about: "Keeps tuning this team's rules, prompts, memory and roles to fit your real work" },
+  "chief-of-staff": { title: "Chief of Staff", about: "When the team is idle, lists next steps you can green-light" },
+  dispatcher: { title: "Dispatcher", about: "Scans incoming signals and splits them into tasks for the right members" },
+  lead: { title: "Lead", about: "Default owner of tasks; decides how much process a job needs" },
+  "ops-watcher": { title: "Ops Watcher", about: "Watches production alerts and CI health" },
+  "oss-triage": { title: "OSS Triage", about: "Handles issues on your open-source projects" },
+  "release-manager": { title: "Release Manager", about: "Versions, CHANGELOG, Homebrew and package releases" },
+  reporter: { title: "Reporter", about: "Writes daily and weekly reports and OKR progress from logs, commits and GitHub activity" },
+  reviewer: { title: "PR Reviewer", about: "Carefully reviews and actually verifies PRs on your projects, especially other people's" },
+  "rust-maintainer": { title: "Rust / GPUI Maintainer", about: "Maintains Rust projects like nsh, gpui-kit and gpui-fast" },
 };
-const hasHan = (s?: string) => !!s && /\p{Script=Han}/u.test(s);
 
 export function agentRole(agent: string): { title?: string; about?: string } {
   const p = P("agents", agent, "profile.md");
   const head = existsSync(p) ? (readFileSync(p, "utf8").split("\n").find((l) => l.startsWith("# ")) ?? "") : "";
-  const m = head.match(/^#\s+(.+?)\s*(?:\(([^)]+)\))?\s*(?:[—–-]+\s*(.+))?$/);
-  const zh = ROLE_ZH[agent];
-  const title = m ? (m[2] ?? m[1]).trim() : undefined;
-  const about = m?.[3]?.trim();
-  return {
-    title: hasHan(title) ? title : (zh?.title ?? title),
-    about: hasHan(about) ? about : (zh?.about ?? about),
-  };
+  const m = head.match(/^#\s+(.+?)\s*(?:\(([^)]+)\))?\s*(?:\s[—–-]+\s+(.+))?$/);
+  return { title: (m?.[2] ?? ROLE[agent]?.title ?? m?.[1])?.trim(), about: (m?.[3] ?? ROLE[agent]?.about)?.trim() };
 }
 
 /** What each built-in routine does, for the settings page (a routine's own `desc` in config.toml wins). */
 const ROUTINE_DESC: Record<string, string> = {
-  "triage-inbound": "扫描 GitHub 通知、待你审的 PR、指派给你的 issue 和 CI 失败，拆成任务交给对应成员",
-  "uptime-watch": "查看线上可用性告警，按升级规则处理",
-  "pr-review": "审查 Core 仓库里还没审过的 PR，每次最多 3 个",
-  "own-prs-ci": "让你自己的 PR 保持可合并：解冲突、修 CI、改掉明显的评审意见",
-  "nightly-health": "在最新 main 上跑 cargo check / test，发现回归就建任务",
-  "macos-check": "在 macOS 上构建并测试 Core 仓库，报告平台相关的失败",
-  "daily-report": "根据日志、提交和 GitHub 动态写当天的日报",
-  "weekly-report": "按 OKR 起草本周周报，正式提交前先问你",
-  "focus-check": "核对你的关注点：哪些继续、哪些已完成、哪些该新增",
-  "learn-ceo": "每台机器从本机的 Claude / Codex 会话里学习你的做事方式和判断",
-  evolve: "回顾最近 7 天，调整团队的规则、提示词和记忆",
-  "evolve-deep": "回顾最近 30 天，重写各成员的设定，提议新角色",
-  "release-monday": "周一发布：按 runbook 发 gpui-fast / gpui-kit，每个关口找你确认",
-  "release-wednesday": "周三发布 NSH：准备好一切，发布前问你一次",
+  "triage-inbound": "Scans GitHub notifications, PRs waiting on you, issues assigned to you and CI failures, and splits them into tasks for the right members",
+  "uptime-watch": "Checks uptime alerts and handles them by the escalation rules",
+  "pr-review": "Reviews PRs in the Core repos that haven't been reviewed yet, up to 3 per run",
+  "own-prs-ci": "Keeps your own PRs mergeable: resolves conflicts, fixes CI, addresses obvious review comments",
+  "nightly-health": "Runs cargo check / test on the latest main and opens a task on any regression",
+  "macos-check": "Builds and tests the Core repos on macOS and reports platform-specific failures",
+  "daily-report": "Writes the day's report from the journal, commits and GitHub activity",
+  "weekly-report": "Drafts this week's report against the OKRs, asking you before it's submitted",
+  "focus-check": "Checks your focus areas: which continue, which are done, which should be added",
+  "learn-ceo": "Each machine learns how you work and judge from its local Claude / Codex sessions",
+  evolve: "Reviews the last 7 days and adjusts the team's rules, prompts and memory",
+  "evolve-deep": "Reviews the last 30 days, rewrites each member's profile and proposes new roles",
+  "release-monday": "Monday release: ships gpui-fast / gpui-kit per the runbook, checking with you at each gate",
+  "release-wednesday": "Wednesday NSH release: prepares everything and asks you once before publishing",
 };
 const routineDesc = (r: any) =>
   String(r.desc ?? ROUTINE_DESC[r.name] ?? String(r.prompt ?? "").split(/(?<=[.。])\s/)[0].slice(0, 120)).trim() || undefined;
@@ -303,7 +296,7 @@ export const setUpdateFleet = (fn: () => Promise<number>) => { updateHook = fn; 
 export async function updateFleet(): Promise<string> {
   if (!updateHook) return "not available";
   const n = await updateHook();
-  appendEvent({ from: "hub", kind: "system", text: `已通知 ${n} 台机器更新到最新代码：空闲的马上更新，有任务在跑的等跑完再重启；主控机同时重新发布线上。` });
+  appendEvent({ from: "hub", kind: "system", text: `Asked ${n} machine(s) to update to the latest code: idle ones update now, busy ones restart when their tasks finish; the main host also redeploys the live site.` });
   return "ok";
 }
 const AMEND_MS = 5 * 60_000;
@@ -426,17 +419,17 @@ export function localSignIn(token: string, now = Date.now) {
       const e = normEmail(email), t = now();
       if (!/^[^@\s]+@[^@\s]+$/.test(e)) return { status: 400, body: { error: "invalid email" } };
       sends = sends.filter((s) => s > t - 3600_000);
-      if (pending && pending.sent > t - RESEND_MS) return { status: 429, body: { error: "请稍等一分钟再重新获取验证码" } };
-      if (sends.length >= SENDS_PER_HOUR) return { status: 429, body: { error: "验证码发送太频繁，请一小时后再试" } };
+      if (pending && pending.sent > t - RESEND_MS) return { status: 429, body: { error: "Please wait a minute before requesting another code." } };
+      if (sends.length >= SENDS_PER_HOUR) return { status: 429, body: { error: "Too many codes sent. Try again in an hour." } };
       sends.push(t);
       pending = { email: e, code: String(randomInt(1_000_000)).padStart(6, "0"), expires: t + CODE_TTL, sent: t, tries: 0 };
       return { status: 200, body: { ok: true, delivery: "cli" } };
     },
     verify(email: unknown, code: unknown) {
-      if (!pending || pending.expires <= now()) return { status: 401, body: { error: "验证码不对或已过期" } };
-      if (pending.tries >= CODE_TRIES) return { status: 401, body: { error: "尝试次数太多，请重新获取验证码" } };
+      if (!pending || pending.expires <= now()) return { status: 401, body: { error: "Wrong or expired code." } };
+      if (pending.tries >= CODE_TRIES) return { status: 401, body: { error: "Too many attempts. Request a new code." } };
       pending.tries++;
-      if (pending.email !== normEmail(email) || pending.code !== String(code ?? "")) return { status: 401, body: { error: "验证码不对或已过期" } };
+      if (pending.email !== normEmail(email) || pending.code !== String(code ?? "")) return { status: 401, body: { error: "Wrong or expired code." } };
       pending = null;
       return { status: 200, body: { session: token } };
     },

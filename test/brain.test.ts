@@ -10,7 +10,7 @@ const put = (p: string, s: string) => { mkdirSync(dirname(join(DATA, p)), { recu
 put("tasks/active/T-0184.md", "---\nid: T-0184\ntitle: noop: MCP server\nagent: lead\nclaimed_by: h1\nrepo: huacnlee/noop\n---\nBuild it.\n");
 put("tasks/inbox/T-0190.md", "---\nid: T-0190\ntitle: Review nsh#812\nagent: reviewer\npriority: normal\n---\nReview.\n");
 put("tasks/done/T-0100.md", "---\nid: T-0100\ntitle: Fix typo\nagent: lead\n---\ndone\n");
-put("decisions/open/D-0099.md", "---\nid: D-0099\nquestion: 合并吗？\nrecommendation: A\noptions: A: 合并 | B: 等\n---\n## Context\nctx\n");
+put("decisions/open/D-0099.md", "---\nid: D-0099\nquestion: Merge it?\nrecommendation: A\noptions: A: Merge | B: Wait\n---\n## Context\nctx\n");
 put("agents/lead/profile.md", "# Kai (lead) — plans and delegates\n");
 put("agents/reviewer/profile.md", "# Rex (reviewer) — reviews PRs\n");
 put("agents/reviewer/memory.md", "- screenshots go in the PR body\n");
@@ -57,7 +57,7 @@ test("read tools over the local data repo", async () => {
   expect((await runTool(st, "read_memory", { file: "config.local.toml" })).ok).toBe(false); // not memory
   expect((await runTool(st, "read_memory", { file: "../x.md" })).ok).toBe(false);
   expect((await r("search_journal", { query: "t-0100 done" })).lines).toEqual([{ day: "2026-11-03", line: "- 10:05 [pc] ✅ T-0100 done: fixed typo" }]);
-  expect((await r("search", { query: "合并" })).results.map((x: any) => x.id)).toEqual(["D-0099"]);
+  expect((await r("search", { query: "Merge it" })).results.map((x: any) => x.id)).toEqual(["D-0099"]);
 });
 
 test("writes are validated once, then performed by the store's acts", async () => {
@@ -114,35 +114,35 @@ test("brain: reads, then answers; writes run after the reply is posted", async (
   const { st, did } = store();
   const model = scripted([
     '{"calls":[{"tool":"get_task","args":{"id":"T-0184"}}],"reply":""}',
-    'Sure:\n```json\n{"calls":[{"tool":"amend_task","args":{"id":"T-0184","text":"顺便加上测试"}}],"reply":"T-0184 测试已经过了，我把「加测试」补给它了。"}\n```',
+    'Sure:\n```json\n{"calls":[{"tool":"amend_task","args":{"id":"T-0184","text":"also add tests"}}],"reply":"T-0184 tests already pass, and I added the new test request to it."}\n```',
   ]);
   const posted: [string, string | undefined][] = [];
-  const out = await think({ text: "T-0184 怎么样了？顺便加上测试", chat: ["lead: T-0184 started"] }, st, model, (r, ref) => { posted.push([r, ref]); expect(did).toEqual([]); });
-  expect(posted).toEqual([["T-0184 测试已经过了，我把「加测试」补给它了。", "T-0184"]]);
+  const out = await think({ text: "How is T-0184 going? Also add tests", chat: ["lead: T-0184 started"] }, st, model, (r, ref) => { posted.push([r, ref]); expect(did).toEqual([]); });
+  expect(posted).toEqual([["T-0184 tests already pass, and I added the new test request to it.", "T-0184"]]);
   expect(out.calls.map((c) => [c.tool, c.ok])).toEqual([["get_task", true], ["amend_task", true]]);
   expect(model.seen[1]).toContain("T-0184 tests pass"); // the tool result went back to the model
-  expect(did).toEqual([{ tool: "amend_task", id: "T-0184", text: "顺便加上测试" }]);
+  expect(did).toEqual([{ tool: "amend_task", id: "T-0184", text: "also add tests" }]);
   expect(out.rounds).toBe(2);
 });
 
 test("brain: nothing to say → nothing posted; invalid writes go back to the model", async () => {
   const { st, did } = store();
   const posted: string[] = [];
-  await think({ text: "好的" }, st, scripted(['{"calls":[],"reply":""}']), (r) => posted.push(r));
+  await think({ text: "ok" }, st, scripted(['{"calls":[],"reply":""}']), (r) => posted.push(r));
   expect(posted).toEqual([]);
-  const m = scripted(['{"calls":[{"tool":"amend_task","args":{"id":"T-0999","text":"再改改"}}],"reply":"好"}',
-    '{"calls":[{"tool":"create_task","args":{"title":"Redo typo fix","follows":"T-0100"}}],"reply":"T-0100 已经结束了，我开了一个新任务接着改。"}']);
-  const out = await think({ text: "T-0100 再改改" }, st, m, (r) => posted.push(r));
+  const m = scripted(['{"calls":[{"tool":"amend_task","args":{"id":"T-0999","text":"change it again"}}],"reply":"ok"}',
+    '{"calls":[{"tool":"create_task","args":{"title":"Redo typo fix","follows":"T-0100"}}],"reply":"T-0100 is already finished; I opened a new task to continue."}']);
+  const out = await think({ text: "T-0100 change it again" }, st, m, (r) => posted.push(r));
   expect(m.seen[1]).toContain("cannot be continued");
-  expect(posted).toEqual(["T-0100 已经结束了，我开了一个新任务接着改。"]);
+  expect(posted).toEqual(["T-0100 is already finished; I opened a new task to continue."]);
   expect(did.map((d) => d.tool)).toEqual(["create_task"]);
   expect(out.calls.map((c) => [c.tool, c.ok])).toEqual([["amend_task", false], ["create_task", true]]);
 });
 
 test("context: open work, decisions, relevant memory, channel and reply target", () => {
   const { st } = store();
-  const c = context(st, { text: "dark mode 不平衡", replyTo: "T-0184", answered: "D-0099", chat: ["owner: hi"] });
-  for (const s of ["T-0184 [active, lead on h1] noop: MCP server", "D-0099: 合并吗？", "memory/taste.md: - Dark mode must be balanced.", "owner: hi",
+  const c = context(st, { text: "dark mode is unbalanced", replyTo: "T-0184", answered: "D-0099", chat: ["owner: hi"] });
+  for (const s of ["T-0184 [active, lead on h1] noop: MCP server", "D-0099: Merge it?", "memory/taste.md: - Dark mode must be balanced.", "owner: hi",
     "reply to the team's message about T-0184", "answered D-0099"]) expect(c).toContain(s);
   expect(parseTurn('noise {"reply":"hi"} noise')).toEqual({ calls: [], reply: "hi" });
   expect(parseTurn("no json")).toBeNull();
@@ -150,17 +150,17 @@ test("context: open work, decisions, relevant memory, channel and reply target",
 
 test("a finished task reopens under its own id, with its runs as context", () => {
   put("tasks/done/T-0300.md", "---\nid: T-0300\ntitle: Ship it\nagent: lead\nfinished: 2026-11-01\nstatus: done\nclaimed_by: pc\n---\nAsked.\n\n## Run 2026-11-01 · pc · claude\n**done** — shipped\n");
-  reopenTask(join(DATA, "tasks/done/T-0300.md"), "不行\n再改");
+  reopenTask(join(DATA, "tasks/done/T-0300.md"), "no\nchange it again");
   expect(existsSync(join(DATA, "tasks/done/T-0300.md"))).toBe(false);
   const t = readFileSync(join(DATA, "tasks/inbox/T-0300.md"), "utf8");
   expect(t).toContain("**done** — shipped");
-  expect(t).toContain("> 不行\n> 再改");
+  expect(t).toContain("> no\n> change it again");
   expect(t).not.toMatch(/^(finished|status|claimed_by):/m);
 });
 
 test("a task's detail names the cards it asked", () => {
-  put("decisions/closed/D-0301.md", "---\nid: D-0301\ntask: T-0302\nquestion: 合并吗？\n---\n");
-  put("decisions/closed/D-0303.md", "---\nid: D-0303\ntask: T-0100\nquestion: 别的\n---\n");
+  put("decisions/closed/D-0301.md", "---\nid: D-0301\ntask: T-0302\nquestion: Merge it?\n---\n");
+  put("decisions/closed/D-0303.md", "---\nid: D-0303\ntask: T-0100\nquestion: Something else\n---\n");
   put("tasks/done/T-0302.md", "---\nid: T-0302\ntitle: x\nagent: lead\n---\nAsked.\n");
   expect(taskInfo(store().st, "T-0302")?.decisions).toEqual(["D-0301"]);
 });

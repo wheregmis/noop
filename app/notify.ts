@@ -6,7 +6,7 @@ export type NotifyRules = { kinds?: Record<string, boolean>; quiet_hours?: Quiet
 export type NotifyEvent = { kind: string; from?: unknown; text?: unknown; priority?: unknown };
 
 const KINDS = ["decision", "menu", "proposals", "login", "notice"];
-const TITLES: Record<string, string> = { decision: "需要你拍板", menu: "可以选下一步", proposals: "新的提议", login: "登录提醒", notice: "Noop" };
+const TITLES: Record<string, string> = { decision: "Needs your decision", menu: "Pick the next step", proposals: "New proposals", login: "Sign-in alert", notice: "Noop" };
 
 /** Is `now` inside the quiet hours (`{start, end}` from the app, "23:00-08:00" written by hand) in `tz`? */
 export function inQuiet(range: Quiet | undefined, tz: string | undefined, now = new Date()) {

@@ -41,7 +41,7 @@ test("judge hold is still recorded and scored against the owner", async () => {
   expect(o.shadow_answer).toBe("B: wait");
   // the card: the question, the agent's account, its recommendation; never the judge's reason for asking
   expect(sent.at(-1)).toContain("Merge?");
-  expect(sent.at(-1)).toContain("建议：*A*");
+  expect(sent.at(-1)).toContain("Recommendation: *A*");
   expect(sent.at(-1)).not.toContain("release gate");
   dec.closeDecision(id, "B", "owner(chat)");
   expect(closed(id).shadow_agree).toBe("yes");
@@ -92,13 +92,13 @@ test("choice() normalises option answers", () => {
 });
 
 test("linkRefs links PR references using the repositories the decision mentions", () => {
-  const opts = "A: squash 合并 https://github.com/longbridge/nsh/pull/747 — 发布";
-  expect(dec.linkRefs("合并 nsh #747 吗？", undefined, opts)).toBe("合并 [nsh#747](https://github.com/longbridge/nsh/pull/747) 吗？");
-  expect(dec.linkRefs("见 PR #747", undefined, opts)).toBe("见 PR [#747](https://github.com/longbridge/nsh/pull/747)");
-  expect(dec.linkRefs("改 a/b#3", undefined, "")).toBe("改 [a/b#3](https://github.com/a/b/pull/3)");
+  const opts = "A: squash merge https://github.com/longbridge/nsh/pull/747 — release";
+  expect(dec.linkRefs("Merge nsh #747?", undefined, opts)).toBe("Merge [nsh#747](https://github.com/longbridge/nsh/pull/747)?");
+  expect(dec.linkRefs("see PR #747", undefined, opts)).toBe("see PR [#747](https://github.com/longbridge/nsh/pull/747)");
+  expect(dec.linkRefs("fix a/b#3", undefined, "")).toBe("fix [a/b#3](https://github.com/a/b/pull/3)");
   // an unknown repository, an existing link and no repository at all stay as they are
-  expect(dec.linkRefs("见 other#3 与 [#9](u)", undefined, opts)).toBe("见 other#3 与 [#9](u)");
-  expect(dec.linkRefs("见 #5", undefined, "")).toBe("见 #5");
+  expect(dec.linkRefs("see other#3 and [#9](u)", undefined, opts)).toBe("see other#3 and [#9](u)");
+  expect(dec.linkRefs("see #5", undefined, "")).toBe("see #5");
 });
 
 test("ignoring a question closes it without a lesson and drops its task", async () => {

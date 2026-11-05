@@ -82,14 +82,14 @@ export async function proposeBatch(cfg: Cfg, host: string) {
   const id = nextId("P", P("decisions"));
   const lines = items.map((p, i) => {
     const m = readDoc(p).meta;
-    return `${i + 1}. ${m.title}（${m.agent}）`;
+    return `${i + 1}. ${m.title}(${m.agent})`;
   });
   writeDoc(P("decisions", "open", `${id}.md`), {
     id, kind: "proposals", created: now(), notified: now(), host, items: itemIds.join(","),
-    question: "要做哪几项？",
-  }, `## 待确认\n${lines.join("\n")}\n`);
-  await notify([`*${id}* 想做这几件事，请确认：`, ...lines,
-    `回复 \`${id} 1,3\`、\`${id} all\`（全做）或 \`${id} none\`（都不做）`].join("\n"), cfg,
+    question: "Which of these should go ahead?",
+  }, `## Awaiting confirmation\n${lines.join("\n")}\n`);
+  await notify([`*${id}* wants to do these; please confirm:`, ...lines,
+    `Reply \`${id} 1,3\`, \`${id} all\` (do everything) or \`${id} none\` (do nothing)`].join("\n"), cfg,
     { kind: "proposals", ref: id, options: ["all", "none", ...lines.map((_, i) => String(i + 1))] });
   journal(host, `${id} asked owner to approve ${items.length} proposed tasks`);
 }

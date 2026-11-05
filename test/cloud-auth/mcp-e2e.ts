@@ -28,7 +28,7 @@ ok(client.client_id, `registered ${client.client_id}`);
 const verifier = crypto.randomUUID() + crypto.randomUUID();
 const q = new URLSearchParams({ response_type: "code", client_id: client.client_id, redirect_uri: redirect, state: "xyz",
   code_challenge: await pkceChallenge(verifier), code_challenge_method: "S256", scope: "noop", resource: prm.resource });
-ok((await (await fetch(`${asm.authorization_endpoint}?${q}`)).text()).includes("发送验证码"), "sign-in page");
+ok((await (await fetch(`${asm.authorization_endpoint}?${q}`)).text()).includes("Send code"), "sign-in page");
 const step = (b: Record<string, string>) => fetch(`${asm.authorization_endpoint}?${q}`, { method: "POST", body: new URLSearchParams(b), redirect: "manual" });
 const sent = await (await step({ step: "send", email: "owner@example.com" })).text();
 ok(sent.includes("noop login"), "code page (code shown by `noop login`)");

@@ -56,7 +56,7 @@ export function startCloudBridge(cfg: Cfg) {
   setMirror((e) => { pending.push(e); void flush(); });
 
   let after = 0, n = 0, busy = false, lastStatus = "", lastShape = "", lastPush = 0;
-  // push the dashboard at once when its shape changes (an answered decision must leave "待你决定" at once); live agent
+  // push the dashboard at once when its shape changes (an answered decision must leave "Needs your decision" at once); live agent
   // activity alone is pushed at most once a minute, and an unchanged dashboard every ~5 min (Worker writes are budgeted)
   const pushStatus = async (force = false) => {
     const s = status();
@@ -138,12 +138,12 @@ export async function cloudDeploy(cfg: Cfg) {
   const env = { ...process.env, ...(account ? { CLOUDFLARE_ACCOUNT_ID: account } : {}) };
   const who = await $`${wr} whoami`.cwd(dir).env(env).quiet().nothrow();
   if (!/logged in/i.test(who.stdout.toString())) {
-    return fail("先登录你自己的 Cloudflare 账号（免费版即可）：\n  bunx wrangler login\n然后重新运行：hub cloud deploy");
+    return fail("Sign in to your own Cloudflare account first (the free plan is enough):\n  bunx wrangler login\nThen run again: hub cloud deploy");
   }
-  if (!cfg.server?.token) return fail("缺少 [server] token，先运行 hub init");
-  if (!(await ensureWebClient())) return fail("客户端网页下载失败，Worker 没有部署。请检查网络后重新运行：noop cloud deploy");
+  if (!cfg.server?.token) return fail("Missing [server] token; run hub init first");
+  if (!(await ensureWebClient())) return fail("Downloading the web client failed, so the Worker wasn't deployed. Check your network and run again: noop cloud deploy");
   const name = cfg.cloud?.name ?? "noop";
-  console.log(`部署到你的 Cloudflare 账号（Worker：${name}）…`);
+  console.log(`Deploying to your Cloudflare account (Worker: ${name})…`);
   const dep = await $`${wr} deploy --name ${name}`.cwd(dir).env(env).quiet().nothrow();
   const out = dep.stdout.toString() + dep.stderr.toString();
   if (dep.exitCode !== 0) return fail(out.slice(-1500));
@@ -156,14 +156,14 @@ export async function cloudDeploy(cfg: Cfg) {
   } else if (e.to && e.from) { // Cloudflare Email Routing: no SMTP, `from` is an address on a domain with Email Routing on
     secrets.HUB_OWNER_EMAIL = String(e.to);
     secrets.HUB_MAIL_FROM = String(e.from).match(/<([^>]+)>/)?.[1] ?? String(e.from);
-  } else console.log("还没配置邮箱：登录验证码发不出去，在共享的 config.toml 里填 [email] 后重新运行 noop cloud deploy");
+  } else console.log("No email configured: sign-in codes can't be sent. Fill in [email] in the shared config.toml and run noop cloud deploy again");
   const vapid = await vapidKeys();
   secrets.HUB_VAPID_PUBLIC = vapid.publicKey;
   secrets.HUB_VAPID_PRIVATE = JSON.stringify(vapid.privateJwk);
   // `secret bulk` reads JSON from stdin — values never touch argv or the console.
   const sec = Bun.spawn([...wr, "secret", "bulk", "--name", name], { cwd: dir, env, stdin: new Blob([JSON.stringify(secrets)]), stdout: "pipe", stderr: "pipe" });
-  if ((await sec.exited) !== 0) return fail("设置 Worker 密钥失败：\n" + (await new Response(sec.stderr).text()).slice(-800));
-  if (!url) return fail("部署成功，但没识别到地址；请把 workers.dev 地址写进 config.toml 的 [cloud] url");
+  if ((await sec.exited) !== 0) return fail("Setting the Worker secrets failed:\n" + (await new Response(sec.stderr).text()).slice(-800));
+  if (!url) return fail("Deployed, but the URL wasn't detected; put the workers.dev address in [cloud] url in config.toml");
   // ---- record the URL (machine-local noop.toml first: the data sync itself goes through this Worker)
   writeHubToml({ cloud: { url, name, ...(account ? { account } : {}) } });
   await locked(async () => {
@@ -172,10 +172,10 @@ export async function cloudDeploy(cfg: Cfg) {
     let s = readFileSync(f, "utf8");
     s = /^\[cloud\]/m.test(s) ? s.replace(/^\[cloud\][^\[]*/m, `[cloud]\nurl = "${url}"\nname = "${name}"\n\n`) : `${s.trimEnd()}\n\n[cloud]\nurl = "${url}"\nname = "${name}"\n`;
     writeFileSync(f, s);
-    writeFileSync(P("README.md"), `# noop data\n\n私有数据（保存在你自己的 Cloudflare Worker 里）：任务、决策、记忆、日志。\n\n## 客户端\n\n地址：**${url}**\n\n打开后粘贴 token 连接（或用邮箱验证码登录；机器 token 在主机的 ~/.noop/noop.toml 里）。这个地址部署在你自己的 Cloudflare 账号里，固定不变。\n`);
+    writeFileSync(P("README.md"), `# noop data\n\nPrivate data (stored in your own Cloudflare Worker): tasks, decisions, memory, logs.\n\n## Client\n\nAddress: **${url}**\n\nOpen it and paste the token to connect (or sign in with an emailed code; the machine token is in ~/.noop/noop.toml on the host). This address is deployed in your own Cloudflare account and stays fixed.\n`);
     journal(hostName(cfg), `☁️ cloud hub deployed: ${url}`);
     await _commitPush(`cloud hub ${url}`);
   });
-  console.log(`✓ 已部署：${url}`);
+  console.log(`✓ Deployed: ${url}`);
   return url;
 }

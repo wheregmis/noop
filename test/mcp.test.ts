@@ -37,19 +37,19 @@ function hub() {
   const file = (path: string, content: string) => sql.exec("INSERT OR REPLACE INTO files (path, content, hash, version, updated, by, deleted, rev) VALUES (?, ?, '', 1, ?, 'x', 0, ?)",
     path, new TextEncoder().encode(content), new Date(Date.now() + rev * 1000).toISOString(), ++rev);
   const host: McpHost = {
-    sql, status: () => ({ tasks: { active: 1 }, decisions: [{ id: "D-0099", question: "合并吗？" }], hosts: [{ host: "h1", online: true }], active: [], hub: { online: true } }),
+    sql, status: () => ({ tasks: { active: 1 }, decisions: [{ id: "D-0099", question: "Merge it?" }], hosts: [{ host: "h1", online: true }], active: [], hub: { online: true } }),
     events: (after, limit) => sql.exec("SELECT seq, json FROM events WHERE seq > ? ORDER BY seq LIMIT ?", after, limit).toArray().map((r) => ({ seq: r.seq, ev: JSON.parse(r.json) })),
     say: (text, ref) => { said.push({ text, ref }); return append({ from: "owner", kind: "owner", text, ref }); },
     enqueue: (op) => { queued.push(op); },
     startCode: async (email) => (email === "owner@example.com" ? { status: 200, body: { ok: true } } : { status: 400, body: { error: "invalid email" } }),
-    checkCode: async (email, code) => (code === "123456" ? { email } : { error: "验证码不对" }),
+    checkCode: async (email, code) => (code === "123456" ? { email } : { error: "Wrong code." }),
     newSession: async (email) => { const s = crypto.randomUUID().replace(/-/g, ""); sql.exec("INSERT INTO sessions (id, email) VALUES (?, ?)", s, email); return s; },
     dropSession: async () => {},
   };
   mcp = new Mcp(host);
   file("tasks/active/T-0184.md", "---\nid: T-0184\ntitle: noop: MCP server\nagent: lead\nrepo: huacnlee/noop\nclaimed_by: h1\n---\nBuild the MCP server.\n");
   file("tasks/done/T-0100.md", "---\nid: T-0100\ntitle: Fix typo\nagent: lead\n---\ndone\n");
-  file("decisions/open/D-0099.md", "---\nid: D-0099\ntask: T-0184\nquestion: 合并吗？\nrecommendation: A\noptions: A: 合并 — 好 | B: 不合并 — 等\n---\n## Context\n需要你决定。\n\n## Options\n- A\n");
+  file("decisions/open/D-0099.md", "---\nid: D-0099\ntask: T-0184\nquestion: Merge it?\nrecommendation: A\noptions: A: Merge — good | B: Don't merge — wait\n---\n## Context\nNeeds your decision.\n\n## Options\n- A\n");
   return { sql, mcp, said, queued, append, file };
 }
 
@@ -102,7 +102,7 @@ test("OAuth: register → sign in with email code → PKCE token → refresh rot
   expect((await mcp.fetch(new Request(`${B}/oauth/authorize?${bad}`), null)).status).toBe(400);
   const form = (o: Record<string, string>) => new Request(`${B}/oauth/authorize?${q}`, { method: "POST", body: new URLSearchParams(o) });
   expect(await (await mcp.fetch(form({ step: "send", email: "owner@example.com" }), null)).text()).toContain('name="code"');
-  expect(await (await mcp.fetch(form({ step: "verify", email: "owner@example.com", code: "000000" }), null)).text()).toContain("验证码不对");
+  expect(await (await mcp.fetch(form({ step: "verify", email: "owner@example.com", code: "000000" }), null)).text()).toContain("Wrong code.");
   const ok = await mcp.fetch(form({ step: "verify", email: "owner@example.com", code: "123456" }), null);
   expect(ok.status).toBe(302);
   const back = new URL(ok.headers.get("location")!);
@@ -154,7 +154,7 @@ test("tools: read and owner-level writes", async () => {
   expect(t.body).toContain("Build the MCP server");
   expect((await tool(mcp, "get_task", { id: "T-9999" })).isError).toBe(true);
   const d = (await tool(mcp, "list_decisions")).data.decisions[0];
-  expect(d).toMatchObject({ id: "D-0099", recommendation: "A", options: ["A: 合并 — 好", "B: 不合并 — 等"], context: "需要你决定。" });
+  expect(d).toMatchObject({ id: "D-0099", recommendation: "A", options: ["A: Merge — good", "B: Don't merge — wait"], context: "Needs your decision." });
 
   expect((await tool(mcp, "send_message", { text: "  hi team ", reply_to: "T-0184" })).data.ok).toBe(true);
   expect((await tool(mcp, "answer_decision", { id: "D-0099", answer: "A" })).data.ok).toBe(true);
@@ -171,7 +171,7 @@ test("tools: read and owner-level writes", async () => {
   expect(s.map((r: any) => r.id)).toEqual(["T-0184"]);
   expect(s[0].url).toBe(`${B}/?ref=T-0184`);
   const f = (await tool(mcp, "fetch", { id: "D-0099" })).data;
-  expect(f).toMatchObject({ id: "D-0099", title: "D-0099 合并吗？", metadata: { state: "open" } });
+  expect(f).toMatchObject({ id: "D-0099", title: "D-0099 Merge it?", metadata: { state: "open" } });
 });
 
 test("wait_for_events returns as soon as an event lands", async () => {
@@ -340,7 +340,7 @@ test("resources/list_changed when the set of open tasks or decisions changes", a
   expect(f.all.filter((x) => x.data?.method === "notifications/resources/list_changed").length).toBe(1);
   expect((await rpc(mcp, "resources/list", {}, sid)).body.result.resources.map((x: any) => x.uri)).toContain("noop://tasks/T-0201");
   expect((await rpc(mcp, "resources/list", {}, sid)).body.result.resources.map((x: any) => x.uri)).toContain("noop://decisions/D-0099");
-  expect(JSON.parse((await rpc(mcp, "resources/read", { uri: "noop://decisions/D-0099" }, sid)).body.result.contents[0].text).question).toBe("合并吗？");
+  expect(JSON.parse((await rpc(mcp, "resources/read", { uri: "noop://decisions/D-0099" }, sid)).body.result.contents[0].text).question).toBe("Merge it?");
   void append;
   for (const s of mcp.streams) s.close();
 });

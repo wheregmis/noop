@@ -119,9 +119,9 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
       st.told = st.cooldown_until;
       const others = (cfg.clis?.preference ?? ["claude", "codex"]).filter((c: string) => c !== a.cli && Bun.which(c) && accounts(cfg, c).some(usable));
       const at = new Date(st.cooldown_until).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-      void notify([`${a.cli === "claude" ? "Claude" : "Codex"}（${host}）额度用完了，约 ${at} 恢复。`,
-        others.length ? `这期间任务先交给 ${others.join("、")} 做。` : "这期间没有可用的 AI，任务会排队等着。",
-        `想马上恢复：在这台机器上运行 ${a.cli === "claude" ? "claude /login" : "codex login"} 换个账号，登录后会自动接着用，不用等。`].join("\n"),
+      void notify([`${a.cli === "claude" ? "Claude" : "Codex"}(${host}) hit its usage limit; back around ${at}.`,
+        others.length ? `Meanwhile tasks go to ${others.join(", ")}.` : "No AI is available meanwhile; tasks will queue.",
+        `To resume now: run ${a.cli === "claude" ? "claude /login" : "codex login"} on this machine with another account; it picks up automatically after you sign in.`].join("\n"),
         cfg, { kind: "notice" });
     }
   } else {
@@ -144,10 +144,10 @@ async function alertIfAllExhausted(cfg: Cfg) {
   save(s);
   const lines = installed.flatMap((c) => accounts(cfg, c)).map((a) => {
     const st = load().accounts[key(a)] ?? {};
-    return `• ${key(a)}：${st.needs_login ? "需要登录" : st.cooldown_until ? `额度用尽，约 ${new Date(st.cooldown_until).toLocaleTimeString()} 恢复` : "?"}`;
+    return `• ${key(a)}: ${st.needs_login ? "needs sign-in" : st.cooldown_until ? `usage limit hit, back around ${new Date(st.cooldown_until).toLocaleTimeString()}` : "?"}`;
   });
-  await notify([`${hostName(cfg)} 上所有 AI 账户都不可用，fleet 暂停中：`, ...lines,
-    `可以：回复登录码完成待登录账户，或在 config.local.toml 的 [[accounts]] 加一个账户。`].join("\n"), cfg);
+  await notify([`All AI accounts on ${hostName(cfg)} are unavailable; the fleet is paused:`, ...lines,
+    `You can reply with a login code to finish a pending sign-in, or add an account under [[accounts]] in config.local.toml.`].join("\n"), cfg);
 }
 
 // ------------------------------------------------------------------ remote-assisted login
@@ -192,9 +192,9 @@ export async function startLogin(a: Account, cfg: Cfg) {
     if (url && !sent && (needsCode || code || buf.length > 2000 || /enter|code/i.test(buf))) {
       sent = true;
       await notify([
-        `🔑 *${id}* · ${host} 上的 ${a.cli} 账户「${a.name}」需要重新登录`,
-        `1. 打开：${url}`,
-        code ? `2. 输入设备码：\`${code}\`（完成后会自动生效，无需回复）` : `2. 登录后把页面给出的授权码回复：\`${id} <code>\``,
+        `🔑 *${id}* · ${a.cli} account "${a.name}" on ${host} needs to sign in again`,
+        `1. Open: ${url}`,
+        code ? `2. Enter the device code: \`${code}\` (it takes effect automatically, no reply needed)` : `2. After signing in, reply with the authorization code the page shows: \`${id} <code>\``,
       ].join("\n"), cfg);
       journal(host, `🔑 ${id} login link sent for ${k}`);
     }
@@ -213,7 +213,7 @@ export async function startLogin(a: Account, cfg: Cfg) {
     st.accounts[k] = { ...st.accounts[k], needs_login: !ok, login_id: undefined, cooldown_until: undefined };
     save(st);
     journal(host, ok ? `${k} logged in (${id})` : `${k} login ${id} failed (exit ${code})`);
-    await notify(ok ? `${k} 登录成功，fleet 继续运转` : `${id} 登录未完成（exit ${code}），稍后会再发新链接`, cfg);
+    await notify(ok ? `${k} signed in; the fleet is running again` : `${id} sign-in didn't finish (exit ${code}); a new link will follow`, cfg);
   });
   setTimeout(() => { if (pending.has(id)) proc.kill(); }, 30 * 60_000); // link expiry
 }

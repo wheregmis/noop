@@ -63,8 +63,8 @@ test("owner images are downloaded and named by absolute path in the task text", 
   expect(got).toEqual(["/media/1-shot.png", "/media/2-gone.png"]);
   expect(files).toEqual([join(root, "ev-1", "1-shot.png")]);
   expect([...readFileSync(files[0])]).toEqual([1, 2, 3]);
-  const text = withAttachments("看这个报错", files, 1);
-  expect(text.startsWith("看这个报错\n\nAttached images")).toBe(true);
+  const text = withAttachments("look at this error", files, 1);
+  expect(text.startsWith("look at this error\n\nAttached images")).toBe(true);
   expect(text).toContain(`- ${files[0]}`);
   expect(text).toContain("1 more image(s) could not be downloaded");
   expect(withAttachments("", files).split("\n")[0]).toBe("(see the attached images)");
@@ -176,7 +176,7 @@ test("update the fleet: the owner's request reaches the hook and the feed says h
   expect(await updateFleet()).toBe("not available");
   setUpdateFleet(async () => 3);
   expect(await updateFleet()).toBe("ok");
-  expect(seen.at(-1)).toContain("已通知 3 台机器");
+  expect(seen.at(-1)).toContain("Asked 3 machine");
   setMirror(() => {});
 });
 
@@ -189,12 +189,12 @@ test("heartbeat carries the running code version, linked to its commit", async (
 
 test("recentChat: the channel before an owner message, without the message itself", async () => {
   const { appendEvent, recentChat } = await import("../src/server");
-  appendEvent({ from: "Kai", kind: "notice", text: "已补写 gpui-kit v0.9.0 的更新日志", ref: "T-0115" });
-  appendEvent({ from: "owner", kind: "owner", text: "不行，得留下贡献者名单" });
-  appendEvent({ from: "hub", kind: "system", text: "收到，接着 T-0115 处理（T-0116）", ref: "T-0116" });
-  appendEvent({ from: "owner", kind: "owner", text: "这个细节记录下来，以后都这样" });
-  const lines = recentChat("这个细节记录下来，以后都这样");
-  expect(lines.slice(-3).map((l) => l.slice(8))).toEqual(["Kai (T-0115): 已补写 gpui-kit v0.9.0 的更新日志", "owner: 不行，得留下贡献者名单", "hub (T-0116): 收到，接着 T-0115 处理（T-0116）"]);
+  appendEvent({ from: "Kai", kind: "notice", text: "Backfilled the gpui-kit v0.9.0 changelog", ref: "T-0115" });
+  appendEvent({ from: "owner", kind: "owner", text: "no, we need to keep the contributor list" });
+  appendEvent({ from: "hub", kind: "system", text: "Got it, continuing T-0115 (T-0116)", ref: "T-0116" });
+  appendEvent({ from: "owner", kind: "owner", text: "note this detail down, always do it this way" });
+  const lines = recentChat("note this detail down, always do it this way");
+  expect(lines.slice(-3).map((l) => l.slice(8))).toEqual(["Kai (T-0115): Backfilled the gpui-kit v0.9.0 changelog", "owner: no, we need to keep the contributor list", "hub (T-0116): Got it, continuing T-0115 (T-0116)"]);
   expect(recentChat("x", { limit: 1 }).length).toBe(1);
 });
 
@@ -215,10 +215,10 @@ test("a reply to an agent's message goes to the brain with that task, never as a
   const calls: [string, { reply?: string; answered?: string }][] = [];
   setOwnerTask(async (text, o) => { calls.push([text, { reply: o.reply, answered: o.answered }]); });
   await handleOwnerMessage("D-0001 A"); // just answered a decision: the brain hears it may be amended
-  await handleOwnerMessage("为何我看图片不清晰呢", "T-0125"); // a reply names its task: never an amendment
-  expect(calls).toEqual([["为何我看图片不清晰呢", { reply: "T-0125", answered: undefined }]]);
-  await handleOwnerMessage("等等，选 B");
-  expect(calls.at(-1)).toEqual(["等等，选 B", { reply: undefined, answered: "D-0001" }]);
+  await handleOwnerMessage("why are my images blurry", "T-0125"); // a reply names its task: never an amendment
+  expect(calls).toEqual([["why are my images blurry", { reply: "T-0125", answered: undefined }]]);
+  await handleOwnerMessage("wait, pick B");
+  expect(calls.at(-1)).toEqual(["wait, pick B", { reply: undefined, answered: "D-0001" }]);
   expect(drainInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
 });
 

@@ -42,7 +42,7 @@ test("worker list/read: files table only, whitelist enforced", async () => {
   const sql = sqlOf();
   initFilesSchema(sql);
   const commit = new Request("http://x/api/files/commit", { method: "POST", body: JSON.stringify({ msg: "seed", changes: [
-    { path: "policies/a.md", base_version: 0, content: b64("# 规则") },
+    { path: "policies/a.md", base_version: 0, content: b64("# Rules") },
     { path: "policies0", base_version: 0, content: b64("x") },
     { path: "config.toml", base_version: 0, content: b64("secret") },
   ] }) });
@@ -51,11 +51,11 @@ test("worker list/read: files table only, whitelist enforced", async () => {
   let r = handleReadFiles(sql, new URL("http://x/api/files/list?prefix=policies/"))!;
   const list = await r.json() as any;
   expect(list.files.map((f: any) => f.path)).toEqual(["policies/a.md"]);
-  expect(list.files[0].size).toBe(Buffer.byteLength("# 规则"));
+  expect(list.files[0].size).toBe(Buffer.byteLength("# Rules"));
   expect(sql.queries.some((q) => /history/.test(q))).toBe(false);
   expect(sql.queries[0]).toContain("path >= ? AND path < ?");
   r = handleReadFiles(sql, new URL("http://x/api/files/read?path=policies/a.md"))!;
-  expect(((await r.json()) as any).content).toBe("# 规则");
+  expect(((await r.json()) as any).content).toBe("# Rules");
   expect(handleReadFiles(sql, new URL("http://x/api/files/read?path=config.toml"))!.status).toBe(403);
   expect(handleReadFiles(sql, new URL("http://x/api/files/list?prefix="))!.status).toBe(403);
   expect(handleReadFiles(sql, new URL("http://x/api/files/read?path=memory/none.md"))!.status).toBe(404);

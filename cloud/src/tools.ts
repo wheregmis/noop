@@ -284,7 +284,7 @@ export const TOOLS: Tool[] = [
   { name: "remember", title: "Remember", annotations: RW, write: true,
     inputSchema: obj({ text: str("The rule or fact, one or two sentences, phrased so it is useful later (who/what it applies to, and why)"),
       file: str("memory/owner.md (who the owner is), memory/principles.md (how to work), memory/taste.md (UI/code taste), memory/projects.md, or agents/<name>/memory.md for one agent's know-how") }, ["text", "file"]),
-    description: "Write a durable memory the whole fleet reads from now on: the owner's preference, a rule ('以后都这样'), a fact about a project." },
+    description: "Write a durable memory the whole fleet reads from now on: the owner's preference, a rule ('from now on always do it this way'), a fact about a project." },
   { name: "edit_memory", title: "Edit or delete a memory", annotations: DESTRUCTIVE, write: true,
     inputSchema: obj({ file: str("The memory file, as listed by read_memory"),
       match: str("Text copied from the entry, enough to pick exactly one line (find it with read_memory first)"),

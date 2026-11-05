@@ -157,6 +157,6 @@ export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>,
   }
   const msg = `🧹 disk cleanup freed ${gb(total)}GB → ${s.diskFreeGB}GB free (${lines.join("; ") || "nothing big"})`;
   journal(host, msg);
-  if (low(s)) await alert(`⚠️ ${host} 磁盘仍不足：剩余 ${s.diskFreeGB}GB（${s.diskFreePct}%），自动清理已尽力（${gb(total)}GB）。需要你处理。`);
+  if (low(s)) await alert(`⚠️ ${host} is still low on disk: ${s.diskFreeGB}GB left (${s.diskFreePct}%) after cleaning up as much as it could (${gb(total)}GB). Needs your attention.`);
   return msg;
 }

@@ -142,12 +142,12 @@ async function processTask(path: string, cfg: Cfg, host: string) {
             requeue_note: `Your previous run was stopped: ${why}. Continue from where it got to: first check what is already done (branch agent/${meta.id}-*, commits, PRs, comments you posted) and don't redo it. If you are waiting on something slow, return "waiting" instead of sitting idle.` },
             body);
           if (existsSync(path)) unlinkSync(path);
-          journal(host, `🔁 ${meta.id} 没有动静被中止（${why}），接着跑（第 ${stalls} 次）`);
+          journal(host, `🔁 ${meta.id} aborted after going quiet (${why}); continuing (attempt ${stalls})`);
           await _commitPush(`[${host}] ${meta.id} stalled, rerun`);
         });
         return;
       }
-      res = { status: "failed", summary: `连续 ${stalls} 次运行都卡住没有动静（${why}），已停止重试` };
+      res = { status: "failed", summary: `Stalled with no activity ${stalls} runs in a row (${why}); stopped retrying` };
       break;
     }
     res = parseResult(out);
@@ -159,7 +159,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
       const was = `${acct.cli}/${acct.name}`;
       await locked(async () => {
         await _pull();
-        journal(host, `🔀 ${meta.id} ${was} ${failure === "quota" ? "额度用完" : "需要登录"}，立即改用 ${next.cli}/${next.name} 在本机重跑`);
+        journal(host, `🔀 ${meta.id} ${was} ${failure === "quota" ? "hit its usage limit" : "needs sign-in"}; rerunning right away on ${next.cli}/${next.name} here`);
         await _commitPush(`[${host}] ${meta.id} switch to ${next.cli}`);
       });
       acct = next;
@@ -212,7 +212,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     // the owner's approval covers the whole task: a wait for CI before the approved merge must not revoke it
     writeDoc(P("tasks", "waiting", `${meta.id}.md`), { ...done, gate_override: meta.gate_override, wake_at: wake, waiting_on: res.waiting_on ?? "", wait_check: res.wait_check || undefined },
       body + runNote + `\n**Waiting on:** ${res.waiting_on ?? "?"} (check again ${wake})\n`);
-    journal(host, `⏳ ${meta.id} 等待 ${res.waiting_on ?? ""}，${mins} 分钟后再看`);
+    journal(host, `⏳ ${meta.id} waiting on ${res.waiting_on ?? ""}; checking again in ${mins} min`);
   } else if (res.status === "needs_decision") {
     const did = openDecision(meta, res, host);
     writeDoc(P("tasks", "blocked", `${meta.id}.md`), { ...done, decision: did }, body + runNote);
@@ -244,7 +244,7 @@ async function handleReplies(cfg: Cfg, host: string) {
     if (r.id.startsWith("P-")) {
       if (resolveProposals(r.id, r.answer, `owner(${r.source})`)) {
         journal(host, `${r.id} owner approved: ${r.answer}`);
-        await notify(`${r.id} 已按你的选择排队`, cfg);
+        await notify(`${r.id} queued with your choice`, cfg);
       }
       continue;
     }
@@ -256,20 +256,20 @@ async function handleReplies(cfg: Cfg, host: string) {
       const tid = amendDecision(r.id, r.answer, "owner(chat)");
       if (tid) {
         journal(host, `${r.id} owner correction: ${r.answer}`);
-        await notify(`已按你的纠正更新 ${r.id}（${tid}），之前的选择作废`, cfg);
+        await notify(`Updated ${r.id} (${tid}) with your correction; the earlier choice no longer counts`, cfg);
       } else await handleOwnerMessage(r.answer, undefined, true);
       continue;
     }
     if (open.has(r.id) && r.answer.trim() === IGNORE) {
       ignoreDecision(r.id, `owner(${r.source})`);
       journal(host, `🙈 ${r.id} owner ignored it`);
-      await notify(`已忽略 ${r.id}，不再追问`, cfg);
+      await notify(`Ignored ${r.id}; won't ask again`, cfg);
     } else if (open.has(r.id)) {
       closeDecision(r.id, r.answer, `owner(${r.source})`);
       journal(host, `✔ ${r.id} owner answered via ${r.source}: ${r.answer}`);
-      await notify(`收到 ${r.id}：${r.answer} — 任务已重新排队`, cfg);
+      await notify(`Got ${r.id}: ${r.answer}. The task is back in the queue`, cfg);
     } else if (/^override\b/i.test(r.answer) && overrideJudge(r.id, r.answer.replace(/^override[\s:：]*/i, ""), r.source, host)) {
-      await notify(`已记录你对 ${r.id} 的纠正，judge 以后会参考；已创建重做任务`, cfg);
+      await notify(`Recorded your correction to ${r.id}; the judge will use it from now on. A redo task is created`, cfg);
     }
   }
 }
@@ -355,30 +355,30 @@ async function ownerUpdate(c: Cfg, host: string) {
   writeFileSync(UPDATE_DONE(), at);
   const from = runningRev().rev;
   const before = from?.slice(0, 7) ?? "?";
-  // each step goes out in the heartbeat at once, so the owner watches it in Settings › 版本
+  // each step goes out in the heartbeat at once, so the owner watches it in Settings › Version
   const report = async (state: UpdateState["state"], detail?: string) => {
     setUpdateState({ at, state, detail, from });
     await locked(async () => { await _pull(); heartbeat(c, running, sample(c)); await _commitPush(`[${host}] update: ${state}`); }).catch(() => {});
   };
-  await report("updating", "拉取并测试新代码");
+  await report("updating", "Pulling and testing the new code");
   const updated = await selfUpdate({ force: true, deploy: true }).catch(() => false);
   if (updated) {
     journal(host, `⬆️ updated on the owner's request (was ${before}); restarting${running ? ` after ${running} running task(s)` : ""}`);
-    await report(running ? "waiting" : "restarting", running ? `等 ${running} 个任务跑完后重启` : undefined);
+    await report(running ? "waiting" : "restarting", running ? `Waiting for ${running} running task(s) to finish, then restarting` : undefined);
     void drainAndExit("self-update", host);
     return;
   }
   const now7 = (Bun.spawnSync(["git", "-C", CODE, "rev-parse", "--short", "HEAD"], { stdout: "pipe" }).stdout.toString().trim()) || before;
   const stale = now7 !== before; // the code moved but this process could not take it (local edits, failing tests)
   if (isPrimary(c, host) && c.cloud?.url) {
-    await report("deploying", "重新发布线上");
+    await report("deploying", "Redeploying the live site");
     const cloud = await import("./cloud");
     const err = await cloud.cloudDeploy(c).then((u) => (u ? "" : cloud.lastDeployError || "unknown"), (e) => String(e));
     journal(host, `⬆️ already at ${now7}; ${err ? `redeploying the Worker failed: ${err.replace(/\s+/g, " ").slice(-300)}` : "redeployed the Worker and the web app"}`);
-    await report(err ? "failed" : "current", err ? `代码已是最新，重新发布线上失败：${err.replace(/\s+/g, " ").slice(0, 120)}` : "已重新发布线上");
+    await report(err ? "failed" : "current", err ? `Code is up to date, but redeploying the live site failed: ${err.replace(/\s+/g, " ").slice(0, 120)}` : "Live site redeployed");
   } else {
     journal(host, stale ? `⬆️ not updated (still running ${before}; local edits or failing tests)` : `⬆️ already at ${now7}`);
-    await report(stale ? "failed" : "current", stale ? "有本地改动或测试没通过，仍在运行旧代码" : undefined);
+    await report(stale ? "failed" : "current", stale ? "Local changes or failing tests; still running the old code" : undefined);
   }
 }
 
@@ -405,7 +405,7 @@ async function handleFailure(meta: Record<string, string>, body: string, summary
   const ownerCares = meta.origin === "owner" || /^owner/.test(meta.source ?? "") || meta.priority === "urgent";
   if (!ownerCares || cfg.notify?.on_failure === false) return; // routine/internal work: journal only; architect reviews failures
   const reason = summary.split("\n")[0].replace(/\s+/g, " ").slice(0, 140);
-  await notify(`没能完成「${meta.title}」：${reason}。我会在日报里跟进；需要换个做法可以直接告诉我。`, cfg,
+  await notify(`Couldn't finish "${meta.title}": ${reason}. I'll follow up in the daily report; tell me if you want a different approach.`, cfg,
     { kind: "notice", ref: meta.id, from: `${agentName(meta.agent || "lead")}@${host}` });
 }
 const GH_HEAVY = new Set(["dispatcher", "reviewer", "ops-watcher", "oss-triage", "release-manager"]);
@@ -419,7 +419,7 @@ function wakeParents(host: string, ready = new Set<string>()) {
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, wake_at: undefined, status: undefined, claimed_by: undefined, resumed: "yes" },
         `${body}\nResumed after waiting on: ${meta.waiting_on ?? "?"}. Check it now; if still not ready, return "waiting" again.\n`);
       unlinkSync(p);
-      journal(host, `⏰ ${meta.id} 等待结束，重新排队检查`);
+      journal(host, `⏰ ${meta.id} wait is over; requeued to check`);
       continue;
     }
     const kids = (meta.children ?? "").split(",").filter(Boolean);
@@ -685,12 +685,12 @@ async function daemon(cfg: Cfg) {
       else writeDoc(P("tasks", "rejected", `${kid}.md`), { ...kd.meta, cancelled: now() }, `${kd.body}\n\n## Cancelled ${now()}\nParent ${tid} was cancelled.\n`);
       unlinkSync(P("tasks", k, `${kid}.md`));
     }
-    journal(host, done ? `✅ ${tid} 你已标记为完成` : `🛑 ${tid} 已按你的要求取消`);
+    journal(host, done ? `✅ ${tid} marked done by you` : `🛑 ${tid} cancelled at your request`);
     await _commitPush(`[${host}] ${done ? "finish" : "cancel"} ${tid}`);
     return done ? "done" : "cancelled";
   }));
   // A new task from the owner's chat (created by the chat brain, or by create_task over MCP). It carries the channel's
-  // recent conversation and the task it continues, so terse follow-ups ("不行，…", "这个细节记下来") keep their meaning.
+  // recent conversation and the task it continues, so terse follow-ups ("no, …", "note this detail down") keep their meaning.
   let chatNow: { text: string; chat: string[]; reply?: string; thread?: boolean } | null = null; // the owner message the brain is handling
   const createOwnerTask = (op: { title: string; details?: string; repo?: string; agent?: string; follows?: string }) => locked(async () => {
     await _pull();
@@ -700,9 +700,9 @@ async function daemon(cfg: Cfg) {
     const asked = m ? `The owner (CEO) said in chat:\n\n> ${m.text.replace(/\n/g, "\n> ")}\n` : "The owner asked for this through Noop's MCP connector.\n";
     const context = m && (m.chat.length || m.reply)
       ? (m.reply ? `\nThe owner wrote this as a reply to the team's message about ${m.reply}.\n` : "") +
-        `\n## The channel just before this message\nThe owner writes tersely: words like "this", "不行", "这个细节", "以后都这样" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
+        `\n## The channel just before this message\nThe owner writes tersely: words like "this", "no", "that detail", "always do it this way" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
       : "";
-    const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("记录下来", "以后都这样"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
+    const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("note this down", "always do it this way"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
     const id = newTask(op.title.slice(0, 80), `${asked}${op.details ? `\n## What the chat understood\n${op.details}\n` : ""}${op.repo ? `\nRepo: ${op.repo}\n` : ""}${context}${cont}\nHandle it like a capable chief of staff (see your profile: "Owner requests").`,
       { agent: op.agent ?? "lead", source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
     journal(host, `💬 ${id} from owner ${m ? "chat" : "MCP"}${prevFile ? ` (follows ${prev})` : ""}: ${op.title.slice(0, 80)}`);
@@ -885,7 +885,7 @@ async function main() {
       });
       await pull();
       const id = newTask(positionals.join(" "), values.body ?? "", { ...values, source: `owner@${host}` });
-      journal(host, `＋ ${id} by owner: ${positionals.join(" ")}`);
+      journal(host, `+ ${id} by owner: ${positionals.join(" ")}`);
       await commitPush(`[${host}] add ${id}`);
       return console.log(id);
     }
@@ -921,9 +921,9 @@ async function main() {
     case "login": { // show the pending sign-in code (used when email isn't configured)
       const url = String(cfg.cloud?.url ?? `http://localhost:${cfg.server?.port ?? 8787}`).replace(/\/$/, ""); // no Worker: this machine's own server
       const r = await fetch(`${url}/api/host/login-code`, { headers: { Authorization: `Bearer ${cfg.server?.token}` } }).catch(() => null);
-      if (!r?.ok) return void console.log("没有待使用的验证码：先在 app 里输入邮箱，点「发送验证码」，再运行 noop login");
+      if (!r?.ok) return void console.log("No pending code: enter your email in the app and tap \"Send code\", then run noop login");
       const c = (await r.json()) as { email: string; code: string; expires: number };
-      return void console.log(`\n  ${c.email} 的验证码：${c.code}  （${Math.max(1, Math.round((c.expires - Date.now()) / 60000))} 分钟内有效）\n`);
+      return void console.log(`\n  Code for ${c.email}: ${c.code}  (valid for ${Math.max(1, Math.round((c.expires - Date.now()) / 60000))} min)\n`);
     }
     case "cloud": {
       if (rest[0] !== "deploy") return void console.log("usage: hub cloud deploy");

@@ -70,8 +70,8 @@ function learn(meta: Record<string, string>, answer: string, by: string): Record
     extra.overrode_recommendation = "yes";
     const f = P("memory", "lessons.md");
     if (!existsSync(f)) writeFileSync(f, "# Lessons learned (auto-appended by agents)\n\n");
-    appendFileSync(f, `- ${today()} ${meta.id} [${meta.agent}] Q「${meta.question}」: agent recommended「${meta.recommendation}」, owner chose **${answer}**` +
-      `${meta.shadow_answer ? ` (judge would have said「${meta.shadow_answer}」)` : ""}\n`);
+    appendFileSync(f, `- ${today()} ${meta.id} [${meta.agent}] Q "${meta.question}": agent recommended "${meta.recommendation}", owner chose **${answer}**` +
+      `${meta.shadow_answer ? ` (judge would have said "${meta.shadow_answer}")` : ""}\n`);
   }
   return extra;
 }
@@ -99,7 +99,7 @@ export function closeDecision(id: string, answer: string, by: string, note = "")
 }
 
 /** The answer that sets a question aside: the owner does not want to deal with it. */
-export const IGNORE = "忽略";
+export const IGNORE = "Ignore";
 
 /** Owner set the question aside: close it (no lesson: not a choice between the options) and drop its task. */
 export function ignoreDecision(id: string, by: string): boolean {
@@ -154,7 +154,7 @@ export async function routeDecision(id: string, cfg: Cfg, host: string) {
   }
   if (v && !judgeMayDecide(cfg, meta.agent) && v.verdict !== "hold") { // shadow mode: record, but ask the owner
     journal(host, `👤 shadow-judge on ${id}: would ${v.verdict} "${v.answer ?? v.reason}"`);
-    v = { verdict: "hold", reason: `学习期，judge 认为：${v.verdict === "decided" ? v.answer : "应退回: " + v.reason}` };
+    v = { verdict: "hold", reason: `Learning period; the judge thinks: ${v.verdict === "decided" ? v.answer : "send back: " + v.reason}` };
   }
   if (v?.verdict === "decided" && v.answer) {
     closeDecision(id, v.answer, "judge", `Reason: ${v.reason} (cite: ${v.cite ?? "-"})`);
@@ -171,17 +171,17 @@ export async function routeDecision(id: string, cfg: Cfg, host: string) {
   const menu = meta.kind === "menu";
   const context = body.match(/## Context\n([\s\S]*?)(?=\n## |$)/)?.[1]?.trim() ?? "";
   const text = menu ? [
-    `*${id}* · ${agentName(meta.agent)}：团队空闲了，下一步做哪些？`,
+    `*${id}* · ${agentName(meta.agent)}: the team is idle. What should it do next?`,
     ...opts.map((o) => `${o}`),
-    `建议：*${meta.recommendation || "-"}*`,
-    `回复 \`${id} 1,3\`（可多选）或 \`${id} <其他指示>\``,
+    `Recommendation: *${meta.recommendation || "-"}*`,
+    `Reply \`${id} 1,3\` (multiple allowed) or \`${id} <other instructions>\``,
   ].join("\n") : [
     // the card already shows the id, the agent and the options as buttons: the question, then the agent's account of
     // what is at stake (what the PR changes, what each choice means). The judge's reason for asking is not news to the owner.
     linkRefs(meta.question ?? "", meta.task, [context, ...opts].join("\n")),
     context ? `\n${linkRefs(context, meta.task, [meta.question ?? "", ...opts].join("\n"))}` : "",
-    // the app marks this option 推荐 (and drops the line); chat channels show it as written
-    meta.recommendation ? `\n建议：*${meta.recommendation}*` : "",
+    // the app marks this option "Recommended" (and drops the line); chat channels show it as written
+    meta.recommendation ? `\nRecommendation: *${meta.recommendation}*` : "",
   ].filter(Boolean).join("\n");
   const ids = await notify(text, cfg, { kind: menu ? "menu" : "decision", ref: id, options: opts,
     attachments: (meta.attachments ?? "").split(" | ").filter(Boolean), from: `${agentName(meta.agent)}@${meta.host}` });
@@ -198,7 +198,7 @@ export function overrideJudge(id: string, answer: string, src: string, host: str
   writeDoc(f, { ...meta, answer, answered_by: `owner-override(${src})`, overridden_judge: meta.answer }, body + `\n## Owner override\n${answer}\n`);
   const fb = P("memory", "judge-feedback.md");
   if (!existsSync(fb)) writeFileSync(fb, "# Owner corrections to judge rulings\n\n");
-  appendFileSync(fb, `- ${today()} ${id}: Q「${meta.question}」judge said「${meta.answer}」→ owner: **${answer}**\n`);
+  appendFileSync(fb, `- ${today()} ${id}: Q "${meta.question}": judge said "${meta.answer}" → owner: **${answer}**\n`);
   newTask(`Redo per owner override of ${id}`, `Judge answered "${meta.answer}" but the owner overrode it:\n\n**${answer}**\n\nOriginal question: ${meta.question}\nRelated task: ${meta.task}. Adjust/revert the earlier work accordingly.`,
     { agent: meta.agent, priority: "high", source: `override:${id}` });
   journal(host, `🔁 owner overrode judge on ${id}: ${answer}`);

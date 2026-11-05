@@ -225,7 +225,7 @@ export type Activity = { at: string; step?: string; steps: number };
 /** This process's running agents (written by runAgent, published in the heartbeat). */
 export const agentActivity = new Map<string, Activity>();
 
-/** One host's progress on an update request (`at` names the request), shown per machine in Settings › 版本. */
+/** One host's progress on an update request (`at` names the request), shown per machine in Settings › Version. */
 export type UpdateState = {
   at: string; ts: string;
   state: "updating" | "waiting" | "restarting" | "deploying" | "done" | "current" | "failed";
@@ -246,7 +246,7 @@ export function updateState(): UpdateState | undefined {
   if ((u.state === "restarting" || u.state === "waiting") && Date.parse(u.ts) < STARTED) {
     const rev = runningRev().rev;
     if (rev && rev !== u.from) setUpdateState({ at: u.at, state: "done", detail: rev.slice(0, 7), from: u.from });
-    else setUpdateState({ at: u.at, state: "failed", detail: "重启后仍是旧代码", from: u.from });
+    else setUpdateState({ at: u.at, state: "failed", detail: "Still the old code after restart", from: u.from });
     return updateState();
   }
   return u;

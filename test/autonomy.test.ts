@@ -26,7 +26,7 @@ test("open batch with stale tasks is closed and rebuilt (no deadlock)", async ()
   task("proposed", "T-0002", "routine:pr-review");
   await A.proposeBatch(cfg, "pc");
   expect(files("decisions", "open")).toEqual(["P-0001.md"]);
-  expect(sent[0]).toContain("请确认");
+  expect(sent[0]).toContain("please confirm");
   expect(sent[0]).not.toMatch(/Which|fleet/);
 
   // unchanged → nothing happens

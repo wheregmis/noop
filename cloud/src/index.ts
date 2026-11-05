@@ -121,10 +121,10 @@ export class Hub extends DurableObject<Env> {
     const email = normEmail(rawEmail), code = typeof rawCode === "string" ? rawCode.trim() : "";
     if (!validEmail(email) || !/^\d{6}$/.test(code)) return { error: "invalid request", status: 400 };
     const r = this.sql.exec("SELECT hash, expires, attempts FROM auth_codes WHERE email = ?", email).toArray()[0];
-    if (!r || (r.expires as number) < Date.now()) return { error: "验证码无效或已过期，请重新获取", status: 401 };
-    if ((r.attempts as number) >= CODE_TRIES) return { error: "尝试次数太多，请重新获取验证码", status: 401 };
+    if (!r || (r.expires as number) < Date.now()) return { error: "Invalid or expired code. Request a new one.", status: 401 };
+    if ((r.attempts as number) >= CODE_TRIES) return { error: "Too many attempts. Request a new code.", status: 401 };
     this.sql.exec("UPDATE auth_codes SET attempts = attempts + 1 WHERE email = ?", email);
-    if (!sameStr(await sha256(`${email}:${code}`), r.hash as string)) return { error: "验证码不对", status: 401 };
+    if (!sameStr(await sha256(`${email}:${code}`), r.hash as string)) return { error: "Wrong code.", status: 401 };
     this.sql.exec("DELETE FROM auth_codes WHERE email = ?", email);
     this.sql.exec("DELETE FROM kv WHERE k = 'cli_code'");
     return { email };
@@ -214,7 +214,7 @@ export class Hub extends DurableObject<Env> {
   ownerMessage(text: string, ref?: string, attachments?: string[], thread = false): Ev {
     const ev = this.append({ from: "owner", kind: "owner", text, ref, ...(attachments?.length ? { attachments } : {}), ...(thread ? { thread } : {}) });
     this.toInbox({ type: "message", event: ev });
-    if (!this.hostOnline()) this.append({ from: "hub", kind: "system", text: "收到。团队的电脑暂时都不在线，上线后会马上处理。", ref: ev.id });
+    if (!this.hostOnline()) this.append({ from: "hub", kind: "system", text: "Got it. None of the team's computers are online right now; I'll pick this up as soon as one is.", ref: ev.id });
     return ev;
   }
 
@@ -284,7 +284,7 @@ export class Hub extends DurableObject<Env> {
       return json({ ok: true });
     }
     if (p === "/api/push/test") {
-      const r = await this.pushAll({ title: "Noop", body: "测试通知：手机推送已开通。", kind: "notice", url: "/", tag: "test", options: [], badge: 0 }, "normal", who.session);
+      const r = await this.pushAll({ title: "Noop", body: "Test notification: phone push is on.", kind: "notice", url: "/", tag: "test", options: [], badge: 0 }, "normal", who.session);
       return json({ ok: true, ...r });
     }
     return json({ error: "not found" }, 404);
@@ -325,9 +325,9 @@ export class Hub extends DurableObject<Env> {
       this.sql.exec("DELETE FROM auth_sends WHERE ts < ?", now - 3600_000);
       // Per-email throttle applies to every address alike, so it reveals nothing about the allow-list.
       const recent = this.sql.exec("SELECT COUNT(*) AS n FROM auth_sends WHERE email = ? AND ts > ?", email, now - RESEND_MS).one().n as number;
-      if (recent) return json({ error: "请稍等一分钟再重新获取验证码" }, 429);
+      if (recent) return json({ error: "Please wait a minute before requesting another code." }, 429);
       const sent = this.sql.exec("SELECT COUNT(*) AS n FROM auth_sends WHERE sent = 1").one().n as number;
-      if (sent >= SENDS_PER_HOUR) return json({ error: "验证码发送太频繁，请一小时后再试" }, 429);
+      if (sent >= SENDS_PER_HOUR) return json({ error: "Too many codes sent. Try again in an hour." }, 429);
       const owners = (this.env.HUB_OWNER_EMAIL ?? "").split(",").map(normEmail).filter(Boolean);
       const isOwner = owners.includes(email) || (cli && !owners.length);
       this.sql.exec("INSERT INTO auth_sends (email, ts, sent) VALUES (?, ?, ?)", email, now, isOwner ? 1 : 0);
@@ -337,14 +337,14 @@ export class Hub extends DurableObject<Env> {
       if (cli) { this.set("cli_code", { email, code, expires: now + CODE_TTL }); return json({ ok: true, delivery: "cli" }); }
       if (!isOwner) return json({ ok: true });
       try {
-        const subject = `Noop 登录验证码：${code}`;
-        const text = `你的 Noop 登录验证码是：\n\n    ${code}\n\n10 分钟内有效。\n\n如果不是你本人操作，请忽略这封邮件。\n`;
+        const subject = `Noop sign-in code: ${code}`;
+        const text = `Your Noop sign-in code is:\n\n    ${code}\n\nValid for 10 minutes.\n\nIf this wasn't you, ignore this email.\n`;
         if (cf) await cfMail(this.env.EMAIL!, this.env.HUB_MAIL_FROM!, email, subject, text);
         else await sendMail(smtp!, email, subject, text);
       } catch (err) {
         console.error(`auth mail failed: ${err}`);
         this.sql.exec("DELETE FROM auth_codes WHERE email = ?", email);
-        return json({ error: "验证码邮件发送失败，请稍后再试" }, 502);
+        return json({ error: "Couldn't send the code email. Try again later." }, 502);
       }
       return json({ ok: true });
     }
@@ -403,7 +403,7 @@ export class Hub extends DurableObject<Env> {
     if (p === "/api/host/join" && m === "POST") { // a new machine, approved by the owner's login, gets the machine key
       if (who === "machine") return json({ error: "forbidden" }, 403);
       const { host } = (await req.json().catch(() => ({}))) as { host?: string };
-      this.append({ from: "hub", kind: "notice", text: `新机器 ${String(host ?? "?").slice(0, 60)} 已加入团队。` });
+      this.append({ from: "hub", kind: "notice", text: `New machine ${String(host ?? "?").slice(0, 60)} joined the team.` });
       return json({ token: this.env.HUB_TOKEN });
     }
     if (p === "/api/host/revoke-sessions" && m === "POST") {

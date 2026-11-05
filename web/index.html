@@ -165,34 +165,34 @@ textarea::placeholder { color: var(--text-faint); }
   <aside>
     <div class="brand"><span class="mark"></span>Noop</div>
     <div class="side-scroll">
-      <div class="sec"><h4>待你决定 <span id="nWait"></span></h4><div id="waitList"></div></div>
-      <div class="sec"><h4>进行中 <span id="nRun"></span></h4><div id="runList"></div></div>
-      <div class="sec"><h4>机器</h4><div id="hostList"></div></div>
-      <div class="sec"><h4>队列</h4><div id="queue"></div></div>
+      <div class="sec"><h4>Needs your decision <span id="nWait"></span></h4><div id="waitList"></div></div>
+      <div class="sec"><h4>In progress <span id="nRun"></span></h4><div id="runList"></div></div>
+      <div class="sec"><h4>Machines</h4><div id="hostList"></div></div>
+      <div class="sec"><h4>Queue</h4><div id="queue"></div></div>
     </div>
     <div class="side-foot">
-      <button class="icon-btn" id="themeBtn" title="切换主题">◐ 主题</button>
+      <button class="icon-btn" id="themeBtn" title="Switch theme">◐ Theme</button>
     </div>
   </aside>
   <div class="scrim" id="scrim"></div>
   <main>
     <div class="topbar">
-      <button class="icon-btn" id="menuBtn" aria-label="菜单">☰</button>
-      <div class="title">团队频道</div>
+      <button class="icon-btn" id="menuBtn" aria-label="Menu">☰</button>
+      <div class="title">Team channel</div>
       <span class="sub" id="autonomy"></span>
     </div>
     <div class="feed" id="feed"><div class="col" id="log">
-      <div class="hello" id="hello"><h1>早上好</h1><p>团队在后台运转。需要你拍板的事会出现在这里。</p></div>
+      <div class="hello" id="hello"><h1>Good morning</h1><p>The team works in the background. Anything that needs your decision shows up here.</p></div>
     </div></div>
     <div class="composer">
       <div class="box">
-        <div class="replying" id="replying"><span id="replyLabel"></span><button id="cancelReply" aria-label="取消">✕</button></div>
+        <div class="replying" id="replying"><span id="replyLabel"></span><button id="cancelReply" aria-label="Cancel">✕</button></div>
         <div class="box-row">
-          <textarea id="t" rows="1" placeholder="给团队下指令，例如：把 nsh 的 gallery 示例在 Linux 上截图检查一遍"></textarea>
-          <button class="send" id="send" disabled>发送</button>
+          <textarea id="t" rows="1" placeholder="Give the team an instruction, e.g. screenshot-check the nsh gallery example on Linux"></textarea>
+          <button class="send" id="send" disabled>Send</button>
         </div>
       </div>
-      <div class="hint">⌘/Ctrl + Enter 发送 · 回复决策：<code>D-0001 A</code> · 批准清单：<code>P-0001 1,3</code></div>
+      <div class="hint">⌘/Ctrl + Enter to send · Answer a decision: <code>D-0001 A</code> · Approve a list: <code>P-0001 1,3</code></div>
     </div>
   </main>
 </div>
@@ -211,7 +211,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const fmt = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*([^*\n]+)\*/g, "<b>$1</b>");
 const initials = (n) => (n || "?").replace(/@.*/, "").slice(0, 2).toUpperCase();
 const hour = new Date().getHours();
-document.querySelector(".hello h1").textContent = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好";
+document.querySelector(".hello h1").textContent = hour < 6 ? "Up late" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
 function atBottom() { return feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 80; }
 function scrollEnd() { feedEl.scrollTop = feedEl.scrollHeight; }
@@ -225,7 +225,7 @@ function choicesOf(e) {
   return [...new Set(o.map((x) => (x.match(/^\s*([A-Z])\s*[:：.]/) || [])[1]).filter(Boolean))];
 }
 function recOf(e) {
-  const m = (e.text || "").match(/建议：\*?([^*\s　]+)/);
+  const m = (e.text || "").match(/Recommendation:\s*\*?([^*\s]+)/);
   return m ? m[1] : null;
 }
 
@@ -233,7 +233,7 @@ function render(e) {
   $("hello")?.remove();
   last = e.ts > last ? e.ts : last;
   const d = new Date(e.ts), day = d.toLocaleDateString();
-  if (day !== lastDay) { lastDay = day; log.insertAdjacentHTML("beforeend", `<div class="day">${day === new Date().toLocaleDateString() ? "今天" : day}</div>`); }
+  if (day !== lastDay) { lastDay = day; log.insertAdjacentHTML("beforeend", `<div class="day">${day === new Date().toLocaleDateString() ? "Today" : day}</div>`); }
   const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   if (e.kind === "owner") {
     if (e.ref) answered.add(e.ref);
@@ -245,7 +245,7 @@ function render(e) {
   const isHub = /^hub/.test(e.from);
   const el = document.createElement("div");
   el.className = "msg" + (e.kind === "system" ? " sys" : "");
-  const label = { decision: "需要决定", menu: "下一步", proposals: "待批准", login: "登录", notice: "", system: "" }[e.kind] || "";
+  const label = { decision: "Decision", menu: "Next step", proposals: "To approve", login: "Sign-in", notice: "", system: "" }[e.kind] || "";
   const media = (e.attachments || []).map((a) => {
     const u = a + "?token=" + encodeURIComponent(token);
     return /\.(mp4|webm|mov)$/i.test(a) ? `<video controls playsinline preload="metadata" src="${u}"></video>` : `<a href="${u}" target="_blank" rel="noopener"><img loading="lazy" src="${u}" alt=""></a>`;
@@ -259,11 +259,11 @@ function render(e) {
     for (const c of choicesOf(e).slice(0, 12)) {
       const b = document.createElement("button");
       b.className = "opt" + (rec && rec.split(/[,，]/)[0] === c ? " rec" : "");
-      b.textContent = c === "all" ? "全部" : c === "none" ? "都不要" : c;
+      b.textContent = c === "all" ? "All" : c === "none" ? "None" : c;
       b.onclick = () => send(`${e.ref} ${c}`);
       opts.appendChild(b);
     }
-    const o = document.createElement("button"); o.className = "opt ghost"; o.textContent = "其他指示…";
+    const o = document.createElement("button"); o.className = "opt ghost"; o.textContent = "Other instructions…";
     o.onclick = () => setReply(e.ref);
     opts.appendChild(o);
     if (answered.has(e.ref)) el.querySelector(".card").classList.add("done");
@@ -271,7 +271,7 @@ function render(e) {
   log.appendChild(el);
 }
 function markAnswered(ref) { document.querySelectorAll(`.card[data-ref="${ref}"]`).forEach((c) => c.classList.add("done")); }
-function setReply(ref) { replyTo = ref; $("replyLabel").textContent = "回复 " + ref; $("replying").classList.add("on"); t.focus(); }
+function setReply(ref) { replyTo = ref; $("replyLabel").textContent = "Reply " + ref; $("replying").classList.add("on"); t.focus(); }
 $("cancelReply").onclick = () => { replyTo = null; $("replying").classList.remove("on"); };
 
 async function send(text) {
@@ -286,32 +286,32 @@ $("send").onclick = () => { const v = t.value.trim(); if (!v) return; send(v); t
 
 async function load() {
   const r = await fetch("/api/feed" + (last ? "?since=" + encodeURIComponent(last) : ""), { headers: H });
-  if (r.status === 401) { $("autonomy").textContent = "token 无效"; return; }
+  if (r.status === 401) { $("autonomy").textContent = "Invalid token"; return; }
   const stick = atBottom() || !last;
   (await r.json()).events.forEach(render);
   if (stick) scrollEnd();
 }
 
-const ago = (iso) => { const s = (Date.now() - Date.parse(iso)) / 1000; return s < 90 ? "刚刚" : s < 3600 ? Math.round(s / 60) + " 分钟" : Math.round(s / 3600) + " 小时"; };
+const ago = (iso) => { const s = (Date.now() - Date.parse(iso)) / 1000; return s < 90 ? "just now" : s < 3600 ? Math.round(s / 60) + " min" : Math.round(s / 3600) + " h"; };
 async function status() {
   let s; try { s = await (await fetch("/api/status", { headers: H })).json(); } catch { return; }
   const waits = s.decisions.filter((d) => d.held || d.kind === "proposals");
   $("nWait").innerHTML = waits.length ? `<span class="badge">${waits.length}</span>` : "";
-  $("waitList").innerHTML = waits.map((d) => `<button class="row" data-ref="${esc(d.id)}"><span class="dot wait"></span><span class="t">${esc(d.question || d.id)}</span><span class="s">${esc(d.id)}</span></button>`).join("") || `<div class="empty">没有待办，团队在自己推进</div>`;
+  $("waitList").innerHTML = waits.map((d) => `<button class="row" data-ref="${esc(d.id)}"><span class="dot wait"></span><span class="t">${esc(d.question || d.id)}</span><span class="s">${esc(d.id)}</span></button>`).join("") || `<div class="empty">Nothing pending; the team is moving on its own</div>`;
   $("waitList").querySelectorAll(".row").forEach((r) => r.onclick = () => {
     const c = document.querySelector(`.card[data-ref="${r.dataset.ref}"]`);
     if (c) c.scrollIntoView({ behavior: "smooth", block: "center" }); else setReply(r.dataset.ref);
     $("app").classList.remove("drawer");
   });
   $("nRun").textContent = s.active.length || "";
-  $("runList").innerHTML = s.active.map((a) => `<div class="row" title="${esc(a.id)}"><span class="dot run"></span><span class="t">${esc(a.title)}</span><span class="s">${esc(a.agent)}</span></div>`).join("") || `<div class="empty">空闲</div>`;
+  $("runList").innerHTML = s.active.map((a) => `<div class="row" title="${esc(a.id)}"><span class="dot run"></span><span class="t">${esc(a.title)}</span><span class="s">${esc(a.agent)}</span></div>`).join("") || `<div class="empty">Idle</div>`;
   $("hostList").innerHTML = s.hosts.map((h) => {
     const os = (h.caps.find((c) => c.startsWith("os:")) || "").slice(3);
     const load = Math.min(100, Math.round((h.stats?.loadRatio ?? 0) * 100));
-    return `<div class="row"><span class="dot on"></span><span class="t">${esc(h.host)} <span class="s">${esc(os)}</span></span><span class="meter" title="负载 ${load}% · 磁盘 ${h.stats?.diskFreeGB ?? "?"}GB · ${h.busy} 个运行中"><i style="width:${load}%"></i></span></div>`;
-  }).join("") || `<div class="empty">没有在线机器</div>`;
+    return `<div class="row"><span class="dot on"></span><span class="t">${esc(h.host)} <span class="s">${esc(os)}</span></span><span class="meter" title="Load ${load}% · Disk ${h.stats?.diskFreeGB ?? "?"}GB · ${h.busy} running"><i style="width:${load}%"></i></span></div>`;
+  }).join("") || `<div class="empty">No machines online</div>`;
   const q = s.tasks;
-  $("queue").innerHTML = [["待批准", q.proposed], ["排队", q.inbox], ["阻塞", q.blocked], ["失败", q.failed], ["完成", q.done]]
+  $("queue").innerHTML = [["To approve", q.proposed], ["Queued", q.inbox], ["Blocked", q.blocked], ["Failed", q.failed], ["Done", q.done]]
     .map(([k, v]) => `<div class="row"><span class="t">${k}</span><span class="s">${v ?? 0}</span></div>`).join("");
 }
 
