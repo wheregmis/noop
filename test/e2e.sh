@@ -83,6 +83,16 @@ SPL=$(hub add "SPLIT big job" | tail -1)
 tick_until "grep -qs 'Results from delegated subtasks' tasks/done/$SPL.md"
 grep -q "Results from delegated subtasks" tasks/done/$SPL.md
 ! grep -l "parent: $SPL" tasks/proposed/*.md 2>/dev/null
+# a project's work stays in its folder: follow-ups inherit the project, and the agent is told about it
+mkdir -p "$W/site"
+printf -- '---\nname: Site\npath: %s\nhost: pc\n---\nSITE-RULE: test first.\n' "$W/site" > projects-site.tmp; mkdir -p projects; mv projects-site.tmp projects/site.md
+PJ=$(hub add "SPLIT project job" --project site)
+tick_until "test -f tasks/done/$PJ.md"
+test -f "tasks/done/$PJ.md"
+grep -q "^project: site" "tasks/done/$PJ.md" && grep -q "^repo: $W/site" "tasks/done/$PJ.md"
+KIDS=$(grep -l "^parent: $PJ\|source: followup:$PJ" tasks/done/*.md)
+test "$(echo "$KIDS" | wc -l | tr -d ' ')" = 2
+for k in $KIDS; do grep -q "^project: site" "$k" && grep -q "^repo: $W/site" "$k" && grep -q "^host: pc" "$k"; done
 # a second host joins and mirrors the same data
 HUB_DATA="$W/w2/data" HUB_HOST=w2 bun "$SRC/src/cli.ts" init --worker http://unused --token x >/dev/null
 cmp tasks/done/T-0001.md "$W/w2/data/tasks/done/T-0001.md"

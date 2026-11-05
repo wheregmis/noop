@@ -133,7 +133,7 @@ test("initialize, tools/list, resources", async () => {
   expect(init.body.result.capabilities.resources.subscribe).toBe(true);
   expect((await rpc(mcp, "notifications/initialized", {}, init.sid, null)).status).toBe(202);
   const names = (await rpc(mcp, "tools/list", {}, init.sid)).body.result.tools.map((t: any) => t.name);
-  expect(names).toEqual(["get_status", "list_tasks", "get_task", "list_decisions", "get_feed", "wait_for_events", "list_agents", "list_routines", "read_memory",
+  expect(names).toEqual(["get_status", "list_tasks", "get_task", "list_decisions", "get_feed", "wait_for_events", "list_projects", "list_agents", "list_routines", "read_memory",
     "search_journal", "search", "fetch", "send_message", "create_task", "amend_task", "cancel_task", "set_priority", "reassign_task", "remember", "edit_memory", "answer_decision"]);
   expect(names.some((n: string) => /merge|release|setting/.test(n))).toBe(false);
   const res = (await rpc(mcp, "resources/list")).body.result.resources.map((r: any) => r.uri);

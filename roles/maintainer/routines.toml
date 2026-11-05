@@ -18,7 +18,7 @@ readonly = true                       # only observes: runs without approval; ch
 every = "daily 02:30"
 agent = "maintainer"
 weight = "heavy"
-prompt = "In each Core repo of memory/projects.md: git fetch, run the repo's check and test commands on latest main. File follow-ups for regressions."
+prompt = "In each connected project: git fetch, run the repo's check and test commands on latest main. File follow-ups for regressions."
 
 [[routine]]
 name = "macos-check"

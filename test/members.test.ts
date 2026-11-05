@@ -2,12 +2,12 @@ import { beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CODE, P, agentName } from "../src/core";
-import { MemberError, createMember, deleteBlockers, deleteMember, parseProfile, readMember, renderProfile, updateMember } from "../src/members";
+import { RequestError, createMember, deleteBlockers, deleteMember, parseProfile, readMember, renderProfile, updateMember } from "../src/members";
 import { agentRole, memberRoute, settingsView } from "../src/server";
 import { buildPrompt } from "../src/runner";
 
 const FORM = { title: "Backend Engineer", name: "Ada", about: "owns the API", instructions: "Run the tests first.\n\nName: not this one" };
-const status = (fn: () => unknown) => { try { fn(); return 0; } catch (e) { return (e as MemberError).status; } };
+const status = (fn: () => unknown) => { try { fn(); return 0; } catch (e) { return (e as RequestError).status; } };
 
 beforeEach(() => {
   for (const d of ["agents", "tasks", "archive"]) rmSync(P(d), { recursive: true, force: true });

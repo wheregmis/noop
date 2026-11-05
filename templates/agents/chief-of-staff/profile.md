@@ -2,7 +2,7 @@
 Name: Iris
 - Never ask open questions ("what should I do next?"). Always give a **numbered list of 4-7 concrete, ready-to-execute candidates**; the owner just picks numbers.
 - Candidate sources (gather them yourself; never invent):
-  1. GitHub: open issues/PRs (`gh search issues` over the repos in memory/projects.md), assigned issues, stale PRs, failing CI on main
+  1. GitHub: open issues/PRs (`gh search issues` over the connected projects' repos), assigned issues, stale PRs, failing CI on main
   2. The KRs in the OKR file in memory/projects.md that are behind schedule
   3. TODO/FIXME in each repo, the failed/ and blocked/ queues
   4. Improvement ideas in memory/ and agents/*/memory.md

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { type Cfg, P, list, readDoc } from "./core";
 
 export type MemberFields = { title: string; name: string; about: string; instructions: string };
-export class MemberError extends Error {
+export class RequestError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
 
@@ -29,41 +29,40 @@ function fields(input: unknown): MemberFields {
   const line = (k: string) => String(o[k] ?? "").trim();
   const title = line("title"), about = line("about"), instructions = String(o.instructions ?? "").trim();
   const name = line("name") || title;
-  if (!title) throw new MemberError(400, "Give the member a role");
-  if (title.length > 60 || /[()\n]|\s[—–-]+\s/.test(title)) throw new MemberError(400, "A role is one short line, without parentheses or dashes");
-  if (name.length > 40 || name.includes("\n")) throw new MemberError(400, "A name is one short line");
-  if (about.length > 200 || about.includes("\n")) throw new MemberError(400, "The summary is one line, up to 200 characters");
-  if (!instructions) throw new MemberError(400, "Write the member's instructions");
-  if (instructions.length > 20_000) throw new MemberError(400, "Instructions can be up to 20,000 characters");
+  if (!title) throw new RequestError(400, "Give the member a role");
+  if (title.length > 60 || /[()\n]|\s[—–-]+\s/.test(title)) throw new RequestError(400, "A role is one short line, without parentheses or dashes");
+  if (name.length > 40 || name.includes("\n")) throw new RequestError(400, "A name is one short line");
+  if (about.length > 200 || about.includes("\n")) throw new RequestError(400, "The summary is one line, up to 200 characters");
+  if (!instructions) throw new RequestError(400, "Write the member's instructions");
+  if (instructions.length > 20_000) throw new RequestError(400, "Instructions can be up to 20,000 characters");
   return { title, name, about, instructions };
 }
 
 const profile = (id: string) => P("agents", id, "profile.md");
 const RESERVED = new Set(["owner", "hub", "system", "all", "none"]); // names the feed and answers already use
 
-/** A new id from the role; it never changes afterwards, because tasks and routines refer to it. */
-function newId(title: string): string {
-  const base = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36).replace(/-+$/, "") || "member";
-  const free = (id: string) => !RESERVED.has(id) && !existsSync(P("agents", id));
+/** A new id from a display name; it never changes afterwards, because tasks and routines refer to it. */
+export function newId(text: string, fallback: string, free: (id: string) => boolean): string {
+  const base = text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36).replace(/-+$/, "") || fallback;
   if (free(base)) return base;
   for (let n = 2; ; n++) if (free(`${base}-${n}`)) return `${base}-${n}`;
 }
 
 export function readMember(id: string) {
-  if (!existsSync(profile(id))) throw new MemberError(404, "No such member");
+  if (!existsSync(profile(id))) throw new RequestError(404, "No such member");
   const p = parseProfile(readFileSync(profile(id), "utf8"));
   return { id, title: p.title ?? id, name: p.name ?? "", about: p.about ?? "", instructions: p.instructions };
 }
 
 export function createMember(input: unknown): string {
-  const f = fields(input), id = newId(f.title);
+  const f = fields(input), id = newId(f.title, "member", (x) => !RESERVED.has(x) && !existsSync(P("agents", x)));
   mkdirSync(P("agents", id), { recursive: true });
   writeFileSync(profile(id), renderProfile(f));
   return id;
 }
 
 export function updateMember(id: string, input: unknown) {
-  if (!existsSync(profile(id))) throw new MemberError(404, "No such member");
+  if (!existsSync(profile(id))) throw new RequestError(404, "No such member");
   writeFileSync(profile(id), renderProfile(fields(input)));
 }
 
@@ -82,9 +81,9 @@ export function deleteBlockers(id: string, cfg: Cfg): string[] {
 
 /** Moves the member, with its memory, to archive/agents/ so a mistaken delete can be undone by hand. */
 export function deleteMember(id: string, cfg: Cfg) {
-  if (!existsSync(P("agents", id))) throw new MemberError(404, "No such member");
+  if (!existsSync(P("agents", id))) throw new RequestError(404, "No such member");
   const blockers = deleteBlockers(id, cfg);
-  if (blockers.length) throw new MemberError(409, `Can't delete yet: ${blockers.join("; ")}`);
+  if (blockers.length) throw new RequestError(409, `Can't delete yet: ${blockers.join("; ")}`);
   mkdirSync(P("archive", "agents"), { recursive: true });
   renameSync(P("agents", id), P("archive", "agents", `${id}-${new Date().toISOString().replace(/\W/g, "")}`));
   const settings = P("settings.json");

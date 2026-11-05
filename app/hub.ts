@@ -218,10 +218,12 @@ export function filePath(uri: string): string {
 // ---------------------------------------------------------------- team settings (GET / PUT /api/settings)
 
 export type Autonomy = "onboarding" | "assisted" | "autonomous" | (string & {});
+export type Project = { id: string; name: string; path: string; host: string; repo: string; instructions: string; exists: boolean };
 export type SettingsView = {
   current: Record<string, unknown>;
   effective: {
     agents: { id: string; title?: string; about?: string; clis: string[]; autonomy: Autonomy }[];
+    projects?: Project[]; // absent from a hub that doesn't have them yet
     autonomy: Autonomy;
     routines: { name: string; desc?: string; every: string; agent: string; enabled: boolean }[];
     max_parallel: number | null;

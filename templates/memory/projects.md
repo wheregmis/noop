@@ -1,9 +1,4 @@
-# Projects the fleet works on (agents read this instead of hard-coded lists)
-
-## Core (auto develop + thorough PR review with full testing, screenshots/recordings)
-| repo | local | notes |
-|---|---|---|
-| owner/app | ~/work/app | |
+# Project notes (connect the projects themselves in Settings › Projects)
 
 ## Ops / management
 - Uptime/alerts source:

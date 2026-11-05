@@ -6,6 +6,7 @@ import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
 import { claudeDisallowed } from "./gates";
+import { listProjects } from "./projects";
 
 export type Result = {
   status: "done" | "needs_decision" | "failed" | "delegated" | "waiting";
@@ -76,7 +77,7 @@ Git commits you create must carry the trailer:  Agent: ${agent}
 
 # Resource budget
 ${resourceNote}
-
+${projectsSection(meta)}
 # Task ${meta.id}: ${meta.title}
 Working directory: ${meta.repo || ROOT}   Scratch space (checkouts, worktrees, build targets): ~/.agent-hub/work — never inside the hub folder ${ROOT}, which syncs to the cloud   Host capabilities: ${meta.host_caps ?? ""}
 Priority: ${meta.priority}   Source: ${meta.source}
@@ -84,6 +85,19 @@ Priority: ${meta.priority}   Source: ${meta.source}
 ${body}
 
 ${RESULT_SPEC}`;
+}
+
+/** The projects the team works on, and the one this task belongs to with the owner's instructions for it. */
+function projectsSection(meta: Record<string, string>): string {
+  const all = listProjects();
+  if (!all.length) return "";
+  const mine = all.find((p) => p.id === meta.project);
+  return `
+# Connected projects (these replace any project list in memory/projects.md)
+${all.map((p) => `- ${p.name}: ${p.path}${p.repo ? ` (${p.repo})` : ""}, on ${p.host}`).join("\n")}
+${mine ? `
+# This task's project: ${mine.name}
+${mine.exists ? "" : `Its folder ${mine.path} is missing on this machine. Don't work anywhere else instead: return "failed" and say so.\n`}${mine.instructions ? `The owner's instructions for this project:\n${mine.instructions}\n` : ""}` : ""}`;
 }
 
 function rosterLine(): string {

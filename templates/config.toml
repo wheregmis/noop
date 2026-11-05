@@ -114,7 +114,7 @@ name = "pr-review"
 enabled = false
 every = "30m"
 agent = "reviewer"
-prompt = """Find open PRs on the Core repos in memory/projects.md
+prompt = """Find open PRs on the connected projects' repos
 whose current head SHA is not in reviews/ (ledger), oldest first, PRs by others before my own. Review & verify up to 3 of them in parallel
 (one subagent + worktree + visual session each) per your profile."""
 

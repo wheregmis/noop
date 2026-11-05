@@ -1472,3 +1472,103 @@ describe("members", () => {
     await app.waitFor("Members can only be edited on a local hub for now");
   });
 });
+
+describe("projects", () => {
+  function projects() {
+    const list: { id: string; name: string; path: string; host: string; repo: string; instructions: string; exists: boolean }[] = [];
+    const view = () => ({ current: {}, effective: { agents: [], projects: list, autonomy: "onboarding", routines: [], max_parallel: null, media_days: 7 }, options: { clis: [["claude"]], autonomy: ["onboarding"] } });
+    const log: { creates: Record<string, string>[]; edits: Record<string, string>[]; deletes: number; block: boolean } = { creates: [], edits: [], deletes: 0, block: false };
+    const network = {
+      ...hub([]),
+      [`GET ${URL}/api/settings`]: () => ({ body: view() }),
+      [`POST ${URL}/api/projects`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        if (b.path === "/nope") return { status: 400, body: { error: "No folder at /nope on this machine" } };
+        log.creates.push(b);
+        list.push({ id: "site", name: b.name, path: b.path, host: "mac", repo: "acme/site", instructions: b.instructions, exists: true });
+        return { body: { id: "site", view: view() } };
+      },
+      [`PUT ${URL}/api/projects/site`]: (r: { body?: string | null }) => {
+        const b = JSON.parse(r.body!);
+        log.edits.push(b);
+        Object.assign(list[0]!, b, { exists: false });
+        return { body: { id: "site", view: view() } };
+      },
+      [`DELETE ${URL}/api/projects/site`]: () => {
+        if (log.block) return { status: 409, body: { error: "Can't remove yet: open tasks: T-0001" } };
+        log.deletes++;
+        list.pop();
+        return { body: { id: "site", view: view() } };
+      },
+    };
+    return { log, network };
+  }
+
+  test("settings connects, edits and removes a project", async () => {
+    const { log, network } = projects();
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network });
+    await app.press("id:settings");
+    await app.press("id:settings-tab-projects");
+    await app.press("id:project-new");
+    await app.waitFor("id:project-editor");
+    await app.type("id:project-name", "Site");
+    await app.type("id:project-path", "/nope");
+    await app.press("id:project-save");
+    await app.waitFor("No folder at /nope on this machine");
+    expect(app.shows("id:project-editor")).toBe(true);
+    await app.clear("id:project-path");
+    await app.type("id:project-path", "/code/site");
+    await app.type("id:project-instructions", "Run the tests.");
+    await app.press("id:project-save");
+    await app.waitFor("id:project-site");
+    await app.waitUntil(() => !app.shows("id:project-editor"));
+    expect(log.creates).toEqual([{ name: "Site", path: "/code/site", instructions: "Run the tests." }]);
+    await app.waitFor("acme/site · /code/site");
+    // edit opens with what's saved; a folder that's gone says so
+    await app.press("id:project-site");
+    await app.waitFor("id:project-editor");
+    expect(app.value("id:project-instructions")).toBe("Run the tests.");
+    await app.clear("id:project-path");
+    await app.type("id:project-path", "/moved");
+    await app.press("id:project-save");
+    await app.waitUntil(() => log.edits.length === 1);
+    await app.waitFor("Folder not found: /moved");
+    // remove asks first; a refusal says why
+    await app.press("id:project-site");
+    await app.waitFor("id:project-delete");
+    app.onDialog((d) => (d.title?.startsWith("Remove") ? "Cancel" : null));
+    await app.press("id:project-delete");
+    expect(log.deletes).toBe(0);
+    log.block = true;
+    app.onDialog((d) => (d.title?.startsWith("Remove") ? "Remove" : null));
+    await app.press("id:project-delete");
+    await app.waitFor("Can't remove yet: open tasks: T-0001");
+    log.block = false;
+    await app.press("id:project-delete");
+    await app.waitUntil(() => log.deletes === 1);
+    await app.waitUntil(() => !app.shows("id:project-site"));
+  });
+
+  test("a phone connects a project from settings, and an old hub says it can't", async () => {
+    const { log, network } = projects();
+    const app = await open("./App.tsx", { storage: { ...STORAGE, "hub.notifyAsked": "1" }, width: 390, height: 844, platform: "ios", network });
+    await app.waitFor("id:composer");
+    await app.press("id:settings-top");
+    await app.waitFor("id:project-new");
+    await app.press("id:project-new");
+    await app.waitFor("id:project-editor");
+    await app.type("id:project-name", "Site");
+    await app.type("id:project-path", "/code/site");
+    await app.press("id:project-save");
+    await app.waitUntil(() => log.creates.length === 1);
+    await app.waitFor("id:project-site");
+    const old = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: { ...network, [`POST ${URL}/api/projects`]: { status: 404, body: { error: "not found" } } } });
+    await old.press("id:settings");
+    await old.press("id:settings-tab-projects");
+    await old.press("id:project-new");
+    await old.type("id:project-name", "Site");
+    await old.type("id:project-path", "/code/site");
+    await old.press("id:project-save");
+    await old.waitFor("Projects can only be edited on a local hub for now");
+  });
+});

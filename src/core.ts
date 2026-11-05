@@ -159,7 +159,7 @@ export function idTagFor(cfg: Cfg, host: string): string {
 
 // ------------------------------------------------------------------ tasks
 export type TaskOpts = {
-  agent?: string; cli?: string; host?: string; requires?: string; prefer?: string; weight?: string; repo?: string; priority?: string; source?: string;
+  agent?: string; cli?: string; host?: string; requires?: string; prefer?: string; weight?: string; repo?: string; project?: string; priority?: string; source?: string;
   extra?: Record<string, string>;
 };
 
@@ -199,6 +199,9 @@ export function newTask(title: string, body = "", o: TaskOpts = {}): string {
   const id = nextId("T", P("tasks"));
   // work the owner asked for (directly or via a delegated parent) never needs re-approval
   const folder = o.extra?.origin !== "owner" && approvalGate(o.source ?? "owner") ? "proposed" : "inbox";
+  // a project decides where the work happens: its folder, on the machine that has it
+  const project = o.project && existsSync(P("projects", `${o.project}.md`)) ? readDoc(P("projects", `${o.project}.md`)).meta : null;
+  if (project) { o = { ...o, repo: project.path, host: project.host, extra: { ...o.extra, project: o.project! } }; }
   writeDoc(P("tasks", folder, `${id}.md`), {
     id, title, agent: o.agent ?? "lead", cli: o.cli ?? "auto", host: o.host ?? "any",
     // stored at creation so hosts without the repo checked out still know what it needs

@@ -12,7 +12,7 @@ export type FileRow = { path: string; text: string; updated: string };
 /** A write. `tool` is the tool name; the rest are its validated arguments. */
 export type WriteOp =
   | { tool: "send_message"; text: string; reply_to?: string }
-  | { tool: "create_task"; title: string; details?: string; repo?: string; agent?: string; follows?: string }
+  | { tool: "create_task"; title: string; details?: string; repo?: string; project?: string; agent?: string; follows?: string }
   | { tool: "amend_task"; id: string; text: string }
   | { tool: "cancel_task"; id: string }
   | { tool: "set_priority"; id: string; priority: Priority }
@@ -152,6 +152,13 @@ export function listAgents(st: ToolStore) {
     return { name, about: prof.split("\n").find((l) => l.trim())?.replace(/^#\s*/, "").slice(0, 200) ?? "", memory_lines: mem.split("\n").filter((l) => l.trim()).length };
   });
 }
+/** The projects the owner connected: what they are, and where the work happens. */
+export function listProjects(st: ToolStore) {
+  return st.list("projects/").filter((f) => f.path.endsWith(".md")).map((f) => {
+    const { meta, body } = parseDoc(f.text);
+    return { id: f.path.slice("projects/".length, -".md".length), name: meta.name, repo: meta.repo || undefined, instructions: body.trim().slice(0, 400) || undefined };
+  });
+}
 /** Routines from config.toml ([[routine]] blocks): name, schedule, agent, enabled, and the first line of the prompt. */
 export function listRoutines(st: ToolStore) {
   const toml = st.read("config.toml")?.text ?? "";
@@ -245,6 +252,8 @@ export const TOOLS: Tool[] = [
   { name: "wait_for_events", title: "Wait for new events", annotations: RO, only: "mcp",
     inputSchema: obj({ cursor: int("Cursor from get_feed / a previous wait"), timeout_seconds: int("How long to wait (default 30, max 50)", { minimum: 1, maximum: 50 }) }, ["cursor"]),
     description: "Blocks until the fleet emits new events after `cursor` (or the timeout passes) and returns them. For clients that do not receive MCP notifications." },
+  { name: "list_projects", title: "List projects", annotations: RO, inputSchema: obj({}),
+    description: "The projects the owner connected: id, name, GitHub repo and the owner's instructions. Pass an id as create_task's project." },
   { name: "list_agents", title: "List agents", annotations: RO, inputSchema: obj({}),
     description: "The agent roster: each agent's name, what it is for, and how much memory it keeps. Use the names with create_task/reassign_task." },
   { name: "list_routines", title: "List routines", annotations: RO, inputSchema: obj({}),
@@ -266,7 +275,8 @@ export const TOOLS: Tool[] = [
     description: "Send a chat message to the fleet as the owner (same as typing in the Noop app). The chat brain answers it and acts on it." },
   { name: "create_task", title: "Create a task", annotations: RW, write: true,
     inputSchema: obj({ title: str("Short imperative title"), details: str("Goal, context and acceptance criteria — everything the agent needs, in the owner's words"),
-      repo: str("Optional repo, e.g. owner/repo"), agent: str("Optional agent name from list_agents (default: lead, who plans and delegates)"),
+      project: str("Optional project id from list_projects: the work happens in that project's folder"),
+      repo: str("Optional repo that isn't a connected project, e.g. owner/repo"), agent: str("Optional agent name from list_agents (default: lead, who plans and delegates)"),
       follows: str("Optional: the task (T-…) this continues or corrects; the new task reads its result") }, ["title"]),
     description: "Hand a piece of work to the fleet. An agent picks it up, does it and reports back in the feed. Use for anything that takes more than a quick answer (code, reviews, releases, research)." },
   { name: "amend_task", title: "Add to a task", annotations: RW, write: true,
@@ -312,7 +322,9 @@ export function writeOp(name: string, a: any, st: ToolStore): WriteOp | string {
       if (!s(a.title)) return "title required";
       const agent = s(a.agent);
       if (agent && !st.read(`agents/${agent}/profile.md`)) return `unknown agent ${agent} (see list_agents)`;
-      return { tool: name, title: s(a.title).slice(0, 120), details: s(a.details).slice(0, 20_000) || undefined, repo: s(a.repo) || undefined,
+      const project = s(a.project);
+      if (project && !st.read(`projects/${project}.md`)) return `unknown project ${project} (see list_projects)`;
+      return { tool: name, title: s(a.title).slice(0, 120), details: s(a.details).slice(0, 20_000) || undefined, repo: s(a.repo) || undefined, project: project || undefined,
         agent: agent || undefined, follows: TASK_ID.test(s(a.follows)) ? s(a.follows) : undefined };
     }
     case "amend_task": {
@@ -389,6 +401,7 @@ export async function runTool(st: ToolStore, name: string, a: any, base = ""): P
     }
     case "list_decisions": return ok({ decisions: listDecisions(st, a.which === "closed" ? "closed" : "open", Number(a.limit) || 30) });
     case "get_feed": return ok(feedView(st, a.cursor === undefined || a.cursor === null ? undefined : Number(a.cursor), Number(a.limit) || 50));
+    case "list_projects": return ok({ projects: listProjects(st) });
     case "list_agents": return ok({ agents: listAgents(st) });
     case "list_routines": return ok({ routines: listRoutines(st) });
     case "read_memory": {

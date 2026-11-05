@@ -7,6 +7,7 @@
 //   GET  /api/stream                      → WebSocket, pushes Event JSON as it happens
 //   POST /api/messages {text, reply_to?, attachments?}  → owner message: answers D-/P-/L- ids, otherwise becomes a task for `lead`
 //   GET|PUT|DELETE /api/members/<id> · POST /api/members {title, name?, about?, instructions}   local hub only for now
+//   GET|PUT|DELETE /api/projects/<id> · POST /api/projects {name, path, instructions?}   local hub only for now
 //   POST /api/uploads (multipart file)    → { url }   (the owner's images for a message: image/*, ≤ 10 MB)
 //   GET  /api/status                      → queue, decisions, hosts, accounts
 //   POST /api/fleet/update               → every machine updates to the latest code; the primary redeploys the cloud
@@ -19,7 +20,8 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { accountsInfo } from "./accounts";
-import { MemberError, createMember, deleteMember, parseProfile, readMember, updateMember } from "./members";
+import { RequestError, createMember, deleteMember, parseProfile, readMember, updateMember } from "./members";
+import { createProject, deleteProject, listProjects, readProject, updateProject } from "./projects";
 import { type Cfg, DATA, P, allowedClis, hostName, list, loadConfig, onlineHosts, readDoc, UPDATE_REQUEST } from "./core";
 import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "../cloud/src/uploads";
 import { readable, validPath } from "../cloud/src/files";
@@ -229,7 +231,7 @@ export function agentRole(agent: string): { title?: string; about?: string } {
 const ROUTINE_DESC: Record<string, string> = {
   "triage-inbound": "Scans GitHub notifications, PRs waiting on you, issues assigned to you and CI failures, and splits them into tasks for the right members",
   "uptime-watch": "Checks uptime alerts and handles them by the escalation rules",
-  "pr-review": "Reviews PRs in the Core repos that haven't been reviewed yet, up to 3 per run",
+  "pr-review": "Reviews PRs in your connected projects that haven't been reviewed yet, up to 3 per run",
   "own-prs-ci": "Keeps your own PRs mergeable: resolves conflicts, fixes CI, addresses obvious review comments",
   "nightly-health": "Runs each project's checks and tests on the latest main and opens a task on any regression",
   "macos-check": "Builds and tests the Core repos on macOS and reports platform-specific failures",
@@ -253,6 +255,7 @@ export function settingsView() {
     effective: {
       agents: agents.map((a) => ({ id: a, ...agentRole(a), clis: allowedClis({ agent: a }, cfg), autonomy: cfg.autonomy?.agents?.[a] ?? cfg.autonomy?.level ?? "onboarding" })),
       autonomy: cfg.autonomy?.level ?? "onboarding",
+      projects: listProjects(),
       routines: (cfg.routine ?? []).map((r: any) => ({ name: r.name, desc: routineDesc(r), every: r.every, agent: r.agent, enabled: r.enabled !== false })),
       max_parallel: cfg.host?.max_parallel ?? null,
       media_days: mediaDays(cfg),
@@ -278,23 +281,27 @@ export async function saveSettings(patch: Record<string, unknown>) {
   return settingsView();
 }
 
-/** The members API: GET one, POST to create, PUT to edit, DELETE to archive. Writes answer with the new settings view. */
-export async function memberRoute(req: Request, id: string | undefined): Promise<Response> {
-  const changed = async (member: string, what: string) => {
-    await settingsHook?.(`member ${member} ${what}`);
-    return Response.json({ id: member, view: settingsView() });
+/** The team's records the app manages: GET one, POST to create, PUT to edit, DELETE to archive. Writes answer with the new settings view. */
+async function recordRoute(req: Request, id: string | undefined, kind: string, r: { read: (id: string) => unknown; create: (b: unknown) => string; update: (id: string, b: unknown) => void; remove: (id: string) => void }): Promise<Response> {
+  const changed = async (one: string, what: string) => {
+    await settingsHook?.(`${kind} ${one} ${what}`);
+    return Response.json({ id: one, view: settingsView() });
   };
   try {
-    if (req.method === "GET" && id) return Response.json(readMember(id));
-    if (req.method === "POST" && !id) { const made = createMember(await req.json().catch(() => null)); return await changed(made, "added"); }
-    if (req.method === "PUT" && id) { updateMember(id, await req.json().catch(() => null)); return await changed(id, "edited"); }
-    if (req.method === "DELETE" && id) { deleteMember(id, loadConfig()); return await changed(id, "archived"); }
+    if (req.method === "GET" && id) return Response.json(r.read(id));
+    if (req.method === "POST" && !id) { const made = r.create(await req.json().catch(() => null)); return await changed(made, "added"); }
+    if (req.method === "PUT" && id) { r.update(id, await req.json().catch(() => null)); return await changed(id, "edited"); }
+    if (req.method === "DELETE" && id) { r.remove(id); return await changed(id, "archived"); }
     return Response.json({ error: "not found" }, { status: 404 });
   } catch (e) {
-    if (e instanceof MemberError) return Response.json({ error: e.message }, { status: e.status });
+    if (e instanceof RequestError) return Response.json({ error: e.message }, { status: e.status });
     throw e;
   }
 }
+export const memberRoute = (req: Request, id?: string) =>
+  recordRoute(req, id, "member", { read: readMember, create: createMember, update: updateMember, remove: (m) => deleteMember(m, loadConfig()) });
+export const projectRoute = (req: Request, id?: string) =>
+  recordRoute(req, id, "project", { read: readProject, create: (b) => createProject(b, hostName(loadConfig())), update: updateProject, remove: deleteProject });
 
 const ID = /^\s*([DLP]-[A-Z]?\d{4})\b[\s:：,，\-]*([\s\S]*)$/;
 
@@ -504,6 +511,8 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
       }
       const member = url.pathname.match(/^\/api\/members(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
       if (member) return memberRoute(req, member[1]);
+      const project = url.pathname.match(/^\/api\/projects(?:\/([a-z0-9][a-z0-9-]{0,39}))?$/);
+      if (project) return projectRoute(req, project[1]);
       if (url.pathname === "/api/feed") return json({ events: feed(url.searchParams.get("since") ?? undefined) });
       if (url.pathname === "/api/status") return json(status());
       if (url.pathname === "/api/files/list" && req.method === "GET") {

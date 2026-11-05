@@ -109,6 +109,7 @@ import {
   commandItems,
   savedCommands,
   BUILTIN_COMMANDS,
+  type Project,
   plural,
   slashQuery,
   needsLabel,
@@ -2202,9 +2203,28 @@ function createSettings(hub: Hub) {
     memberDraft.editing.set(undefined);
     return true;
   }
+  /** The project editor: `editing` is undefined when closed, "" for a new project, else the id being edited. */
+  const projectDraft = { name: signal(""), path: signal(""), instructions: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
+  function openProject(p?: Project) {
+    const d = projectDraft;
+    d.name.set(p?.name ?? ""); d.path.set(p?.path ?? ""); d.instructions.set(p?.instructions ?? ""); d.note.set("");
+    d.editing.set(p?.id ?? "");
+  }
+  /** Sends a project change; on success the dialog closes, else it stays open with the reason. */
+  async function writeProject(method: string, path: string, body?: unknown) {
+    const d = projectDraft;
+    d.busy.set(true);
+    d.note.set("");
+    const r = await hub.api(method, path, body);
+    d.busy.set(false);
+    if (!r.ok) return d.note.set(r.status === 404 ? "Projects can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
+    confirmed = r.data.view as SettingsView;
+    refresh();
+    d.editing.set(undefined);
+  }
   /** The section the wide settings page shows (its sidebar picks it). */
   const tab = signal<SettingsTab>("notify");
-  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, tab };
+  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, projectDraft, openProject, writeProject, tab };
 }
 type Settings = ReturnType<typeof createSettings>;
 
@@ -2212,6 +2232,7 @@ type Settings = ReturnType<typeof createSettings>;
 const SETTINGS_TABS = [
   ["notify", "Notifications", "bell"],
   ["members", "Members", "chat"],
+  ["projects", "Projects", "lists"],
   ["routines", "Routines", "play"],
   ["parallel", "Parallel", "layers"],
   ["commands", "Commands", "terminal"],
@@ -2259,6 +2280,11 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
         </If>
         <If when={on("notify")}>
           <NotifySettings push={props.push} view={view()} save={save} wide={props.wide} />
+        </If>
+        <If when={on("projects")}>
+          <Group title="Projects" hint="The folders the team works in. In chat, name a project and the work happens in its folder, following your instructions for it.">
+            <ProjectRows settings={props.settings} />
+          </Group>
         </If>
         <If when={on("members") || on("routines") || on("parallel")}>
         <If when={eff()} else={<Text style={{ fontSize: 14, color: colors.faint }}>{error() ? "" : "Loading…"}</Text>}>
@@ -2619,6 +2645,95 @@ function TextArea(props: { label: string; value: string; onChange: (v: string) =
   );
 }
 
+/** The connected projects, and the way to add one. */
+function ProjectRows(props: { settings: Settings }) {
+  const projects = () => props.settings.view()?.effective.projects ?? [];
+  return (
+    <>
+      <Each of={projects()} key={(p) => p.id}>
+        {(p, i) => (
+          <SetRow
+            first={i() === 0}
+            label={p().name}
+            detail={p().exists ? [p().repo, p().path].filter(Boolean).join(" · ") : `Folder not found: ${p().path}`}
+            chevron
+            onPress={() => props.settings.openProject(p())}
+            testID={`project-${p().id}`}
+          />
+        )}
+      </Each>
+      <SetRow first={!projects().length} label="Connect a project" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => props.settings.openProject()} testID="project-new" />
+      <ProjectEditor settings={props.settings} />
+    </>
+  );
+}
+
+/** Connect / edit / remove one project, in a dialog: its name, its folder and how to work in it. */
+function ProjectEditor(props: { settings: Settings }) {
+  const { name, path, instructions, editing, note, busy } = props.settings.projectDraft;
+  const isNew = () => editing() === "";
+  const close = () => editing.set(undefined);
+  const ok = () => !!name().trim() && !!path().trim() && !busy();
+  const submit = () => {
+    const body = { name: name(), path: path(), instructions: instructions() };
+    void (isNew() ? props.settings.writeProject("POST", "/api/projects", body) : props.settings.writeProject("PUT", `/api/projects/${editing()}`, body));
+  };
+  const remove = async () => {
+    const id = editing()!;
+    const r = await AlertDialog.show({
+      title: `Remove ${name() || id}?`,
+      description: "The team stops working on it. Its folder isn't touched; your instructions move to archive/projects/ in your data folder.",
+      actions: [
+        { id: "cancel", label: "Cancel", role: "cancel" },
+        { id: "remove", label: "Remove", role: "destructive" },
+      ],
+    });
+    if (r.action === "remove") await props.settings.writeProject("DELETE", `/api/projects/${id}`);
+  };
+  return (
+    <Dialog
+      testID="project-editor"
+      open={editing() !== undefined}
+      animation="fade"
+      onOpenChange={({ open }) => !open && close()}
+      backdropClass="bg-scrim"
+      style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}
+    >
+      <View style={{ width: "100%", maxWidth: 620, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: 20, paddingRight: 10, height: 56, borderBottomWidth: 0.5, borderBottomColor: surfaceEdge() }}>
+          <Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>{isNew() ? "Connect a project" : "Edit project"}</Text>
+          <ToolButton icon="close" label="Close" shortcut="Esc" onPress={close} />
+        </View>
+        <Scroll style={{ flexShrink: 1 }}>
+          <View style={{ gap: 16, padding: 20 }}>
+            <Field label="Name" value={name()} onChange={(v) => { name.set(v); note.set(""); }} placeholder="e.g. Website" testID="project-name" autoFocus={isNew()} />
+            <Field label="Folder" value={path()} onChange={(v) => { path.set(v); note.set(""); }} placeholder="e.g. ~/code/website" testID="project-path" hint="A folder on the machine running Noop. It doesn't have to use git; if it's on GitHub, Noop finds the repo." />
+            <TextArea
+              label="Instructions (optional)"
+              testID="project-instructions"
+              height={160}
+              value={instructions()}
+              onChange={(v) => { instructions.set(v); note.set(""); }}
+              placeholder={"What anyone working here should know: how to build and test, what not to touch.\ne.g. Run npm test before finishing. Don't edit generated files in dist/."}
+            />
+            <If when={note()}>
+              <Text testID="project-note" style={{ fontSize: 13.5, lineHeight: 19, color: colors.danger }}>{note()}</Text>
+            </If>
+          </View>
+        </Scroll>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 20, paddingVertical: 16, borderTopWidth: 0.5, borderTopColor: surfaceEdge() }}>
+          <If when={!isNew()}>
+            <Btn label="Remove" kind="danger" icon="trash" onPress={() => void remove()} testID="project-delete" />
+          </If>
+          <View style={{ flex: 1 }} />
+          <Btn label="Cancel" kind="ghost" onPress={close} testID="project-cancel" />
+          <Btn label={isNew() ? "Connect" : "Save"} kind="primary" disabled={!ok()} busy={busy()} onPress={submit} testID="project-save" />
+        </View>
+      </View>
+    </Dialog>
+  );
+}
+
 /** New / edit / delete one member, in a dialog: who they are and how they work. The instructions go into every prompt they run with. */
 function MemberEditor(props: { settings: Settings; onGone?: () => void }) {
   const { title, name, about, instructions, editing, note, busy } = props.settings.memberDraft;
@@ -2915,6 +3030,9 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
               <SetRow label="New member" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openMember()} testID="member-new" />
             </Section>
             <MemberEditor settings={props.settings} />
+            <Section title="Projects" hint="The folders the team works in. In chat, name a project and the work happens in its folder.">
+              <ProjectRows settings={props.settings} />
+            </Section>
             <Section title="Routines" hint="Things the team does on its own schedule.">
               <Each of={e().routines} key={(r) => r.name}>
                 {(r, i) => (
