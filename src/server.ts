@@ -2,6 +2,7 @@
 // Reach it from phone / Mac over Tailscale (`tailscale serve --bg 8787` gives HTTPS on your tailnet). No cloud.
 //
 // API (Bearer token = [server].token in config.local.toml):
+//   POST /api/auth/start {email} · POST /api/auth/verify {email, code} → {session}   no Worker only; `noop login` shows the code
 //   GET  /api/feed?since=<iso>            → { events: Event[] }        chat timeline (newest last)
 //   GET  /api/stream                      → WebSocket, pushes Event JSON as it happens
 //   POST /api/messages {text, reply_to?, attachments?}  → owner message: answers D-/P-/L- ids, otherwise becomes a task for `lead`
@@ -12,6 +13,7 @@
 //   GET  /media/<file>                    → attachment
 //   GET  /api/files/list?prefix=  · GET /api/files/read?path=   → read-only rules & memory (same shape as the Worker)
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomInt } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ServerWebSocket } from "bun";
@@ -409,6 +411,41 @@ export function readDataFile(path: string, root = DATA) {
   } catch { return undefined; }
 }
 
+/**
+ * Sign-in for a hub with no Worker: the client asks for a code, the owner reads it with `noop login` on this machine.
+ * Same limits as the Worker's login. shortcut: the session is the machine token, so signing out revokes nothing and the
+ * code is forgotten on restart; give clients their own sessions if a local hub ever serves more than its owner.
+ */
+export function localSignIn(token: string, now = Date.now) {
+  const CODE_TTL = 10 * 60_000, CODE_TRIES = 5, RESEND_MS = 60_000, SENDS_PER_HOUR = 10;
+  let pending: { email: string; code: string; expires: number; sent: number; tries: number } | null = null;
+  let sends: number[] = [];
+  const normEmail = (e: unknown) => String(e ?? "").trim().toLowerCase();
+  return {
+    start(email: unknown) {
+      const e = normEmail(email), t = now();
+      if (!/^[^@\s]+@[^@\s]+$/.test(e)) return { status: 400, body: { error: "invalid email" } };
+      sends = sends.filter((s) => s > t - 3600_000);
+      if (pending && pending.sent > t - RESEND_MS) return { status: 429, body: { error: "请稍等一分钟再重新获取验证码" } };
+      if (sends.length >= SENDS_PER_HOUR) return { status: 429, body: { error: "验证码发送太频繁，请一小时后再试" } };
+      sends.push(t);
+      pending = { email: e, code: String(randomInt(1_000_000)).padStart(6, "0"), expires: t + CODE_TTL, sent: t, tries: 0 };
+      return { status: 200, body: { ok: true, delivery: "cli" } };
+    },
+    verify(email: unknown, code: unknown) {
+      if (!pending || pending.expires <= now()) return { status: 401, body: { error: "验证码不对或已过期" } };
+      if (pending.tries >= CODE_TRIES) return { status: 401, body: { error: "尝试次数太多，请重新获取验证码" } };
+      pending.tries++;
+      if (pending.email !== normEmail(email) || pending.code !== String(code ?? "")) return { status: 401, body: { error: "验证码不对或已过期" } };
+      pending = null;
+      return { status: 200, body: { session: token } };
+    },
+    pendingCode() {
+      return pending && pending.expires > now() ? { email: pending.email, code: pending.code, expires: pending.expires } : null;
+    },
+  };
+}
+
 export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
   if (process.env.NODE_ENV !== "test") void ensureWebClient(); // served as soon as it lands
   const s = cfg.server ?? {};
@@ -421,6 +458,7 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
     return h === `Bearer ${s.token}` || q === s.token;
   };
   const json = (d: unknown, status = 200) => Response.json(d, { status });
+  const signIn = cfg.cloud?.url ? null : localSignIn(s.token); // with a Worker, clients sign in there
 
   const server = Bun.serve({
     hostname: s.host ?? "0.0.0.0",
@@ -437,7 +475,16 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
         return new Response(Bun.file(join(import.meta.dir, "..", "web", "index.html")));
       if (url.pathname === "/manifest.webmanifest")
         return new Response(Bun.file(join(import.meta.dir, "..", "web", "manifest.webmanifest")));
+      if (signIn && req.method === "POST" && (url.pathname === "/api/auth/start" || url.pathname === "/api/auth/verify")) {
+        const b = (await req.json().catch(() => null)) as { email?: unknown; code?: unknown } | null;
+        const r = url.pathname === "/api/auth/start" ? signIn.start(b?.email) : signIn.verify(b?.email, b?.code);
+        return json(r.body, r.status);
+      }
       if (!auth(req)) return json({ error: "unauthorized" }, 401);
+      if (signIn && url.pathname === "/api/host/login-code") {
+        const c = signIn.pendingCode();
+        return c ? json(c) : json({ error: "no pending code" }, 404);
+      }
       if (url.pathname === "/api/stream" && srv.upgrade(req)) return undefined as unknown as Response;
       if (url.pathname.startsWith("/media/")) {
         const f = join(MEDIA, basename(url.pathname));
