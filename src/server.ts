@@ -214,7 +214,7 @@ const ROLE: Record<string, { title: string; about: string }> = {
   "release-manager": { title: "Release Manager", about: "Versions, CHANGELOG, Homebrew and package releases" },
   reporter: { title: "Reporter", about: "Writes daily and weekly reports and OKR progress from logs, commits and GitHub activity" },
   reviewer: { title: "PR Reviewer", about: "Carefully reviews and actually verifies PRs on your projects, especially other people's" },
-  "rust-maintainer": { title: "Rust / GPUI Maintainer", about: "Maintains Rust projects like nsh, gpui-kit and gpui-fast" },
+  maintainer: { title: "Maintainer", about: "Develops and maintains the projects you connect" },
 };
 
 export function agentRole(agent: string): { title?: string; about?: string } {
@@ -230,15 +230,15 @@ const ROUTINE_DESC: Record<string, string> = {
   "uptime-watch": "Checks uptime alerts and handles them by the escalation rules",
   "pr-review": "Reviews PRs in the Core repos that haven't been reviewed yet, up to 3 per run",
   "own-prs-ci": "Keeps your own PRs mergeable: resolves conflicts, fixes CI, addresses obvious review comments",
-  "nightly-health": "Runs cargo check / test on the latest main and opens a task on any regression",
+  "nightly-health": "Runs each project's checks and tests on the latest main and opens a task on any regression",
   "macos-check": "Builds and tests the Core repos on macOS and reports platform-specific failures",
   "daily-report": "Writes the day's report from the journal, commits and GitHub activity",
   "weekly-report": "Drafts this week's report against the OKRs, asking you before it's submitted",
   "focus-check": "Checks your focus areas: which continue, which are done, which should be added",
   "learn-ceo": "Each machine learns how you work and judge from its local Claude / Codex sessions",
+  "learn-owner": "Each machine learns how you work and judge from its local Claude / Codex sessions",
   evolve: "Reviews the last 7 days and adjusts the team's rules, prompts and memory",
   "evolve-deep": "Reviews the last 30 days, rewrites each member's profile and proposes new roles",
-  "release-monday": "Monday release: ships gpui-fast / gpui-kit per the runbook, checking with you at each gate",
   "release-wednesday": "Wednesday NSH release: prepares everything and asks you once before publishing",
 };
 const routineDesc = (r: any) =>

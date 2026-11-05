@@ -6,7 +6,7 @@ import { join } from "path";
 
 const ASSET = "Noop-web.tar.gz";
 const WEB_DIR = join(import.meta.dir, "..", "app", "dist", "web");
-const LATEST = "https://github.com/huacnlee/noop/releases/latest/download";
+const LATEST = "https://github.com/wheregmis/noop/releases/latest/download";
 
 const fetched = async (url: string, seconds: number) => {
   const res = await fetch(url, { signal: AbortSignal.timeout(seconds * 1000) });

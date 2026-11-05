@@ -10,7 +10,7 @@
             email OTP login · Web Push
                 ▲                                  ▲
                 │ outbound HTTPS                   │
-       primary (always-on Linux)            workers (macOS, Windows)
+       primary (any always-on machine)      workers (any OS)
        routines, triage, judge, agents      claim tasks when online
 ```
 
@@ -25,6 +25,7 @@
 
 | Path | What |
 |---|---|
+| `templates/`, `roles/` | what a new team is seeded with (routines off); optional specialists added with `noop role add` |
 | `src/cli.ts` | CLI entry and the daemon loop (`pull → routines → replies → judge → run tasks → push`) |
 | `src/core.ts` | config, local paths (`HOME_DIR`), tasks, claims, journal, `locked()` |
 | `src/sync.ts` | file sync with the Worker (CAS commit, pull, merge of append-only files) |

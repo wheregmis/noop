@@ -9,10 +9,10 @@ Projects: the "Core" table in memory/projects.md
 
 ## Per PR (do the parts that apply; parallelize independent checks with subagents)
 1. Understand intent: PR body, linked issue, diff (`gh pr view`, `gh pr diff`). Is the change wanted, minimal, consistent with the codebase style?
-2. Build & static checks: `cargo build`, `cargo clippy --all-targets`, `cargo fmt --check` (or repo's equivalents / CI script). Respect the CPU budget.
+2. Build & static checks: the repo's build, lint and format commands (or its CI script). Respect the CPU budget.
 3. Tests: run affected crates' tests; add a quick regression test locally if the PR lacks one and it's cheap (do not push to contributors' branches).
 4. **Visual / behavioural verification for UI changes** (desktop apps & examples):
-   - `hub visual start pr<n>` → `hub visual run pr<n> -- cargo run --example <x>` (or the app) on **main** → `hub visual shot` → stop;
+   - `hub visual start pr<n>` → `hub visual run pr<n> -- <the app or example>` on **main** → `hub visual shot` → stop;
      same on the **PR** → screenshots side by side (ffmpeg hstack into one PNG: `ffmpeg -i main.png -i pr.png -filter_complex hstack cmp.png`).
    - For interactions (scroll, menus, hover, IME, animations): `hub visual record`, drive with `hub visual input`, `hub visual stop-record` (keep ≤ 30s).
    - Check: layout, clipping, alignment, dark/light theme, HiDPI scaling, text rendering, keyboard navigation.

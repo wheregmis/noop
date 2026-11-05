@@ -17,24 +17,26 @@ Noop runs a small team of Claude Code and Codex agents on your own computers. Th
 
 ## Install
 
-On an always-on Linux machine, once — it becomes the primary:
+On an always-on machine (Linux or macOS), once — it becomes the primary:
 
 ```bash
-curl -fsSL https://huacnlee.github.io/noop/install.sh | bash -s -- --primary
+curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.sh | bash -s -- --primary
 ```
 
 You'll be asked to log in to your Cloudflare account once (the free plan is enough).
+
+A new team starts small with its routines off, so it spends no model quota until you ask it to. Turn routines on in Settings, and add specialists with `noop role list` and `noop role add <id>`.
 
 Add more machines whenever you like — they help when they're online and are never waited for:
 
 ```bash
 # macOS or Linux
-curl -fsSL https://huacnlee.github.io/noop/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.sh | bash
 ```
 
 ```powershell
 # Windows
-irm https://huacnlee.github.io/noop/install.ps1 | iex
+irm https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.ps1 | iex
 ```
 
 ## Client apps
@@ -43,12 +45,12 @@ The Noop app talks to your Noop from any device. It is optional: your Noop addre
 
 ```bash
 # macOS (Apple silicon, macOS 14+) and Linux (x86_64, GTK 4.14+, such as Ubuntu 24.04)
-curl -fsSL https://huacnlee.github.io/noop/install-client.sh | bash
+curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install-client.sh | bash
 ```
 
 ```powershell
 # Windows
-irm https://huacnlee.github.io/noop/install-client.ps1 | iex
+irm https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install-client.ps1 | iex
 ```
 
 From v0.1.5 the desktop apps update themselves: when a new version has downloaded, the sidebar offers a restart. Earlier versions update by running the same command again.

@@ -1,7 +1,7 @@
 # Owner profile (fill in — lives in your private data repo)
 - Name / GitHub handle:
-- Role: CEO of a small team; strong in product, UI/UX, architecture, engineering, testing, business.
+- Role and strengths:
 - Main stack:
-- Machines: always-on Linux PC (primary), laptop (worker), …
+- Machines: always-on primary, other workers, …
 - Commit style:
 - Communication: concise; ask with numbered options + a recommendation.

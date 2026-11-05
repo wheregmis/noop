@@ -1,0 +1,5 @@
+[[routine]]
+name = "learn-owner"
+enabled = false
+kind = "learn"                        # runs on EVERY host over its local Claude/Codex history (incremental)
+every = "daily 04:00"

@@ -266,7 +266,7 @@ export const TOOLS: Tool[] = [
     description: "Send a chat message to the fleet as the owner (same as typing in the Noop app). The chat brain answers it and acts on it." },
   { name: "create_task", title: "Create a task", annotations: RW, write: true,
     inputSchema: obj({ title: str("Short imperative title"), details: str("Goal, context and acceptance criteria — everything the agent needs, in the owner's words"),
-      repo: str("Optional repo, e.g. longbridge/nsh"), agent: str("Optional agent name from list_agents (default: lead, who plans and delegates)"),
+      repo: str("Optional repo, e.g. owner/repo"), agent: str("Optional agent name from list_agents (default: lead, who plans and delegates)"),
       follows: str("Optional: the task (T-…) this continues or corrects; the new task reads its result") }, ["title"]),
     description: "Hand a piece of work to the fleet. An agent picks it up, does it and reports back in the feed. Use for anything that takes more than a quick answer (code, reviews, releases, research)." },
   { name: "amend_task", title: "Add to a task", annotations: RW, write: true,

@@ -27,7 +27,7 @@ test("capability matching", () => {
 test("external signature links the Noop name to its site", () => {
   const cfg = { owner: { github: "huacnlee" } } as Cfg;
   expect(signature("lead", "host", cfg)).toBe(
-    "🤖 [Noop](https://huacnlee.github.io/noop) (lead) · AI agent acting for @huacnlee",
+    "🤖 [Noop](https://github.com/wheregmis/noop) (lead) · AI agent acting for @huacnlee",
   );
 });
 

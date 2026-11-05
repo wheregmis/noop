@@ -1,4 +1,4 @@
-// Learn the CEO: extract the owner's own words from local Claude Code / Codex session history
+// Learn the owner: extract the owner's own words from local Claude Code / Codex session history
 // (instructions, corrections, vetoes, trade-offs, taste) into a redacted digest that an agent distills
 // into memory/taste.md + principles. Raw transcripts never leave this machine; only the distilled
 // principles are synced to the shared data.
@@ -158,7 +158,7 @@ export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = 
   return { file, turns: turns.length, sessions };
 }
 
-export const LEARN_PROMPT = (digest: string) => `Learn the CEO. Read the redacted digest of the owner's own messages to AI coding agents at:
+export const LEARN_PROMPT = (digest: string) => `Learn the owner. Read the redacted digest of the owner's own messages to AI coding agents at:
 ${digest}
 (local to this machine; never copy raw text or the file into the hub repo, never quote anything that looks like a secret or a private person's data).
 

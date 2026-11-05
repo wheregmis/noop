@@ -1,0 +1,8 @@
+[[routine]]
+name = "triage-inbound"
+enabled = false
+every = "15m"
+agent = "dispatcher"
+prompt = """Scan inbound signals since the last journal entry by dispatcher: GitHub notifications (gh api notifications),
+PRs requesting my review, issues assigned to me, CI failures on my open PRs, new uptime alerts.
+Dedupe against tasks/ and journal/, then emit follow-ups routed to the right agent. Mark handled notifications read."""

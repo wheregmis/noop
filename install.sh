@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Noop installer (Linux / macOS)
-#   a machine (the default; joins your Noop):  curl -fsSL https://huacnlee.github.io/noop/install.sh | bash -s -- [<noop-url>]
-#   the first machine, once (the primary):     curl -fsSL https://huacnlee.github.io/noop/install.sh | bash -s -- --primary
+#   a machine (the default; joins your Noop):  curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.sh | bash -s -- [<noop-url>]
+#   the first machine, once (the primary):     curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.sh | bash -s -- --primary
 set -euo pipefail
 
 HOME_DIR="${NOOP_HOME:-$([ -d "$HOME/.agent-hub" ] && [ ! -d "$HOME/.noop" ] && echo "$HOME/.agent-hub" || echo "$HOME/.noop")}"
 APP="$HOME_DIR/app"
-REPO="https://github.com/huacnlee/noop.git"
+REPO="https://github.com/wheregmis/noop.git"
 LOG="$HOME_DIR/install.log"
 mkdir -p "$HOME_DIR" && : > "$LOG"
 
@@ -31,7 +31,7 @@ printf "\n%sNoop%s — your own AI team\n\n" "$B" "$N"
 step "git";  command -v git >/dev/null || { printf "%s✗%s install git first\n" "$R" "$N"; exit 1; }; ok
 step "bun";  if ! command -v bun >/dev/null; then run bash -c "curl -fsSL https://bun.sh/install | bash"; export PATH="$HOME/.bun/bin:$PATH"; else run bun upgrade; fi; ok "$(bun --version)"
 step "Noop"
-if [ -d "$APP/.git" ]; then run git -C "$APP" pull -q --ff-only || true; else run git clone -q "$REPO" "$APP"; fi
+if [ -d "$APP/.git" ]; then run git -C "$APP" pull -q --ff-only || true; else run git clone -q -b wheregmis "$REPO" "$APP"; fi
 (cd "$APP" && run bun install --frozen-lockfile)
 mkdir -p "$HOME/.local/bin"
 ln -sf "$APP/bin/noop" "$HOME/.local/bin/noop"; ln -sf "$APP/bin/noop" "$HOME/.local/bin/hub"

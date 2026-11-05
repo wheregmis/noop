@@ -1,4 +1,4 @@
-# Noop installer (Windows):  irm https://huacnlee.github.io/noop/install.ps1 | iex
+# Noop installer (Windows):  irm https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 $HomeDir = if ($env:NOOP_HOME) { $env:NOOP_HOME } elseif ((Test-Path "$HOME\.agent-hub") -and -not (Test-Path "$HOME\.noop")) { "$HOME\.agent-hub" } else { "$HOME\.noop" }
 $App = "$HomeDir\app"
@@ -23,7 +23,7 @@ Step "bun"
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { Run { irm bun.sh/install.ps1 | iex }; $env:Path += ";$HOME\.bun\bin" } else { Run { bun upgrade } }  # an old bun cannot read a newer bun.lock
 Ok (bun --version)
 Step "Noop"
-if (Test-Path "$App\.git") { Run { git -C $App pull -q --ff-only } } else { Run { git clone -q https://github.com/huacnlee/noop.git $App } }
+if (Test-Path "$App\.git") { Run { git -C $App pull -q --ff-only } } else { Run { git clone -q -b wheregmis https://github.com/wheregmis/noop.git $App } }
 Push-Location $App; Run { bun install --frozen-lockfile }; Pop-Location
 Ok
 Step "AI tools"

@@ -78,7 +78,7 @@ export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; k
   const line = res ? `${res.fixed ? "✅ fixed" : "❌ not fixed"}: ${res.summary}${res.owner_action ? `\n👉 You need to do: ${res.owner_action}` : ""}${res.pr ? `\nPR: ${res.pr}` : ""}`
     : `medic finished without a result; log: ${log}`;
   console.error(`🩺 ${line}`);
-  // CEO only hears about it when he must act (run a command / merge a PR). Silent fixes go to the journal only.
+  // The owner only hears about it when they must act (run a command / merge a PR). Silent fixes go to the journal only.
   if (res?.owner_action || res?.pr) try {
     const { notify } = await import("./notify");
     const ask = res.owner_action ? `You need to do this on ${hostName(cfg)}: ${res.owner_action}` : `Fixed automatically; the fix PR is waiting for you to merge: ${res.pr}`;

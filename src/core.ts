@@ -56,8 +56,16 @@ export function loadConfig(): Cfg {
   return cfg;
 }
 
+let machine = "";
+/** This machine's short name. macOS's `hostname` follows the network (ip-10-0-0-1…); its LocalHostName stays put. */
+export function machineName(): string {
+  if (machine) return machine;
+  const local = process.platform === "darwin" ? Bun.spawnSync(["scutil", "--get", "LocalHostName"]).stdout.toString().trim() : "";
+  return (machine = local || hostname().split(".")[0]);
+}
+
 export const hostName = (cfg: Cfg): string =>
-  process.env.HUB_HOST || cfg.host?.name || hostname().split(".")[0];
+  process.env.HUB_HOST || cfg.host?.name || machineName();
 
 export const now = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 export const today = () => new Date().toLocaleDateString("sv-SE"); // YYYY-MM-DD local
@@ -353,7 +361,7 @@ export function precedents(n = 30): string {
 }
 
 export function signature(agent: string, host: string, cfg: Cfg) {
-  return `🤖 [Noop](https://huacnlee.github.io/noop) (${agent}) · AI agent acting for @${cfg.owner?.github ?? "owner"}`;
+  return `🤖 [Noop](https://github.com/wheregmis/noop) (${agent}) · AI agent acting for @${cfg.owner?.github ?? "owner"}`;
 }
 
 export function agentName(agent: string): string {

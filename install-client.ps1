@@ -1,10 +1,10 @@
 # Installs the Noop client app, or updates it (Windows):
-#   irm https://huacnlee.github.io/noop/install-client.ps1 | iex
+#   irm https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install-client.ps1 | iex
 # $env:NOOP_CLIENT_BASE_URL  where the release assets are (default: the latest GitHub release)
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"  # the progress bar slows downloads down a lot
 
-$Base = if ($env:NOOP_CLIENT_BASE_URL) { $env:NOOP_CLIENT_BASE_URL } else { "https://github.com/huacnlee/noop/releases/latest/download" }
+$Base = if ($env:NOOP_CLIENT_BASE_URL) { $env:NOOP_CLIENT_BASE_URL } else { "https://github.com/wheregmis/noop/releases/latest/download" }
 $Asset = "Noop-windows-x86_64.zip"
 $Dir = Join-Path $env:LOCALAPPDATA "Programs\Noop"
 $Work = Join-Path ([IO.Path]::GetTempPath()) ("noop-" + [IO.Path]::GetRandomFileName())

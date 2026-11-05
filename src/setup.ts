@@ -1,9 +1,9 @@
 // hub init / install / update — out-of-the-box setup and self-update.
 import { $ } from "bun";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { CODE, DATA, P } from "./core";
+import { CODE, DATA, P, machineName } from "./core";
 
 const STATE_DIRS = [
   "tasks/proposed", "tasks/rejected", "tasks/waiting", "tasks/inbox", "tasks/active", "tasks/blocked", "tasks/failed", "tasks/done",
@@ -50,7 +50,7 @@ export async function init(opts: { worker?: string; token?: string; primary?: bo
   const { commitPush, pull, loadConfig, hostName } = await import("./core");
   const { readHubToml, syncMode, writeHubToml } = await import("./sync");
   mkdirSync(DATA, { recursive: true });
-  const me = hostname().split(".")[0];
+  const me = machineName();
   const joined = readHubToml().cloud?.url;
   const primaryHere = existsSync(P("config.toml")) && new RegExp(`^\\s*primary\\s*=\\s*"${me}"`, "m").test(readFileSync(P("config.toml"), "utf8"));
   if (!opts.primary && !primaryHere) {
@@ -90,6 +90,30 @@ export async function init(opts: { worker?: string; token?: string; primary?: bo
 function writeLocalConfig(me: string) {
   if (!existsSync(P("config.local.toml")))
     writeFileSync(P("config.local.toml"), `# per-machine overrides & secrets (never synced)\n[host]\n# name = "${me}"\n# caps = []\n# max_parallel = 3\n\n[notify]\n# slack_bot_token = ""\n# discord_bot_token = ""\n`);
+}
+
+// ------------------------------------------------------------------ optional roles
+const ROLES = join(CODE, "roles");
+/** The optional specialists in roles/ (not seeded, so a new team stays small). */
+export function listRoles() {
+  return readdirSync(ROLES, { withFileTypes: true }).filter((d) => d.isDirectory()).map(({ name: id }) => ({
+    id, about: readFileSync(join(ROLES, id, "profile.md"), "utf8").split("\n")[0].replace(/^#\s*/, ""), installed: existsSync(P("agents", id, "profile.md")),
+  }));
+}
+
+/** Adds an optional role: its profile (an existing one stays yours) and its routines, switched off. Returns the routines added. */
+export function addRole(id: string): string[] {
+  if (!listRoles().some((r) => r.id === id)) throw new Error(`no optional role "${id}": see noop role list`);
+  mkdirSync(P("agents", id), { recursive: true });
+  if (!existsSync(P("agents", id, "profile.md"))) cpSync(join(ROLES, id, "profile.md"), P("agents", id, "profile.md"));
+  const file = join(ROLES, id, "routines.toml");
+  if (!existsSync(file)) return [];
+  const config = readFileSync(P("config.toml"), "utf8");
+  const have = new Set(((Bun.TOML.parse(config) as { routine?: { name: string }[] }).routine ?? []).map((r) => r.name));
+  const blocks = readFileSync(file, "utf8").split(/^(?=\[\[routine\]\]$)/m).filter((b) => b.trim());
+  const fresh = blocks.map((b) => ({ b, name: b.match(/^name = "(.+)"$/m)![1] })).filter((r) => !have.has(r.name));
+  if (fresh.length) writeFileSync(P("config.toml"), `${config.trimEnd()}\n\n${fresh.map((r) => r.b.trim()).join("\n\n")}\n`);
+  return fresh.map((r) => r.name);
 }
 
 // ------------------------------------------------------------------ self-update

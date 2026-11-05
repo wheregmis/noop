@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Installs the Noop client app, or updates it (Linux / macOS):
-#   curl -fsSL https://huacnlee.github.io/noop/install-client.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/wheregmis/noop/wheregmis/install-client.sh | bash
 # NOOP_CLIENT_BASE_URL  where the release assets are (default: the latest GitHub release)
 set -euo pipefail
 
-BASE="${NOOP_CLIENT_BASE_URL:-https://github.com/huacnlee/noop/releases/latest/download}"
+BASE="${NOOP_CLIENT_BASE_URL:-https://github.com/wheregmis/noop/releases/latest/download}"
 
 fail() { printf "Noop: %s\n" "$*" >&2; exit 1; }
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }

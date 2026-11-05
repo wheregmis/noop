@@ -11,14 +11,12 @@ agents/*/memory.md, and logs/runs/ (logs only exist on the host that ran them).
 2. Act, by risk tier:
    - **Tier 0, apply directly**: memory/ and agents/*/memory.md — dedupe, merge, delete stale/incorrect entries, distill
      repeated owner answers into principles in `memory/principles.md` (each must cite its source D-xxxx). Keep each memory file < 150 lines.
-   - **Tier 1, apply directly + report**: small *additive* edits to agents/*/profile.md or policies/*.md (add a clarification,
-     example, or a missing tool tip; ≤ 10 lines per file, no deleting constraints, no loosening 🛑 rules).
-   - **Tier 2, needs_decision**: removing/loosening any rule, moving a decision category into "Do without asking", new agents
+   - **Tier 2, needs_decision**: any edit to agents/*/profile.md or policies/*.md (the owner's instructions are theirs to change), removing/loosening any rule, moving a decision category into "Do without asking", new agents
      (new agents/<id>/profile.md, include a Name), new routines in config.toml, deleting an agent. Put the full diff in the summary.
    - **Tier 3, framework code**: improvements to the hub program itself → open a PR on the Noop repo (checkout at ~/.agent-hub/app,
      branch agent/evolve-<date>, `bun test` must pass). The owner merges; all hosts self-update.
 3. Append to evolution/CHANGELOG.md: date, tier, file, one-line why (with evidence: metric/decision/task id).
-   Every Tier 1 entry gets an id `E-<date>-<n>` so the owner can say "revert E-..." .
+   Every applied Tier 2 entry gets an id `E-<date>-<n>` so the owner can say "revert E-..." .
 4. Summary for the owner: max 6 lines, metrics delta vs last run first.
 
 Never edit tasks/, decisions/ or journal/ history. Never weaken src/gates.ts. Prefer deleting obsolete instructions over piling on new ones.

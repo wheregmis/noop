@@ -1,0 +1,14 @@
+[[routine]]
+name = "evolve"
+enabled = false
+every = "daily 03:30"
+agent = "architect"
+prompt = "Run your evolve loop (see profile) on the last 7 days. fleet/metrics.json was just refreshed."
+
+[[routine]]
+name = "evolve-deep"
+enabled = false
+every = "weekly SUN 21:00"
+agent = "architect"
+weight = "heavy"
+prompt = "Deep weekly evolution: 30-day window. Re-read every agent profile and policy end to end; rewrite for clarity and remove obsolete rules (Tier 2 for removals). Propose new agents for recurring uncovered work and any framework PR."

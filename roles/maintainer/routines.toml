@@ -1,0 +1,30 @@
+[[routine]]
+name = "own-prs-ci"
+enabled = false
+readonly = true                       # only observes: runs without approval; changes come back as gated followups
+every = "30m"
+agent = "maintainer"
+difficulty = "hard"
+prompt = """Keep the owner's own open PRs mergeable without asking them. List them with `gh search prs --author=@me --state=open --json repository,number,url` and, per PR, `gh pr view <n> -R <repo> --json mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,headRefName`.
+1. mergeable == CONFLICTING (GitHub shows "This branch has conflicts", checks stuck "awaiting conflict resolution"): in a fresh worktree of the PR branch, `git merge origin/<base>` (never rebase: force-push is forbidden), resolve every conflict preserving the PR's intent and main's newer changes (read both sides' commits), run the repo's real build + tests , then push normally to the PR branch. Comment a short signed note listing the resolved files.
+2. CI red because of main drift, or a trivial failure (fmt, clippy, snapshot, lockfile): fix on the branch the same way.
+3. Unaddressed review comments with an obvious fix: fix them.
+Only if a conflict needs a product/design choice the code can't settle → needs_decision with both versions summarized and a recommendation. Skip PRs marked draft-WIP by the owner within the last hour (they are likely still pushing)."""
+
+[[routine]]
+name = "nightly-health"
+enabled = false
+readonly = true                       # only observes: runs without approval; changes come back as gated followups
+every = "daily 02:30"
+agent = "maintainer"
+weight = "heavy"
+prompt = "In each Core repo of memory/projects.md: git fetch, run the repo's check and test commands on latest main. File follow-ups for regressions."
+
+[[routine]]
+name = "macos-check"
+enabled = false
+readonly = true                       # only observes: runs without approval; changes come back as gated followups
+every = "daily 10:00"
+agent = "maintainer"
+prefer = "os:macos"
+prompt = "Build and run tests of the Core repos on this host's OS (prefer macOS). Report platform-specific failures as follow-ups."

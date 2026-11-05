@@ -13,7 +13,7 @@ import { writeRules } from "./rules";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { init, install, selfUpdate } from "./setup";
+import { addRole, init, install, listRoles, selfUpdate } from "./setup";
 import { computeMetrics } from "./metrics";
 import { collect, LEARN_PROMPT } from "./sessions";
 import { medic } from "./medic";
@@ -72,7 +72,7 @@ function runRoutines(cfg: Cfg, host: string, primary: boolean) {
       state[r.name] = new Date().toISOString();
       const d = collect(cfg);
       if (!d.file) { journal(host, `📚 learn: no new sessions`); continue; }
-      const id = newTask(`learn the CEO · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file),
+      const id = newTask(`learn the owner · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file),
         { agent: "apprentice", host, source: `routine:learn`, priority: "normal" });
       journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${id}`);
       continue;
@@ -697,7 +697,7 @@ async function daemon(cfg: Cfg) {
     const m = chatNow;
     const prev = op.follows ?? (m?.reply && !["inbox", "active", "waiting"].some((d) => existsSync(P("tasks", d, `${m.reply}.md`))) ? m.reply : undefined);
     const prevFile = prev ? ["done", "failed", "rejected", "blocked", "inbox", "active", "waiting"].map((d) => P("tasks", d, `${prev}.md`)).find(existsSync) : undefined;
-    const asked = m ? `The owner (CEO) said in chat:\n\n> ${m.text.replace(/\n/g, "\n> ")}\n` : "The owner asked for this through Noop's MCP connector.\n";
+    const asked = m ? `The owner said in chat:\n\n> ${m.text.replace(/\n/g, "\n> ")}\n` : "The owner asked for this through Noop's MCP connector.\n";
     const context = m && (m.chat.length || m.reply)
       ? (m.reply ? `\nThe owner wrote this as a reply to the team's message about ${m.reply}.\n` : "") +
         `\n## The channel just before this message\nThe owner writes tersely: words like "this", "no", "that detail", "always do it this way" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
@@ -838,7 +838,8 @@ const HELP = `Noop — your own AI team
   noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--repo ~/work/x] [-p high] [--cli claude|codex]
   noop decide D-0001 "A"      answer a decision from the terminal
   noop status                 queue / decision / accounts / resources overview
-  noop learn [--full] [--dry]  learn the CEO from local Claude/Codex sessions (digest stays local; principles go to memory)
+  noop role [add <id>]        list optional specialist roles, or add one (its routines stay off until you enable them)
+  noop learn [--full] [--dry]  learn from your local Claude/Codex sessions (digest stays local; principles go to memory)
   noop metrics [days]         per-agent success, judge vs owner decisions (feeds self-evolution)
   noop agents                 list fleet members
   noop notify "text"          test Slack/Discord
@@ -873,6 +874,18 @@ async function main() {
       return void console.log(force ? "noop restarts as soon as its running tasks finish"
         : "noop restarts once its running tasks finish (at most once per hour; --force to skip the limit)");
     }
+    case "role": {
+      if (rest[0] !== "add") {
+        for (const r of listRoles()) console.log(`${r.installed ? "✓" : " "} ${r.id.padEnd(16)} ${r.about}`);
+        return console.log("\nadd one: noop role add <id>");
+      }
+      await pull();
+      try {
+        const routines = addRole(String(rest[1]));
+        await commitPush(`[${host}] role ${rest[1]}`);
+        return console.log(`✔ ${rest[1]} joined the team${routines.length ? `; routines, off until you enable them: ${routines.join(", ")}` : ""}`);
+      } catch (e) { console.error((e as Error).message); process.exitCode = 1; return; }
+    }
     case "update": return void console.log((await selfUpdate()) ? "updated" : "up to date");
     case "daemon": return daemon(cfg);
     case "tick": return tick(cfg);
@@ -901,12 +914,13 @@ async function main() {
     }
     case "status": return status(cfg, rest.includes("--brief"));
     case "learn": {
+      if (!existsSync(P("agents", "apprentice", "profile.md"))) return void console.log("learning needs the apprentice: noop role add apprentice");
       const d = collect(cfg, { full: rest.includes("--full") });
       if (!d.file) return void console.log(`no new sessions (${d.sessions})`);
       console.log(`${d.turns} owner turns from ${d.sessions} sessions → ${d.file}`);
       if (rest.includes("--dry")) return;
       await pull();
-      const id = newTask(`learn the CEO · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file), { agent: "apprentice", host, source: `owner@${host}`, priority: "high" });
+      const id = newTask(`learn the owner · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file), { agent: "apprentice", host, source: `owner@${host}`, priority: "high" });
       journal(host, `📚 ${id} learn from ${d.sessions} local sessions (owner-triggered)`);
       await commitPush(`[${host}] learn ${id}`);
       return console.log(id);

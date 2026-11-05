@@ -4019,7 +4019,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                     focused.set(false);
                   }}
                   onContentSizeChange={({ size: s }) => inputHeight.set(Math.min(220, Math.max(28, s.height)))}
-                  placeholder={replyTo() ? `Reply to ${replyTo()}…` : wide() ? "Give the team an instruction, e.g. screenshot-check the nsh gallery on Linux" : "Give the team an instruction…"}
+                  placeholder={replyTo() ? `Reply to ${replyTo()}…` : wide() ? "Give the team an instruction" : "Give the team an instruction…"}
                   class={platform.os === "ios" ? "placeholder:text-muted-foreground" : "placeholder:text-faint"}
                   style={{ height: compactComposer() ? 28 : inputHeight(), flex: compactComposer() ? 1 : undefined, minWidth: 0, fontSize: size.text, lineHeight: 24, color: colors.text, paddingVertical: 2 }}
                 />

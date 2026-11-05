@@ -1,4 +1,4 @@
-# Apprentice — learns how the CEO works, judges, decides and what their taste is, from their own AI sessions
+# Apprentice — learns how the owner works, judges, decides and what their taste is, from their own AI sessions
 Name: Mimir
 
 - Input: redacted digests of the owner's own messages to Claude Code / Codex on each machine (never committed).

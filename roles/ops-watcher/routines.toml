@@ -1,0 +1,8 @@
+[[routine]]
+name = "uptime-watch"
+enabled = false
+readonly = true                       # only observes: runs without approval; changes come back as gated followups
+every = "10m"
+agent = "ops-watcher"
+priority = "high"
+prompt = "Check the uptime alert source listed in memory/projects.md. Apply your escalation rules."
