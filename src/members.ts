@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { type Cfg, P, list, readDoc } from "./core";
 import { openPlans } from "./plans";
+import { archiveDestination } from "./archive-path";
 
 export type MemberFields = { title: string; name: string; about: string; instructions: string };
 export class RequestError extends Error {
@@ -87,8 +88,7 @@ export function deleteMember(id: string, cfg: Cfg) {
   if (!existsSync(P("agents", id))) throw new RequestError(404, "No such member");
   const blockers = deleteBlockers(id, cfg);
   if (blockers.length) throw new RequestError(409, `Can't delete yet: ${blockers.join("; ")}`);
-  mkdirSync(P("archive", "agents"), { recursive: true });
-  renameSync(P("agents", id), P("archive", "agents", `${id}-${new Date().toISOString().replace(/\W/g, "")}`));
+  renameSync(P("agents", id), archiveDestination("agents", id));
   const settings = P("settings.json");
   if (existsSync(settings)) { // a later member with this id starts fresh
     const s = JSON.parse(readFileSync(settings, "utf8"));
@@ -96,4 +96,10 @@ export function deleteMember(id: string, cfg: Cfg) {
     delete s.autonomy?.agents?.[id];
     writeFileSync(settings, JSON.stringify(s, null, 2) + "\n");
   }
+}
+
+export function validateArchivedMember(id: string, text: string): MemberFields {
+  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id) || RESERVED.has(id) || text.includes("\0")) throw new RequestError(400, "The archived member has an unsupported identity or profile");
+  const parsed = parseProfile(text);
+  return fields({ title: parsed.title, name: parsed.name || parsed.title, about: parsed.about || "", instructions: parsed.instructions });
 }

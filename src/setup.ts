@@ -1,9 +1,10 @@
 // hub init / install / update — out-of-the-box setup and self-update.
 import { $ } from "bun";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CODE, DATA, P, machineName } from "./core";
+import { renderRoutine } from "./routines";
 
 const STATE_DIRS = [
   "tasks/proposed", "tasks/rejected", "tasks/waiting", "tasks/inbox", "tasks/active", "tasks/blocked", "tasks/failed", "tasks/done",
@@ -96,24 +97,66 @@ function writeLocalConfig(me: string) {
 const ROLES = join(CODE, "roles");
 /** The optional specialists in roles/ (not seeded, so a new team stays small). */
 export function listRoles() {
-  return readdirSync(ROLES, { withFileTypes: true }).filter((d) => d.isDirectory()).map(({ name: id }) => ({
+  return readdirSync(ROLES, { withFileTypes: true }).filter((d) => d.isDirectory() && /^[a-z0-9][a-z0-9-]{0,39}$/.test(d.name) && existsSync(join(ROLES, d.name, "profile.md"))).map(({ name: id }) => ({
     id, about: readFileSync(join(ROLES, id, "profile.md"), "utf8").split("\n")[0].replace(/^#\s*/, ""), installed: existsSync(P("agents", id, "profile.md")),
-  }));
+  })).sort((a, b) => a.id.localeCompare(b.id));
 }
 
-/** Adds an optional role: its profile (an existing one stays yours) and its routines, switched off. Returns the routines added. */
-export function addRole(id: string): string[] {
-  if (!listRoles().some((r) => r.id === id)) throw new Error(`no optional role "${id}": see noop role list`);
-  mkdirSync(P("agents", id), { recursive: true });
-  if (!existsSync(P("agents", id, "profile.md"))) cpSync(join(ROLES, id, "profile.md"), P("agents", id, "profile.md"));
+type RoleRoutine = Record<string, unknown> & { name: string; every: string; enabled?: boolean };
+function roleData(id: string) {
+  const role = listRoles().find((r) => r.id === id);
+  if (!role) throw new Error(`no optional role "${id}": see noop role list`);
   const file = join(ROLES, id, "routines.toml");
-  if (!existsSync(file)) return [];
-  const config = readFileSync(P("config.toml"), "utf8");
-  const have = new Set(((Bun.TOML.parse(config) as { routine?: { name: string }[] }).routine ?? []).map((r) => r.name));
-  const blocks = readFileSync(file, "utf8").split(/^(?=\[\[routine\]\]$)/m).filter((b) => b.trim());
-  const fresh = blocks.map((b) => ({ b, name: b.match(/^name = "(.+)"$/m)![1] })).filter((r) => !have.has(r.name));
-  if (fresh.length) writeFileSync(P("config.toml"), `${config.trimEnd()}\n\n${fresh.map((r) => r.b.trim()).join("\n\n")}\n`);
-  return fresh.map((r) => r.name);
+  const routines = existsSync(file) ? (Bun.TOML.parse(readFileSync(file, "utf8")) as { routine?: RoleRoutine[] }).routine ?? [] : [];
+  if (!Array.isArray(routines) || routines.some((r) => !/^[a-z0-9][a-z0-9-]{0,79}$/.test(r.name) || typeof r.every !== "string")) throw new Error("Invalid built-in role routines");
+  return { ...role, profile: readFileSync(join(ROLES, id, "profile.md"), "utf8"), routines: routines.map((r) => ({ ...r, enabled: false as const })) };
+}
+
+/** Preview the shipped instructions; installing never replaces a profile the owner has already changed. */
+export function readRole(id: string) {
+  const role = roleData(id);
+  return { ...role, routines: role.routines.map((r) => ({ name: String(r.name), every: String(r.every), enabled: false as const })) };
+}
+
+/** Adds an optional role without overwriting profiles or existing routines. New routines always start switched off. */
+export function addRole(id: string): string[] {
+  const role = roleData(id), file = P("config.toml");
+  const config = role.routines.length ? readFileSync(file, "utf8") : "";
+  const current = role.routines.length ? (Bun.TOML.parse(config) as { routine?: Record<string, unknown>[] }).routine ?? [] : [];
+  const have = new Set(current.map((r) => r.name));
+  const fresh = role.routines.filter((r) => { if (have.has(r.name)) return false; have.add(r.name); return true; });
+  const next = `${config.trimEnd()}\n\n${fresh.map(renderRoutine).join("\n")}\n`;
+  if (fresh.length && !Bun.deepEquals((Bun.TOML.parse(next) as any).routine, [...current, ...fresh])) throw new Error("Cannot safely add this role's routines");
+  const preferencesFile = P("settings.json");
+  const preferencesBefore = fresh.length && existsSync(preferencesFile) ? readFileSync(preferencesFile, "utf8") : null;
+  const preferences = preferencesBefore === null ? {} : JSON.parse(preferencesBefore);
+  let staleOverrides = false;
+  // An old UI preference must not turn a newly installed routine back on.
+  for (const routine of fresh) if (Object.hasOwn(preferences.routines ?? {}, routine.name)) { delete preferences.routines[routine.name]; staleOverrides = true; }
+  const profile = P("agents", id, "profile.md"), profileTemp = `${profile}.${crypto.randomUUID()}.tmp`, configTemp = `${file}.${crypto.randomUUID()}.tmp`, preferencesTemp = `${preferencesFile}.${crypto.randomUUID()}.tmp`;
+  let createdProfile = false, changedPreferences = false;
+  // shortcut: separate file renames roll back errors; use durable receipts if crash recovery must be atomic.
+  try {
+    if (fresh.length) writeFileSync(configTemp, next, { flag: "wx", mode: 0o600 });
+    if (staleOverrides) writeFileSync(preferencesTemp, JSON.stringify(preferences, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    mkdirSync(P("agents", id), { recursive: true });
+    const needsProfile = !existsSync(profile);
+    if (needsProfile) writeFileSync(profileTemp, role.profile, { flag: "wx", mode: 0o600 });
+    if (staleOverrides) { renameSync(preferencesTemp, preferencesFile); changedPreferences = true; }
+    if (needsProfile) {
+      try { linkSync(profileTemp, profile); createdProfile = true; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    }
+    if (fresh.length) renameSync(configTemp, file);
+  } catch (error) {
+    if (createdProfile) rmSync(profile, { force: true });
+    if (changedPreferences) {
+      writeFileSync(preferencesTemp, preferencesBefore!, { flag: "wx", mode: 0o600 });
+      renameSync(preferencesTemp, preferencesFile);
+    }
+    throw error;
+  } finally { rmSync(profileTemp, { force: true }); rmSync(configTemp, { force: true }); rmSync(preferencesTemp, { force: true }); }
+  return fresh.map((r) => String(r.name));
 }
 
 // ------------------------------------------------------------------ self-update

@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { CODE, P, loadConfig } from "../src/core";
 import type { RequestError } from "../src/members";
 import { createRoutine, deleteRoutine, readRoutine, renderRoutine, routineBlocks, updateRoutine } from "../src/routines";
-import { routineRoute, settingsView } from "../src/server";
+import { recordRequest as serverRecordRequest, routineRoute, settingsView } from "../src/server";
+
+const RECORD_IO = { pull: async () => true, push: async () => true };
+const recordRequest = (req: Request) => serverRecordRequest(req, RECORD_IO);
 
 const status = (fn: () => unknown) => { try { fn(); return 0; } catch (e) { return (e as RequestError).status; } };
 const parsed = () => Bun.TOML.parse(readFileSync(P("config.toml"), "utf8")) as any;
@@ -45,6 +48,7 @@ every = "daily 04:00"
 `;
 
 beforeEach(() => {
+  mkdirSync(P("journal"), { recursive: true });
   for (const d of ["agents", "projects", "archive"]) rmSync(P(d), { recursive: true, force: true });
   rmSync(P("settings.json"), { force: true });
   mkdirSync(P("agents", "lead"), { recursive: true });
@@ -174,7 +178,7 @@ test("a layout the app can't edit safely is refused, not guessed at", () => {
 
 test("the API creates, reads, edits and deletes", async () => {
   const call = async (method: string, id?: string, body?: unknown) => {
-    const r = await routineRoute(new Request("http://x/api/routines", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id);
+    const r = await routineRoute(new Request("http://x/api/routines", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id, RECORD_IO);
     return { status: r.status, data: (await r.json()) as any };
   };
   const made = await call("POST", undefined, FORM);
@@ -185,4 +189,49 @@ test("the API creates, reads, edits and deletes", async () => {
   expect((await call("PUT", "weekly-deps", { ...FORM, enabled: false })).data.view.effective.routines.find((r: any) => r.name === "weekly-deps").enabled).toBe(false);
   expect((await call("DELETE", "weekly-deps")).data.view.effective.routines.some((r: any) => r.name === "weekly-deps")).toBe(false);
   expect((await call("DELETE", "weekly-deps")).status).toBe(404);
+});
+
+
+test("routine run settings round trip and reject malformed placement", () => {
+  const placement = { requires: "os:macos,cli:cargo", host: "mac", cli: "codex", priority: "high" };
+  createRoutine({ ...FORM, ...placement });
+  expect(readRoutine(FORM.name)).toMatchObject(placement);
+  updateRoutine(FORM.name, { ...FORM, requires: "", host: "any", cli: "auto", priority: "normal" });
+  expect(readRoutine(FORM.name)).toMatchObject({ requires: "", host: "any", cli: "auto", priority: "normal" });
+  for (const bad of [{ requires: "os:macos\n" }, { host: "mac\n" }, { cli: "bash" }, { priority: "asap" }]) {
+    expect(status(() => updateRoutine(FORM.name, { ...FORM, ...bad }))).toBe(400);
+  }
+});
+
+
+test("remote dispatcher uses the same routine validation and persisted settings as the local form", async () => {
+  const { applyUiRequest } = await import("../src/ui-requests");
+  const id = crypto.randomUUID();
+  let response: any;
+  const send = async (_path: string, init: RequestInit) => {
+    if (init.method === "POST") return { job: { method: "POST", path: "/api/routines", body: { ...FORM, requires: "os:macos", host: "mac" } } };
+    response = JSON.parse(String(init.body));
+    return { ok: true };
+  };
+  await applyUiRequest(id, send, recordRequest, new Map());
+  expect(response.status).toBe(200);
+  expect(response.data.id).toBe(FORM.name);
+  expect(readRoutine(FORM.name)).toMatchObject({ requires: "os:macos", host: "mac" });
+  expect((await recordRequest(new Request("http://hub/api/settings"))).status).toBe(200);
+  const bad = await recordRequest(new Request("http://hub/api/routines", { method: "POST", body: JSON.stringify({ ...FORM, name: "bad", every: "soon" }) }));
+  expect(bad.status).toBe(400);
+  expect((await bad.json() as any).error).toContain("schedule");
+});
+
+
+test("advanced routine settings round trip, clear explicitly, and preserve hidden fields on older clients", () => {
+  const values = { prefer: "os:macos,gpu", weight: "heavy", repo: "~/work/app", scheduler: "each", signal: "printf 'stable'" };
+  createRoutine({ ...FORM, ...values });
+  expect(readRoutine(FORM.name)).toMatchObject(values);
+  updateRoutine(FORM.name, { ...FORM, every: "hourly" });
+  expect(readRoutine(FORM.name)).toMatchObject(values);
+  updateRoutine(FORM.name, { ...FORM, prefer: "", weight: "normal", repo: "", scheduler: "primary", signal: "" });
+  expect(readRoutine(FORM.name)).toMatchObject({ prefer: "", weight: "normal", repo: "", scheduler: "primary", signal: "" });
+  for (const bad of [{ prefer: "gpu;rm" }, { weight: "huge" }, { scheduler: "bad\nname" }, { repo: "folder\nagent: other" }, { signal: "bad\0command" }, { project: "../config" }])
+    expect(status(() => updateRoutine(FORM.name, { ...FORM, ...bad }))).toBe(400);
 });

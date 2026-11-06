@@ -1,14 +1,19 @@
 #!/usr/bin/env bun
+import { enabledProviders, providerAvailable } from "./providers";
+import { startMachineBridge } from "./machine-bridge";
+import { createTaskControl, registerTaskRun, releaseTaskRun, runId, taskRunCurrent, type TaskRun } from "./task-runs";
+import { hasPendingStops, matchingStopIntent, settleTaskStop, taskHasStopIntent } from "./stop-intents";
+import { createStopDrainer, type StopDrainer } from "./task-stops";
 // hub — CLI + daemon for the agent fleet.
 import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
   type Cfg, P, ROOT, _commitPush, _pull, agentName, chooseCli, claim, commitPush, heartbeat, hostCaps, hostName, journal,
-  list, loadConfig, locked, newTask, now, onlineHosts, pickTask, pull, readDoc, remember, writeDoc,
+  list, loadConfig, locked, matches, schedulableHosts, newTask, now, onlineHosts, pickTask, pull, readDoc, remember, writeDoc,
 } from "./core";
 import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, recentJudgeIds, routeDecision } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
-import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent, stopOrphanedAgent } from "./runner";
+import { STALLED, ask, buildPrompt, parseResult, quickAsk, runAgent, stopOrphanedAgent } from "./runner";
 import { writeRules } from "./rules";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
 import { homedir } from "node:os";
@@ -16,17 +21,20 @@ import { resolve } from "node:path";
 import { addRole, init, install, listRoles, selfUpdate } from "./setup";
 import { type Plan, advancePlans, approvePlan, continuePlan, createPlan, listPlans, pausePlan, readPlan, resumePlan, retryStep, saveDraft, skipStep, summary } from "./plans";
 import { computeMetrics } from "./metrics";
-import { collect, LEARN_PROMPT } from "./sessions";
+import { collect, learningBlockReason } from "./sessions";
+import { queueLearning } from "./learning";
 import { medic } from "./medic";
 import { githubStarved } from "./github";
+import { persistOwnerAction } from "./owner-actions";
 import { doctor, visual } from "./visual";
-import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, onPlanChanged, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
-import { reopenTask, type BrainOut, ClaudeModel, SYSTEM, dataActs, localStore, logBrain, think } from "./brain";
+import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, onPlanChanged, setApplyOp, setCancelTask, setStopDrainer, setUpdateFleet, startServer, status as hubStatus } from "./server";
+import { reopenTask, type BrainOut, RoutingModel, dataActs, localStore, logBrain, think } from "./brain";
 import { runTool } from "../cloud/src/tools";
+import { learningTaskHostError } from "../cloud/src/learning";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { judgeAccuracy, level, needsApproval, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
-import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
-import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
+import { CODE, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
+import { accountEnv, accountsStatus, markAccountSuccess, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 
 // ------------------------------------------------------------------ routines (scheduled task generators)
 const STATE = P("logs", "routine-state.json");
@@ -61,51 +69,69 @@ export function signalChanged(r: { name: string; signal?: string }, state: Recor
   return true;
 }
 
-function runRoutines(cfg: Cfg, host: string, primary: boolean) {
-  const state: Record<string, string> = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
-  maybeProposeNext(cfg, host, state);
+export function runRoutines(cfg: Cfg, host: string, primary: boolean) {
+  // Separate worker clocks prevent simultaneous machines from overwriting each other's scheduling progress.
+  const stateFile = primary ? STATE : P("logs", `routine-state-${encodeURIComponent(host)}.json`);
+  const state: Record<string, string> = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : {};
+  if (primary) maybeProposeNext(cfg, host, state);
   for (const r of cfg.routine ?? []) {
     if (r.enabled === false) continue;
     const owner = r.scheduler ?? (r.kind === "learn" ? "each" : "primary"); // which host generates the task
     if (owner === "primary" ? !primary : owner !== "each" && owner !== host) continue;
-    if (!due(r.every, state[r.name])) continue;
+    const stateKey = owner === "each" ? `${r.name}@${host}` : r.name;
+    if (!due(r.every, state[stateKey])) continue;
     if (r.kind === "learn") { // local session history → digest → task pinned to this host
-      state[r.name] = new Date().toISOString();
-      const d = collect(cfg);
-      if (!d.file) { journal(host, `📚 learn: no new sessions`); continue; }
-      const id = newTask(`learn the owner · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file),
-        { agent: "apprentice", host, source: `routine:learn`, priority: "normal" });
-      journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${id}`);
+      const blocked = learningBlockReason(cfg);
+      state[stateKey] = new Date().toISOString();
+      if (blocked) { journal(host, `📚 learn skipped: ${blocked}`); continue; }
+      try {
+        const d = queueLearning(cfg, { source: "routine:learn" });
+        if (!d.id) { journal(host, `📚 learn: no new sessions`); continue; }
+        journal(host, `📚 learn: ${d.turns} owner turns from ${d.sessions} sessions → ${d.id}`);
+      } catch (error) { journal(host, `📚 learn paused: ${(error as Error).message}`); }
       continue;
     }
-    const queued = routineQueued(r.name); // a copy queued or running → this run is redundant
-    if (queued) { state[r.name] = new Date().toISOString(); journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`); continue; }
-    if (r.signal && !signalChanged(r, state)) { state[r.name] = new Date().toISOString(); continue; } // nothing new → no AI run
+    const queued = routineQueued(r.name, owner === "each" ? host : undefined); // a copy queued or running → this run is redundant
+    if (queued) { state[stateKey] = new Date().toISOString(); journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`); continue; }
+    if (r.signal && !signalChanged({ ...r, name: stateKey }, state)) { state[stateKey] = new Date().toISOString(); continue; } // nothing new → no AI run
     if (r.agent === "architect") computeMetrics(r.name === "evolve-deep" ? 30 : 7);
     const prompt = r.readonly ? `${r.prompt}\n\nRead-only routine: observe and report only. Do not change code, PRs, issues or settings; propose any change as a follow-up.` : r.prompt;
     const id = newTask(`${r.name} · ${new Date().toLocaleString("sv-SE").slice(0, 16)}`, prompt, {
-      agent: r.agent, cli: r.cli, requires: r.requires, prefer: r.prefer, weight: r.weight, repo: r.repo, project: r.project, priority: r.priority, source: `routine:${r.name}`,
+      agent: r.agent, cli: r.cli, host: owner === "each" && (!r.host || r.host === "any") ? host : r.host, requires: r.requires, prefer: r.prefer, weight: r.weight, repo: r.repo, project: r.project, priority: r.priority, source: `routine:${r.name}`, extra: { scheduled_by: host },
     });
-    const old = supersedeProposed(r.name, id); // a newer run replaces older unapproved copies
+    const old = supersedeProposed(r.name, id, owner === "each" ? host : undefined); // a newer run replaces older unapproved copies
     if (old.length) journal(host, `⏰ routine \`${r.name}\`: ${id} supersedes ${old.join(", ")}`);
-    state[r.name] = new Date().toISOString();
+    state[stateKey] = new Date().toISOString();
     journal(host, `⏰ routine \`${r.name}\` → ${id} (${r.agent})`);
   }
   mkdirSync(P("logs"), { recursive: true });
-  writeFileSync(STATE, JSON.stringify(state, null, 2));
+  writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
 // ------------------------------------------------------------------ task processing
 const pendingRoute: string[] = [];
-const cancelled = new Set<string>(); // tasks the owner cancelled while their agent ran // decisions opened by workers, routed by the next tick
-async function processTask(path: string, cfg: Cfg, host: string) {
+export async function processTask(path: string, cfg: Cfg, host: string) {
   const { meta, body } = readDoc(path);
+  const placementError = (doc: ReturnType<typeof readDoc>) => learningTaskHostError(doc.meta, doc.body, doc.meta.host || "any") ?? learningTaskHostError(doc.meta, doc.body, host);
+  const requeueMisplaced = () => locked(async () => {
+    if (!await _pull() || !existsSync(path)) return;
+    const latest = readDoc(path), error = placementError(latest);
+    if (!error || latest.meta.id !== meta.id || latest.meta.run_id !== meta.run_id || latest.meta.claimed_by !== host) return;
+    writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...latest.meta, claimed_by: undefined }, latest.body);
+    unlinkSync(path);
+    journal(host, `⏸ ${meta.id}: ${error}`);
+    await _commitPush(`[${host}] requeue ${meta.id} (learning source machine)`);
+  });
+  if (placementError({ meta, body })) { await requeueMisplaced(); return; }
+  const run = registerTaskRun({ id: meta.id, host, run_id: meta.run_id });
+  try {
   const wanted = allowedClis(meta, cfg);
-  const installed = (c: string) => !!Bun.which(c);
+  const installed = providerAvailable;
   const first = pickAccount(cfg, wanted.filter(installed)) ?? failoverAccount(cfg, null, wanted, installed);
   const agent = meta.agent || "lead";
   if (!first) { // no usable account right now → put it back, don't fail it
     await locked(async () => {
+      if (!await _pull() || !taskRunCurrent(run)) return;
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined }, body);
       if (existsSync(path)) unlinkSync(path);
       await _commitPush(`[${host}] requeue ${meta.id} (no AI account available)`);
@@ -120,25 +146,33 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     cli = acct.cli;
     const model = cfg.clis?.[cli]?.model ?? (cli === "claude" ? "claude-opus-5-5" : "default");
     meta.cli_used = cli; meta.model = model; meta.account = acct.name;
-    await locked(async () => {
-      if (existsSync(path)) writeDoc(path, meta, body); // the app shows which model runs it
+    const started = await locked(async () => {
+      if (!await _pull() || !taskRunCurrent(run)) return;
+      const latest = readDoc(path);
+      if (placementError(latest)) return;
+      writeDoc(path, { ...latest.meta, cli_used: cli, model, account: acct.name }, latest.body); // preserve owner additions
       journal(host, `▶ ${meta.id} ${agentName(agent)}/${cli}: ${meta.title}`);
       await _commitPush(`[${host}] start ${meta.id}`);
+      return true;
     });
+    if (!started || !taskRunCurrent(run)) { await requeueMisplaced(); return; }
 
     const log = P("logs", "runs", `${meta.id}-${Date.now()}-${cli}.log`);
     const gh = await githubStarved(cfg);
+    if (!taskRunCurrent(run)) return;
+    const latest = readDoc(path);
+    if (placementError(latest)) { await requeueMisplaced(); return; }
     const b = budget(sample(cfg), running, meta.weight === "heavy");
     b.note += gh.note ? `\n${gh.note}` : "";
     out = await runAgent(cli, buildPrompt(meta, promptBody, cfg, b.note), meta.repo || P(), cfg, log, !!meta.gate_override,
-      { ...b.env, ...accountEnv(acct) });
-    if (cancelled.has(meta.id)) { cancelled.delete(meta.id); return; } // the owner cancelled it while it ran
+      { ...b.env, ...accountEnv(acct) }, run);
+    if (!taskRunCurrent(run)) return;
     if (out.includes(STALLED)) { // went quiet and was stopped: run it again from where it got to, up to twice
       const why = out.slice(out.indexOf(STALLED) + STALLED.length).trim();
       const stalls = Number(meta.stalls ?? 0) + 1;
       if (stalls <= 2) {
         await locked(async () => {
-          await _pull();
+          if (!await _pull() || !taskRunCurrent(run)) return;
           writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, stalls: String(stalls),
             requeue_note: `Your previous run was stopped: ${why}. Continue from where it got to: first check what is already done (branch agent/${meta.id}-*, commits, PRs, comments you posted) and don't redo it. If you are waiting on something slow, return "waiting" instead of sitting idle.` },
             body);
@@ -152,22 +186,31 @@ async function processTask(path: string, cfg: Cfg, host: string) {
       break;
     }
     res = parseResult(out);
+    if (res.status !== "failed") markAccountSuccess(acct);
     const failure = res.status === "failed" ? classify(out) : null;
     if (!failure) break;
-    await reportFailure(acct, failure, out, cfg); // puts this account on cooldown / needs-login
-    const next: typeof first | null = hop < 4 ? failoverAccount(cfg, acct, wanted, installed) : null;
+    const failed = await locked(async () => {
+      if (!await _pull() || !taskRunCurrent(run)) return;
+      await reportFailure(acct, failure, out, cfg); // puts this account on cooldown / needs-login
+      return true;
+    });
+    if (!failed || !taskRunCurrent(run)) return;
+    const currentConfig = loadConfig();
+    const next: typeof first | null = hop < 4 ? failoverAccount(currentConfig, acct, allowedClis(meta, currentConfig), installed) : null;
     if (next) {
       const was = `${acct.cli}/${acct.name}`;
-      await locked(async () => {
-        await _pull();
+      const switched = await locked(async () => {
+        if (!await _pull() || !taskRunCurrent(run)) return;
         journal(host, `🔀 ${meta.id} ${was} ${failure === "quota" ? "hit its usage limit" : "needs sign-in"}; rerunning right away on ${next.cli}/${next.name} here`);
         await _commitPush(`[${host}] ${meta.id} switch to ${next.cli}`);
+        return true;
       });
-      acct = next;
+      if (!switched || !taskRunCurrent(run)) return;
+      acct = next; cfg = currentConfig;
       continue;
     }
     await locked(async () => { // nothing usable on this host → requeue
-      await _pull();
+      if (!await _pull() || !taskRunCurrent(run)) return;
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, retried_after: failure }, body);
       if (existsSync(path)) unlinkSync(path);
       journal(host, `↻ ${meta.id} requeued (${cli}/${acct!.name}: ${failure})`);
@@ -176,7 +219,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     return;
   }
   await locked(async () => {
-  await _pull();
+  if (!await _pull() || !taskRunCurrent(run)) return;
 
   remember(agent, res.lessons, meta.id);
   if (meta.plan_draft && res.followups?.length) { // a plan's draft: these steps wait for the owner's approval, they aren't tasks yet
@@ -190,7 +233,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   const children: string[] = [];
   for (const f of (res.followups ?? []).slice(0, depth > maxDepth ? 0 : 8)) {
     const id = newTask(f.title, f.body ?? "", { agent: f.agent ?? agent, priority: f.priority ?? meta.priority, repo: f.repo, project: f.repo ? undefined : meta.project, requires: f.requires, host: f.host,
-      source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}) } });
+      source: `followup:${meta.id}`, extra: { depth: String(depth), spawned_by_run: meta.run_id, ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}) } });
     children.push(id);
     journal(host, `  ↳ ${id} → ${f.agent ?? agent}: ${f.title}`);
   }
@@ -233,10 +276,11 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     // every other finished task (routines, follow-ups, sub-steps) → a quiet result line in the team channel, no push
     else if (res.status === "done")
       void notify(`${meta.title}\n${res.summary}`, cfg, { kind: "system", ref: meta.id, attachments: res.attachments, from: `${agentName(agent)}@${host}`, quiet: true });
-    if (res.status !== "done") void track(handleFailure(meta, body, res.summary, out, cfg, host));
+    if (res.status !== "done") void track(handleFailure(meta, body, res.summary, out, cfg, host, run));
   }
   await _commitPush(`[${host}] ${res.status} ${meta.id}: ${meta.title}`);
   });
+  } finally { releaseTaskRun(run); }
 }
 
 const FOLLOW_UP = "## Owner follow-up";
@@ -285,6 +329,7 @@ function reapStale(cfg: Cfg, host: string, ownOnly = false) {
   const graceMs = (cfg.fleet?.reap_after_minutes ?? 20) * 60_000;
   for (const p of list(P("tasks", "active"), /^T-.*\.md$/)) {
     const { meta, body } = readDoc(p);
+    if (taskHasStopIntent(meta) || hasPendingStops(meta.pending_stops)) continue;
     // own tasks not run by this process were orphaned by a crash/restart (we're alive, so no one else reaps them)
     if (meta.claimed_by === host ? runningIds.has(meta.id) : ownOnly || alive.has(meta.claimed_by)) continue;
     if (Date.now() - Date.parse(meta.started) < graceMs) continue;
@@ -297,20 +342,16 @@ function reapStale(cfg: Cfg, host: string, ownOnly = false) {
 
 /** Tasks whose hard requirements no online host satisfies: note once, never block the queue. */
 function noteUnservable(cfg: Cfg, host: string) {
-  const hosts = onlineHosts(cfg);
+  const hosts = schedulableHosts(cfg);
   for (const p of list(P("tasks", "inbox"), /^T-.*\.md$/)) {
     const { meta, body } = readDoc(p);
-    const reqs = (meta.requires ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-    if (!reqs.length || meta.parked) continue;
-    if (!hosts.some((h) => reqs.every((r) => capOk(r, h.caps)))) {
-      writeDoc(p, { ...meta, parked: now() }, body);
-      journal(host, `🅿️ ${meta.id} parked until a host with ${reqs.join("+")} comes online`);
-    }
-  }
-  for (const p of list(P("tasks", "inbox"), /^T-.*\.md$/)) { // unpark when capable host returns
-    const { meta, body } = readDoc(p);
-    const reqs = (meta.requires ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-    if (meta.parked && hosts.some((h) => reqs.every((r) => capOk(r, h.caps)))) writeDoc(p, { ...meta, parked: undefined }, body);
+    const available = hosts.some((h) => matches(meta, h.caps, body) && allowedClis(meta, cfg).some((cli) => h.caps.includes(`cli:${cli}`)));
+    if (!available) {
+      const allowed = allowedClis(meta, cfg);
+      const need = learningTaskHostError(meta, body, meta.host || "any") || (!allowed.length ? "enabled-ai-tool" : hosts.some((machine) => matches(meta, machine.caps, body)) ? allowed.map((cli) => `cli:${cli}`).join("|") : "");
+      if (!meta.parked || meta.parked_need !== need) writeDoc(p, { ...meta, parked: meta.parked || now(), parked_need: need }, body);
+      if (!meta.parked) journal(host, `🅿️ ${meta.id} needs an available machine and enabled AI tool; change its run settings or the AI tools selected in team configuration`);
+    } else if (meta.parked) writeDoc(p, { ...meta, parked: undefined, parked_need: undefined }, body);
   }
 }
 
@@ -320,6 +361,7 @@ let draining = false;
 const RESTART_FLAG = () => P("..", "restart-requested");
 /** Follow-up work a finished task still owes (retry bookkeeping etc.): drain waits for it too. */
 const inflight = new Set<Promise<unknown>>();
+const bridgeStops: Array<() => void | Promise<void>> = [];
 const track = <T,>(p: Promise<T>) => { inflight.add(p); void p.finally(() => inflight.delete(p)).catch(() => {}); return p; };
 const LAST_RESTART = () => P("logs", "last-restart");
 /** At most one voluntary restart (self-update, `hub restart`) per hour unless forced; signals are never throttled. */
@@ -333,6 +375,7 @@ async function drainAndExit(why: string, host: string) {
   if (running) console.log(`${why}: waiting for ${running} running task(s) to finish`);
   // `running` covers each task from claim until its agent process exited and its result was committed
   while (running > 0 || inflight.size > 0) { await Bun.sleep(3000); await Promise.allSettled([...inflight]); }
+  await Promise.allSettled(bridgeStops.map((stop) => Promise.resolve().then(stop)));
   try {
     mkdirSync(P("logs"), { recursive: true });
     writeFileSync(LAST_RESTART(), new Date().toISOString());
@@ -389,15 +432,20 @@ async function ownerUpdate(c: Cfg, host: string) {
 
 /** A good report doesn't forward raw errors. Retry, call the medic for tooling problems, and only after that
  *  tell the owner — in one plain sentence, and only for work the owner actually cares about. */
-async function handleFailure(meta: Record<string, string>, body: string, summary: string, out: string, cfg: Cfg, host: string) {
+async function handleFailure(meta: Record<string, string>, body: string, summary: string, out: string, cfg: Cfg, host: string, run?: TaskRun) {
   const attempt = Number(meta.attempt ?? 1);
   // no keyword matching: when the agent could not even report a result, the medic (AI) decides whether the tooling broke
   const tooling = /agent returned no result block/.test(summary);
-  if (tooling) void medic(`Agent run for ${meta.id} on ${host} ended without a result. Decide whether the tooling (CLI, auth, environment) is at fault and fix it; ignore it if the task itself failed:\n${out.slice(-2500)}`,
-    cfg, { auto: true, kind: `tool-${meta.cli_used ?? "agent"}` });
+  const current = () => {
+    const f = P("tasks/failed", `${meta.id}.md`);
+    const currentMeta = existsSync(f) ? readDoc(f).meta : null;
+    return !run?.stopped && currentMeta && !taskHasStopIntent(currentMeta) && !hasPendingStops(currentMeta.pending_stops) && (!run || currentMeta.run_id === run.run_id)
+      && !["inbox", "active", "waiting", "blocked", "proposed", "done", "rejected"].some((dir) => existsSync(P("tasks", dir, `${meta.id}.md`)));
+  };
   if (attempt < (cfg.fleet?.max_attempts ?? 2)) {
     await locked(async () => {
-      await _pull();
+      if (!await _pull() || !current()) return;
+      if (tooling) void medic(`Agent run for ${meta.id} on ${host} ended without a result:\n${out.slice(-2500)}`, cfg, { auto: true, kind: `tool-${meta.cli_used ?? "agent"}` });
       const f = P("tasks", "failed", `${meta.id}.md`);
       if (existsSync(f)) unlinkSync(f);
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, status: undefined, attempt: String(attempt + 1) },
@@ -408,7 +456,7 @@ async function handleFailure(meta: Record<string, string>, body: string, summary
     return;
   }
   const ownerCares = meta.origin === "owner" || /^owner/.test(meta.source ?? "") || meta.priority === "urgent";
-  if (!ownerCares || cfg.notify?.on_failure === false) return; // routine/internal work: journal only; architect reviews failures
+  if (!current() || !ownerCares || cfg.notify?.on_failure === false) return; // routine/internal work: journal only; architect reviews failures
   const reason = summary.split("\n")[0].replace(/\s+/g, " ").slice(0, 140);
   await notify(`Couldn't finish "${meta.title}": ${reason}. I'll follow up in the daily report; tell me if you want a different approach.`, cfg,
     { kind: "notice", ref: meta.id, from: `${agentName(meta.agent || "lead")}@${host}` });
@@ -424,6 +472,7 @@ const GH_HEAVY = new Set(["dispatcher", "reviewer", "ops-watcher", "oss-triage",
 function wakeParents(host: string, ready = new Set<string>()) {
   for (const p of list(P("tasks", "waiting"), /^T-.*\.md$/)) {
     const { meta, body } = readDoc(p);
+    if (taskHasStopIntent(meta) || hasPendingStops(meta.pending_stops)) continue;
     if (meta.wake_at) { // parked on something slow: back to the queue once the time is up, or as soon as its check changes
       if (Date.parse(meta.wake_at) > Date.now() && !ready.has(meta.id)) continue;
       writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, wake_at: undefined, status: undefined, claimed_by: undefined, resumed: "yes" },
@@ -457,6 +506,7 @@ export async function checkWaits(now = Date.now(), everyMs = 3 * 60_000): Promis
   const waiting = new Set<string>();
   for (const p of list(P("tasks", "waiting"), /^T-.*\.md$/)) {
     const { meta } = readDoc(p);
+    if (taskHasStopIntent(meta) || hasPendingStops(meta.pending_stops)) continue;
     if (!meta.wake_at || !meta.wait_check) continue;
     waiting.add(meta.id);
     const c = waitChecks.get(meta.id);
@@ -518,24 +568,29 @@ function pruneMediaHourly(cfg: Cfg) {
   } catch (e) { console.error(`media prune: ${e}`); }
 }
 
-export async function tick(cfg: Cfg, background = false) {
+export async function tick(cfg: Cfg, background = false, stopDrainer?: StopDrainer) {
   const host = hostName(cfg);
   const primary = isPrimary(cfg, host);
   const ready = primary ? await checkWaits().catch(() => new Set<string>()) : new Set<string>();
   await locked(async () => {
-    await _pull();
+    if (!await _pull()) throw new Error("Could not refresh task state; no scheduling changes were made");
+    cfg = loadConfig(); // apply UI settings just received from the fleet before claiming work
     try { writeRules(); } catch (e) { console.error(`rules.md: ${e}`); }
     heartbeat(cfg, running, sample(cfg));
+    runRoutines(cfg, host, primary);
     if (primary) {
-      runRoutines(cfg, host, primary);
       reapStale(cfg, host);
       wakeParents(host, ready);
       advancePlans({ maxAttempts: cfg.fleet?.max_attempts ?? 2, notify: (text) => { if (text) void notify(text, cfg, { kind: "notice", from: "hub" }); } });
       await proposeBatch(cfg, host);
       noteUnservable(cfg, host);
     } else reapStale(cfg, host, true);
-    await _commitPush(`[${host}] tick`);
+    if (!await _commitPush(`[${host}] tick`)) throw new Error("Scheduling state was saved locally but not confirmed; no new tasks will be claimed");
   });
+  if (primary) {
+    const drained = await (stopDrainer ?? createStopDrainer(cfg, host, createTaskControl(cfg, host)))();
+    if (!drained.synced) throw new Error(drained.error || "Task cleanup state could not sync; no new tasks will be claimed");
+  }
   pruneMediaHourly(cfg);
   await retryLogins(cfg);
   if (primary || pendingLoginIds().size) await handleReplies(cfg, host);
@@ -559,7 +614,7 @@ export async function tick(cfg: Cfg, background = false) {
     const s = sample(cfg);
     const max = allowedParallel(s, cfg, running);
     if (running >= max) break;
-    if (!pickAccount(cfg, ["claude", "codex"].filter((c) => Bun.which(c)))) break;
+    if (!pickAccount(cfg, enabledProviders(cfg).filter(providerAvailable))) break;
     if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
     const t = pickTask(cfg, s.loadRatio, canRunHeavy(s, cfg, running));
     if (!t) break;
@@ -592,14 +647,16 @@ const wakeDaemon = () => wakeUp?.();
 const nap = (ms: number) => Promise.race([Bun.sleep(ms), new Promise<void>((r) => { wakeUp = r; })]).finally(() => { wakeUp = null; });
 
 async function planNow(cfg: Cfg, host: string) {
-  const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned).slice(0, 12);
+  const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned && !taskHasStopIntent(t.meta) && !hasPendingStops(t.meta.pending_stops)).slice(0, 12);
   if (!todo.length) return;
-  const hosts = onlineHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
+  const hosts = schedulableHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
   const r = await ask(`You place tasks for an AI agent fleet running on several machines.
 For each task decide:
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
-- cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
+  Reviews, triage, gh commands and ordinary coding are OS-independent: leave requires empty unless an actual platform tool is needed.
+  Prefer available machines. Never infer Linux from a shell command or an agent name. If a genuinely required OS is offline, keep it so the owner can decide in the UI.
+- cli: choose from ${enabledProviders(cfg).join(", ") || "(none enabled)"}. Prefer an enabled tool available on an online machine. Claude often suits engineering and judgement; Codex routine work; Hermes general agent tasks. Never select a disabled tool.
 - difficulty: "hard" or "normal".
 
 Online hosts:
@@ -616,9 +673,12 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
     for (const t of todo) {
       const v = r[t.meta.id];
       if (!v || !existsSync(t.p)) continue;
+      const fresh = readDoc(t.p);
+      if (fresh.meta.planned || taskHasStopIntent(fresh.meta) || hasPendingStops(fresh.meta.pending_stops)) continue; // owner settings changed while the planner ran
+      t.meta = fresh.meta; t.body = fresh.body;
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
-      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
+      writeDoc(t.p, { ...t.meta, requires: req, ...(pinned ? {} : { planned_cli: enabledProviders(cfg).includes(v.cli) ? v.cli : "" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
       journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
     }
@@ -626,33 +686,61 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
   });
 }
 
-async function daemon(cfg: Cfg) {
-  const host = hostName(cfg);
-  const every = (cfg.host?.tick_seconds ?? 60) * 1000;
-  console.log(`hub daemon on ${host} caps=${hostCaps(cfg).join(",")} tick=${every / 1000}s parallel≤${cfg.host?.max_parallel ?? "cores/3"}`);
-  onSettingsSaved((summary) => locked(async () => {
-    await _pull();
-    journal(host, `⚙️ owner changed settings: ${summary}`);
-    await _commitPush(`[${host}] settings: ${summary.slice(0, 60)}`);
-  }));
-  if (isPrimary(cfg, host)) startCloudBridge(cfg);
-  const appendFollowUp = (tid: string, text: string) => locked(async () => {
-    await _pull();
+export async function recoverTaskRuns(host: string, io: { pull: () => Promise<boolean>; push: (message: string) => Promise<boolean>;
+  stopOrphan?: (id: string, runId?: string) => Promise<boolean> } = { pull: _pull, push: _commitPush }) {
+  const interrupted = await locked(async () => {
+    if (!await io.pull()) throw new Error("Could not refresh interrupted tasks; reconnect before starting this machine");
+    return list(P("tasks/active"), /^T-.*\.md$/).flatMap((path) => {
+      const { meta } = readDoc(path);
+      if (meta.claimed_by !== host) return [];
+      if (!runId(meta.run_id)) throw new Error(`Interrupted task ${meta.id} has no verifiable run identity. Update the machine and inspect this older run before recovery.`);
+      if (taskHasStopIntent(meta) && !matchingStopIntent(meta)) throw new Error(`Interrupted task ${meta.id} has an unverified stop request; recovery was halted`);
+      return [{ path, id: meta.id, run_id: meta.run_id, intent: matchingStopIntent(meta)?.operation_id }];
+    });
+  });
+  let recovered = 0;
+  for (const run of interrupted) {
+    const stopped = await (io.stopOrphan ?? stopOrphanedAgent)(run.id, run.run_id);
+    await locked(async () => {
+      if (!await io.pull()) throw new Error("Could not refresh a stopped interrupted run; recovery was halted");
+      if (!existsSync(run.path)) return;
+      const { meta, body } = readDoc(run.path);
+      if (meta.claimed_by !== host || meta.run_id !== run.run_id) return; // Never retarget a newer attempt.
+      if (taskHasStopIntent(meta) && !matchingStopIntent(meta)) throw new Error(`Interrupted task ${run.id} has an unverified stop request; recovery was halted`);
+      if (settleTaskStop(run.path)) journal(host, `🛑 ${run.id} completed its requested stop during startup`);
+      else {
+        if (run.intent || taskHasStopIntent(meta)) throw new Error(`Interrupted task ${run.id} lost its stop request; recovery was halted`);
+        writeDoc(P("tasks/inbox", `${run.id}.md`), { ...meta, claimed_by: undefined, requeued: now(),
+          requeue_note: `Requeued after daemon restart on ${host}; check for partial work.` }, body);
+        unlinkSync(run.path);
+        journal(host, `♻️ requeued ${run.id} after restart${stopped ? " (old agent stopped)" : ""}`);
+      }
+      recovered++;
+      if (!await io.push(`[${host}] recover ${run.id}`)) throw new Error("Interrupted-task recovery was saved locally but not confirmed; reconnect before starting this machine");
+    });
+  }
+  return recovered;
+}
+
+export async function appendTaskFollowUp(cfg: Cfg, host: string, tid: string, text: string, io = { pull: _pull, push: _commitPush }) {
+  const result = await persistOwnerAction((saved) => {
     for (const dir of ["inbox", "active", "waiting", "blocked", "done", "failed"]) {
       const f = P("tasks", dir, `${tid}.md`);
       if (!existsSync(f)) continue;
       const { meta, body } = readDoc(f);
+      if (hasPendingStops(meta.pending_stops) || taskHasStopIntent(meta)) return { ok: false, id: tid, title: "", error: `Task ${tid} is still stopping related runs. Finish its cleanup before continuing it.` };
+      const placementError = learningTaskHostError(meta, body, meta.host || "any");
+      if (placementError) return { ok: false, id: tid, title: String(meta.title ?? tid), error: placementError };
       // waiting on the owner's card: what they write on the task is their answer to it
       if (dir === "blocked" && meta.decision && existsSync(P("decisions", "open", `${meta.decision}.md`))) {
-        answerFromChat(String(meta.decision), text, false);
-        return String(meta.title ?? tid);
+        // The reply is queued below; this branch has not changed the task file.
+        return { ok: false, id: tid, title: String(meta.title ?? tid), decision: String(meta.decision) };
       }
       if (dir === "blocked" || dir === "done" || dir === "failed") { // a task is a conversation: talking to a finished one continues it, under the same id
         reopenTask(f, text);
+        saved({ id: tid });
         journal(host, `💬 ${tid} reopened by owner: ${text.slice(0, 80)}`);
-        await _commitPush(`[${host}] reopen ${tid}`);
-        queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
-        return String(meta.title ?? tid);
+        return { ok: true, id: tid, title: String(meta.title ?? tid), wake: true };
       }
       const added = `${body}\n\n${FOLLOW_UP} ${now()}\n> ${text.replace(/\n/g, "\n> ")}\n`;
       if (dir === "waiting") { // parked until its sub-tasks finish: the owner's new message is acted on now, not then
@@ -661,76 +749,68 @@ async function daemon(cfg: Cfg) {
           `${added}\nWoken from waiting by the owner's message above: act on it now.${kids}\n`);
         unlinkSync(f);
       } else writeDoc(f, meta, added);
+      saved({ id: tid });
       journal(host, `💬 ${tid} owner added${dir === "waiting" ? " (woken from waiting)" : ""}: ${text.slice(0, 80)}`);
-      await _commitPush(`[${host}] chat follow-up ${tid}`);
-      return String(meta.title ?? tid);
+      return { ok: true, id: tid, title: String(meta.title ?? tid) };
     }
-    return "";
+    const cancelled = P("tasks/rejected", `${tid}.md`);
+    return { ok: false, id: tid, title: "", error: existsSync(cancelled) && readDoc(cancelled).meta.cancelled
+      ? `Task ${tid} is cancelled. Use Reopen task to review its run settings before continuing it.`
+      : `Task ${tid} cannot be continued. Refresh it before sending another instruction.` };
+  }, () => `[${host}] chat follow-up ${tid}`, io);
+  if (result.decision) { answerFromChat(result.decision, text, false); return { ...result, ok: true, queued: true }; }
+  if (result.wake) queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
+  return result;
+}
+
+async function daemon(cfg: Cfg) {
+  const host = hostName(cfg);
+  const every = (cfg.host?.tick_seconds ?? 60) * 1000;
+  console.log(`hub daemon on ${host} caps=${hostCaps(cfg).join(",")} tick=${every / 1000}s parallel≤${cfg.host?.max_parallel ?? "cores/3"}`);
+  const appendFollowUp = (tid: string, text: string) => appendTaskFollowUp(cfg, host, tid, text);
+  setUpdateFleet(async () => {
+    const result = await persistOwnerAction((saved) => {
+      mkdirSync(P("fleet"), { recursive: true });
+      writeFileSync(UPDATE_REQUEST(), JSON.stringify({ at: now(), by: "owner" }, null, 2));
+      saved({ file: "fleet/update.json" });
+      journal(host, "⬆️ owner asked every machine to update");
+      return { ok: true, file: "fleet/update.json", hosts: onlineHosts(cfg).length };
+    }, () => `[${host}] update requested`);
+    return result.hosts;
   });
-  setUpdateFleet(() => locked(async () => {
-    await _pull();
-    mkdirSync(P("fleet"), { recursive: true });
-    writeFileSync(UPDATE_REQUEST(), JSON.stringify({ at: now(), by: "owner" }, null, 2));
-    journal(host, "⬆️ owner asked every machine to update");
-    await _commitPush(`[${host}] update requested`);
-    return onlineHosts(cfg).length;
-  }));
-  setCancelTask((tid, done) => locked(async () => {
-    await _pull();
-    const where = ["inbox", "waiting", "blocked", "proposed", "active"].find((d) => existsSync(P("tasks", d, `${tid}.md`)));
-    if (!where) return "not found";
-    const f = P("tasks", where, `${tid}.md`);
-    const { meta, body } = readDoc(f);
-    if (where === "active" && meta.claimed_by && meta.claimed_by !== host) return `running on ${meta.claimed_by}`;
-    cancelled.add(tid);
-    agentProcs.get(tid)?.kill("SIGTERM");
-    if (done) writeDoc(P("tasks", "done", `${tid}.md`), { ...meta, claimed_by: undefined, finished: now(), wake_at: undefined },
-      `${body}\n\n## Done ${now()}\nThe owner marked this task done (finished it himself).\n`);
-    else writeDoc(P("tasks", "rejected", `${tid}.md`), { ...meta, claimed_by: undefined, cancelled: now(), wake_at: undefined },
-      `${body}\n\n## Cancelled ${now()}\nThe owner cancelled this task.\n`);
-    unlinkSync(f);
-    for (const kid of (meta.children ?? "").split(",").filter(Boolean)) { // its sub-tasks go with it
-      const k = ["inbox", "waiting", "blocked", "proposed"].find((d) => existsSync(P("tasks", d, `${kid}.md`)));
-      if (!k) continue;
-      const kd = readDoc(P("tasks", k, `${kid}.md`));
-      if (done) writeDoc(P("tasks", "done", `${kid}.md`), { ...kd.meta, finished: now() }, `${kd.body}\n\n## Done ${now()}\nParent ${tid} was marked done by the owner.\n`);
-      else writeDoc(P("tasks", "rejected", `${kid}.md`), { ...kd.meta, cancelled: now() }, `${kd.body}\n\n## Cancelled ${now()}\nParent ${tid} was cancelled.\n`);
-      unlinkSync(P("tasks", k, `${kid}.md`));
-    }
-    journal(host, done ? `✅ ${tid} marked done by you` : `🛑 ${tid} cancelled at your request`);
-    await _commitPush(`[${host}] ${done ? "finish" : "cancel"} ${tid}`);
-    return done ? "done" : "cancelled";
-  }));
+  const rawControl = createTaskControl(cfg, host);
+  setCancelTask(rawControl);
   // A new task from the owner's chat (created by the chat brain, or by create_task over MCP). It carries the channel's
   // recent conversation and the task it continues, so terse follow-ups ("no, …", "note this detail down") keep their meaning.
   let chatNow: { text: string; chat: string[]; reply?: string; thread?: boolean } | null = null; // the owner message the brain is handling
-  const createOwnerTask = (op: { title: string; details?: string; repo?: string; project?: string; agent?: string; follows?: string }) => locked(async () => {
-    await _pull();
-    const m = chatNow;
-    const prev = op.follows ?? (m?.reply && !["inbox", "active", "waiting"].some((d) => existsSync(P("tasks", d, `${m.reply}.md`))) ? m.reply : undefined);
-    const prevFile = prev ? ["done", "failed", "rejected", "blocked", "inbox", "active", "waiting"].map((d) => P("tasks", d, `${prev}.md`)).find(existsSync) : undefined;
-    const asked = m ? `The owner said in chat:\n\n> ${m.text.replace(/\n/g, "\n> ")}\n` : "The owner asked for this through Noop's MCP connector.\n";
-    const context = m && (m.chat.length || m.reply)
-      ? (m.reply ? `\nThe owner wrote this as a reply to the team's message about ${m.reply}.\n` : "") +
-        `\n## The channel just before this message\nThe owner writes tersely: words like "this", "no", "that detail", "always do it this way" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
-      : "";
-    const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("note this down", "always do it this way"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
-    const id = newTask(op.title.slice(0, 80), `${asked}${op.details ? `\n## What the chat understood\n${op.details}\n` : ""}${op.repo ? `\nRepo: ${op.repo}\n` : ""}${context}${cont}\nHandle it like a capable chief of staff (see your profile: "Owner requests").`,
-      { agent: op.agent ?? "lead", project: op.project, source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
-    journal(host, `💬 ${id} from owner ${m ? "chat" : "MCP"}${prevFile ? ` (follows ${prev})` : ""}: ${op.title.slice(0, 80)}`);
-    await _commitPush(`[${host}] chat ${id}`);
+  const createOwnerTask = async (op: { title: string; details?: string; repo?: string; project?: string; agent?: string; follows?: string }) => {
+    const result = await persistOwnerAction((saved) => {
+      const m = chatNow;
+      const prev = op.follows ?? (m?.reply && !["inbox", "active", "waiting"].some((d) => existsSync(P("tasks", d, `${m.reply}.md`))) ? m.reply : undefined);
+      const prevFile = prev ? ["done", "failed", "rejected", "blocked", "inbox", "active", "waiting"].map((d) => P("tasks", d, `${prev}.md`)).find(existsSync) : undefined;
+      const asked = m ? `The owner said in chat:\n\n> ${m.text.replace(/\n/g, "\n> ")}\n` : "The owner asked for this through Noop's MCP connector.\n";
+      const context = m && (m.chat.length || m.reply)
+        ? (m.reply ? `\nThe owner wrote this as a reply to the team's message about ${m.reply}.\n` : "") +
+          `\n## The channel just before this message\nThe owner writes tersely: words like "this", "no", "that detail", "always do it this way" refer to what was just said here.\n\n${m.chat.map((l) => `- ${l}`).join("\n")}\n`
+        : "";
+      const cont = prevFile && prev ? `\nThis continues ${prev} (${prevFile.split("/").slice(-2, -1)[0]}): read tasks/${prevFile.split("/").slice(-2).join("/")} for what was done and how. If the owner is correcting that result, fix it; if they say to remember something ("note this down", "always do it this way"), write it as a durable rule/memory for the agent and kind of work it concerns, not just in this task.\n` : "";
+      const id = newTask(op.title.slice(0, 80), `${asked}${op.details ? `\n## What the chat understood\n${op.details}\n` : ""}${op.repo ? `\nRepo: ${op.repo}\n` : ""}${context}${cont}\nHandle it like a capable chief of staff (see your profile: "Owner requests").`,
+        { agent: op.agent ?? "lead", project: op.project, source: m ? "owner@chat" : "owner@mcp", priority: "high", extra: { origin: "owner", ...(op.repo ? { repo: op.repo } : {}), ...(prevFile && prev ? { follows: prev } : {}) } });
+      saved({ id });
+      journal(host, `💬 ${id} from owner ${m ? "chat" : "MCP"}${prevFile ? ` (follows ${prev})` : ""}: ${op.title.slice(0, 80)}`);
+      return { ok: true, id, ...(prevFile ? { follows: prev } : {}) };
+    }, (value) => `[${host}] chat ${value.id}`);
     // plan it now and wake the loop, so an idle machine starts it within seconds instead of after the next tick or two
     queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
-    return { ok: true, id, ...(prevFile ? { follows: prev } : {}) };
-  });
+    return result;
+  };
   const planOp = async (what: string, fn: () => Plan) => {
-    const p = await locked(async () => {
-      await _pull();
+    const p = await persistOwnerAction((saved) => {
       const done = fn();
+      saved({ id: done.id });
       journal(host, `🗺️ plan ${what}: ${done.id} ${done.status}`);
-      await _commitPush(`[${host}] plan ${what}`);
-      return done;
-    });
+      return { ok: true, id: done.id, status: done.status };
+    }, () => `[${host}] plan ${what}`);
     queueMicrotask(() => void planInbox(cfg, host).then(wakeDaemon).catch(() => {}));
     return { ok: true, id: p.id, status: p.status };
   };
@@ -745,22 +825,21 @@ async function daemon(cfg: Cfg) {
       // said on a task's page: it stays in that conversation, however the model read it
       create_task: async (op) => {
         const m = chatNow;
-        const title = m?.thread && m.reply ? await appendFollowUp(m.reply, m.text) : "";
-        return title ? { ok: true, id: m!.reply, title } : createOwnerTask(op);
+        if (m?.thread && m.reply) return appendFollowUp(m.reply, m.text);
+        return createOwnerTask(op);
       },
-      amend_task: async (op) => { const title = await appendFollowUp(op.id, op.text); return title ? { ok: true, id: op.id, title } : { ok: false, error: `${op.id} cannot be continued` }; },
+      amend_task: (op) => appendFollowUp(op.id, op.text),
       cancel_task: async (op) => { const r = await cancelTask(op.id); return { ok: r === "cancelled", id: op.id, result: r }; },
       answer_decision: async (op) => {
         const open = existsSync(P("decisions", "open", `${op.id}.md`));
         answerFromChat(op.id, op.answer, !open);
-        return { ok: true, id: op.id, ...(open ? {} : { amended: true }) };
+        return { ok: true, id: op.id, queued: true, ...(open ? {} : { amended: true }) };
       },
       send_message: async (op) => { await handleOwnerMessage(op.text, op.reply_to); return { ok: true }; },
     },
   });
   setApplyOp((op) => runTool(store, op?.tool, op));
-  const model = new ClaudeModel(String(cfg.router?.model ?? "claude-haiku-5-5"), String(cfg.router?.cli ?? "claude"), (cfg.router?.timeout_seconds ?? 45) * 1000);
-  if (isPrimary(cfg, host) && Bun.which(String(cfg.router?.cli ?? "claude"))) model.warm(SYSTEM);
+  const model = new RoutingModel((prompt) => quickAsk(prompt, loadConfig(), P("logs", "runs", `chat-${Date.now()}.log`)));
   if (isPrimary(cfg, host)) startServer(cfg, async (text, { reply, answered, sentAt, thread }) => {
     const got = Date.now();
     const m = { text, replyTo: reply, answered, chat: recentChat(text), sentAt };
@@ -779,20 +858,16 @@ async function daemon(cfg: Cfg) {
     } finally { chatNow = null; }
     logBrain(m, out, got);
   });
-  await locked(async () => { // recover tasks this host was running when it died/restarted
-    await _pull();
-    for (const p of list(P("tasks", "active"), /^T-.*\.md$/)) {
-      const { meta, body } = readDoc(p);
-      if (meta.claimed_by !== host) continue;
-      if (await stopOrphanedAgent(meta.id)) journal(host, `🧹 stopped ${meta.id}'s old agent, left running by the last daemon`);
-      // the note goes in meta (shown to the agent, not to the owner as part of the request)
-      writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, requeued: now(),
-        requeue_note: `Requeued after daemon restart on ${host}; check for partial work.` }, body);
-      require("node:fs").unlinkSync(p);
-      journal(host, `♻️ requeued ${meta.id} after restart`);
-    }
-    await _commitPush(`[${host}] recover`);
-  });
+  await recoverTaskRuns(host);
+  const stopDrainer = isPrimary(cfg, host) ? createStopDrainer(cfg, host, rawControl) : undefined;
+  if (stopDrainer) {
+    setStopDrainer(stopDrainer);
+    const progress = await stopDrainer();
+    if (!progress.synced) throw new Error(progress.error || "Task cleanup could not sync during startup");
+  }
+  // Accept remote task control only after hooks and interrupted-run recovery are installed.
+  if (isPrimary(cfg, host)) bridgeStops.push(startCloudBridge(cfg));
+  bridgeStops.push(startMachineBridge(cfg, { taskReady: () => true }));
   await locked(async () => { await _pull(); journal(host, `🟢 daemon started (${hostCaps(cfg).join(", ")})`); await _commitPush(`[${host}] up`); });
   for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => void drainAndExit("stop", host));
   // a stray rejection (a voided notify/medic) used to kill the process → systemd restart → running work requeued
@@ -806,19 +881,19 @@ async function daemon(cfg: Cfg) {
       if (restartAllowed(force)) { unlinkSync(RESTART_FLAG()); void drainAndExit("restart", host); }
     }
     if (!draining) await ownerUpdate(c, host);
-    try { await tick(c, true); failures = 0; } catch (e) {
+    try { await tick(c, true, stopDrainer); failures = 0; } catch (e) {
       console.error("tick failed", e);
       if (++failures >= 3) void medic(`noop daemon: ${failures} consecutive tick failures on ${host}.\n${(e as Error)?.stack ?? e}`, c, { auto: true, kind: "daemon" });
     }
     // self-update only when idle and not restarted within the hour; otherwise check again next tick
-    if (!draining && running === 0 && restartAllowed() && Date.now() - lastUpdate > (c.update?.check_minutes ?? 30) * 60_000) {
+    if (!draining && c.update?.enabled !== false && running === 0 && restartAllowed() && Date.now() - lastUpdate > (c.update?.check_minutes ?? 30) * 60_000) {
       lastUpdate = Date.now();
       if (await selfUpdate({ busy: running }).catch(() => false)) {
         journal(host, "⬆️ framework self-updated; restarting when workers finish");
         void drainAndExit("self-update", host); // service manager restarts us on the new code
       }
     }
-    await nap(every);
+    await nap((loadConfig().host?.tick_seconds ?? 60) * 1000);
   }
 }
 
@@ -863,12 +938,12 @@ const HELP = `Noop — your own AI team
 
   noop daemon                 run forever (tick every host.tick_seconds)
   noop tick                   one cycle: pull → routines → replies → judge → run tasks → push
-  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--project id] [--repo ~/work/x] [-p high] [--cli claude|codex]
+  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--project id] [--repo ~/work/x] [-p high] [--cli claude|codex|hermes]
   noop decide D-0001 "A"      answer a decision from the terminal
   noop status                 queue / decision / accounts / resources overview
   noop plan [...]             goals broken into approved steps: new, show, approve, pause, resume, retry, skip, continue
   noop role [add <id>]        list optional specialist roles, or add one (its routines stay off until you enable them)
-  noop learn [--full] [--dry]  learn from your local Claude/Codex sessions (digest stays local; principles go to memory)
+  noop learn [--full] [--dry]  learn from selected local histories (digest stays local; principles go to memory)
   noop metrics [days]         per-agent success, judge vs owner decisions (feeds self-evolution)
   noop agents                 list fleet members
   noop notify "text"          test Slack/Discord
@@ -877,7 +952,7 @@ const HELP = `Noop — your own AI team
 async function main() {
   const [cmd, ...rest] = Bun.argv.slice(2);
   const cfg = loadConfig();
-  setApprovalGate((src) => needsApproval(loadConfig(), src));
+  setApprovalGate((src, agent) => needsApproval(loadConfig(), src, agent));
   setIdTag(idTagFor(cfg, hostName(cfg))); // every id minted on a non-primary host carries its tag (T-M0001)
   const host = hostName(cfg);
   switch (cmd) {
@@ -957,16 +1032,21 @@ async function main() {
     }
     case "status": return status(cfg, rest.includes("--brief"));
     case "learn": {
-      if (!existsSync(P("agents", "apprentice", "profile.md"))) return void console.log("learning needs the apprentice: noop role add apprentice");
-      const d = collect(cfg, { full: rest.includes("--full") });
-      if (!d.file) return void console.log(`no new sessions (${d.sessions})`);
-      console.log(`${d.turns} owner turns from ${d.sessions} sessions → ${d.file}`);
-      if (rest.includes("--dry")) return;
-      await pull();
-      const id = newTask(`learn the owner · ${host} · ${d.sessions} sessions`, LEARN_PROMPT(d.file), { agent: "apprentice", host, source: `owner@${host}`, priority: "high" });
-      journal(host, `📚 ${id} learn from ${d.sessions} local sessions (owner-triggered)`);
-      await commitPush(`[${host}] learn ${id}`);
-      return console.log(id);
+      return locked(async () => {
+        if (!await _pull()) return void console.log("Could not load the latest learning settings. Reconnect and try again.");
+        const current = loadConfig(), blocked = learningBlockReason(current);
+        if (blocked) return void console.log(blocked);
+        try {
+          if (rest.includes("--dry")) {
+            const d = collect(current, { full: rest.includes("--full"), dry: true });
+            return void console.log(d.file ? `${d.turns} owner turns from ${d.sessions} sessions → ${d.file}` : `no new sessions (${d.sessions})`);
+          }
+          const d = queueLearning(current, { full: rest.includes("--full"), source: `owner@${host}` });
+          journal(host, `📚 ${d.id ?? "no new history"} learn from ${d.sessions} local sessions (owner-triggered)`);
+          if (!await _commitPush(`[${host}] learn ${d.id ?? "no new history"}`)) { process.exitCode = 1; console.log(`Learning request ${d.request_id} was saved locally${d.id ? ` as ${d.id}` : ""}; sync was not confirmed. Check this machine's learning status.`); }
+          else console.log(d.id ?? `no new sessions (${d.sessions})`);
+        } catch (error) { process.exitCode = 1; console.log((error as Error).message); }
+      });
     }
     case "metrics": return void console.log(JSON.stringify(computeMetrics(Number(rest[0] ?? 7)), null, 2));
     case "agents":

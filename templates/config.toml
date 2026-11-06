@@ -31,11 +31,11 @@ heavy_max_load = 0.5                  # heavy tasks (bench/full build) start onl
 stale_repo_days = 7                   # target/ of repos untouched this long may be removed
 
 [clis]
-# Claude Opus = challenging work (development, debugging, architecture, UI, judge, learning, evolution).
-# Codex (ChatGPT) = routine work; these agents use Codex first and fall back to Claude. Tasks marked
-# difficulty = "hard" or weight = "heavy" always go to Claude.
-routine_agents = ["dispatcher", "ops-watcher", "reporter", "oss-triage", "reviewer", "chief-of-staff"]
-# per-agent override, e.g.  [clis.agents]  reviewer = ["codex", "claude"]
+# Explicit task tool orders are tried among usable tools on the machine running the task.
+# Without an ordered policy, the planner may recommend the first enabled tool.
+# preference = ["codex", "claude"]   # team task default; [] leaves inherited automatic tasks waiting
+# per-member override, e.g. [clis.agents] reviewer = ["codex", "claude"]; [] pauses that member
+# Settings → Members can choose team/member orders, inherit the team, or restore these file settings.
 timeout_minutes = 90
 [clis.claude]
 permission_mode = "bypassPermissions" # hard gates still apply via --disallowedTools (src/gates.ts)

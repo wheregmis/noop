@@ -1,0 +1,27 @@
+# Saved requests
+
+Open **Settings → Saved requests**, or the recovery banner, to inspect unconfirmed task creation/reopening, archive restoration, cleanup-review decisions and machine learning runs after an app restart. Each copy retains the original identity and payload. Recovery is passive: loading the app or opening the list does not submit, retry or create work. Unknown or damaged cached entries cannot become fresh requests.
+
+Requests belong to the hub and signed-in session that saved them. Switching hubs or signing in with a different session must not show or send another session's requests. The local cache is a recovery aid; the primary's durable receipts remain authoritative about what was applied.
+
+Native builds store one document per scope in the app's private `pending-intents` directory. Web builds use a scope-specific IndexedDB record. The scope hashes the normalized hub URL and session token; the token itself is not copied into the document. Original request payloads, including task instructions and review reasons, remain local app data. Confirmation-only flags and expiring remote-folder proof tickets are omitted from saved requests.
+
+Saving must finish before submission. Native writes use a same-directory temporary file and replacement; web writes wait for the IndexedDB transaction to complete. A failed or ambiguous write blocks later changes until storage is reloaded, so a queued write cannot overwrite a request that may already have been committed. The native SDK exposes no file or directory `fsync`, so this guarantees acknowledged app I/O rather than survival of every power-loss scenario.
+
+Each write compares the exact document previously loaded. A stale browser tab or store in the same native runtime cannot overwrite newer saved requests: it must reload them before submitting or dismissing another action. Web comparison and replacement occur in one IndexedDB transaction; native stores in the same runtime share a per-scope write queue. The native adapter does not provide a file lock for independent processes sharing the same application directory.
+
+The cache accepts at most 100 requests and one million UTF-8 bytes. Malformed, duplicated, unknown-version or oversized cache contents fail closed without silently discarding older entries. Inspect current records before explicitly resetting an unreadable cache. Resetting it only removes local recovery information.
+
+Inspect the current task, archived record or cleanup owner before retrying an uncertain request. A timeout or a lost reply does not prove that an action failed. Keep the original request identity when checking it; creating a new request can authorize additional work.
+
+**Reload saved requests** reads current local copies after a storage conflict. It preserves open unsent drafts; newly discovered actions remain available in the Saved requests list. Initial startup restores the existing pending action into its task, archive or review controls. **Check earlier result** checks a task or restore receipt, while **Retry same request** explicitly authorizes retrying its original payload.
+
+Task creation, reopening and archive restoration support confirmation-only calls. These check the original receipt without creating, reopening or restoring a record when no receipt exists. A confirmed result describes the historical action: it does not reapply it if the record has since changed or been removed. A prepared-only receipt remains uncertain until the primary can verify completion.
+
+Cleanup review decisions have different semantics. Retrying the same saved decision may record its original include or exclude authorization if it was never saved and its preview is still valid. It must be an explicit owner action, with that possibility stated in the UI. Inspecting the owner and its review history is the passive option. An old preview or changed cleanup operation requires a fresh review; an audit file alone cannot authorize a blind replay.
+
+Machine learning runs retain the selected host, request identity, opaque preview identity and count-only preview. Checking a run never recollects history or creates a missing task. Its machine can confirm an applied or explicitly released receipt even after settings change. An unfinished collection discovered through machine status can be reviewed and saved again without exposing its private snapshot. See [Learning on a selected machine](ui-machine-learning.md) for the warned release action and its effect on later previews.
+
+Removing a saved request clears the local reminder. It does not cancel a task, undo a recorded decision, abandon a server receipt or prove that an uncertain action was never applied. Check the current record before choosing a new action.
+
+`app/saved-requests.test.tsx` exercises the native headless UI with explicit compare-and-swap host storage acknowledgements. Its desktop and phone restart cases dispose one app and open another against the same fixture document. The cases cover passive loading, exact confirmation-only requests, an offline project, manual cleanup-decision retries, storage barriers and ambiguous writes, failed cache clearing, session isolation, corrupt-cache reset, mismatched task identities, fresh creation after confirming or forgetting, and late inspection navigation. The host storage is simulated in these UI cases; `app/intent-storage.test.tsx` and its fixture exercise the separate portable adapter boundary.

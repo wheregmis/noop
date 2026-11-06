@@ -1,8 +1,11 @@
 // Routines live as [[routine]] blocks in config.toml, beside settings and comments that must survive. So one block is edited
 // at a time, fields the form doesn't show are kept, and a change is only written if everything else still parses the same.
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { P, loadConfig, now } from "./core";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { P, loadConfig } from "./core";
 import { RequestError } from "./members";
+import { PROVIDER_IDS } from "../cloud/src/providers";
+import { normalizeCaps } from "../cloud/src/tools";
+import { archiveDestination } from "./archive-path";
 
 const parse = (text: string) => Bun.TOML.parse(text) as Record<string, any> & { routine?: Record<string, any>[] };
 const config = () => readFileSync(P("config.toml"), "utf8");
@@ -61,14 +64,35 @@ function fields(input: unknown, was?: Record<string, any>) {
   if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) throw new RequestError(400, "A name uses lowercase letters, numbers and dashes, like weekly-deps");
   if (!SCHEDULE.test(every)) throw new RequestError(400, "Use a schedule like 30m, hourly, daily 09:00, weekdays 09:00 or weekly MON 09:00");
   if (desc.includes("\n") || desc.length > 200) throw new RequestError(400, "The description is one line, up to 200 characters");
-  if (project && !existsSync(P("projects", `${project}.md`))) throw new RequestError(400, `No project ${project}`);
+  if (project && (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(project) || !existsSync(P("projects", `${project}.md`)))) throw new RequestError(400, `No project ${project}`);
   if (!learn) {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(agent) || !existsSync(P("agents", agent, "profile.md"))) throw new RequestError(400, "Choose the member who runs it");
     if (!prompt) throw new RequestError(400, "Say what the routine should do");
     if (prompt.length > 20_000) throw new RequestError(400, "Instructions can be up to 20,000 characters");
   }
+  const placement: Record<string, string> = {};
+  for (const key of ["requires", "host", "cli", "priority", "prefer", "weight", "repo", "scheduler"]) {
+    if (o[key] === undefined || learn && key !== "scheduler") continue;
+    if (typeof o[key] !== "string" || /[\r\n\0]/.test(o[key] as string) || (o[key] as string).length > 1000) throw new RequestError(400, `Invalid ${key}`);
+    placement[key] = (o[key] as string).trim();
+  }
+  for (const key of ["requires", "prefer"]) {
+    if (placement[key] === undefined) continue;
+    const value = normalizeCaps(placement[key]);
+    if (value === null) throw new RequestError(400, `Invalid ${key === "requires" ? "required" : "preferred"} capabilities`);
+    placement[key] = value;
+  }
+  if (placement.weight && !["normal", "heavy"].includes(placement.weight)) throw new RequestError(400, "Choose normal or heavy resource use");
+  if (placement.scheduler && !/^[a-zA-Z0-9][\w.-]{0,79}$/.test(placement.scheduler)) throw new RequestError(400, "Choose the main machine, every machine or a machine name for scheduling");
+  if (!learn && o.signal !== undefined) {
+    if (typeof o.signal !== "string" || o.signal.length > 4000 || o.signal.includes("\0")) throw new RequestError(400, "The change detector must be a command, up to 4,000 characters");
+    placement.signal = o.signal.trim();
+  }
+  if (placement.host && !/^[\w.-]+$/.test(placement.host)) throw new RequestError(400, "Invalid machine name");
+  if (placement.cli && !["auto", ...PROVIDER_IDS].includes(placement.cli)) throw new RequestError(400, "Choose auto or a supported AI tool");
+  if (placement.priority && !["urgent", "high", "normal", "low"].includes(placement.priority)) throw new RequestError(400, "Invalid priority");
   return {
-    ...was, name, every, enabled: o.enabled !== false, readonly: o.readonly === true || undefined, desc: desc || undefined, project: project || undefined,
+    ...was, ...placement, name, every, enabled: o.enabled !== false, readonly: o.readonly === true || undefined, desc: desc || undefined, project: project || undefined,
     ...(learn ? {} : { agent, prompt }),
   } as Record<string, any>;
 }
@@ -80,7 +104,7 @@ export function readRoutine(id: string) {
   const r = find(id);
   if (!r) throw new RequestError(404, "No such routine");
   const effective = (loadConfig().routine ?? []).find((x: any) => x.name === id) ?? r; // what the app's on/off and interval say
-  return { name: r.name, every: effective.every, enabled: effective.enabled !== false, agent: r.agent ?? "", project: r.project ?? "", readonly: r.readonly === true, desc: r.desc ?? "", prompt: r.prompt ?? "", kind: r.kind ?? "" };
+  return { prefer: r.prefer ?? "", weight: r.weight ?? "normal", repo: r.repo ?? "", scheduler: r.scheduler ?? (r.kind === "learn" ? "each" : "primary"), signal: r.signal ?? "", requires: r.requires ?? "", host: r.host ?? "any", cli: r.cli ?? "auto", priority: r.priority ?? "normal", name: r.name, every: effective.every, enabled: effective.enabled !== false, agent: r.agent ?? "", project: r.project ?? "", readonly: r.readonly === true, desc: r.desc ?? "", prompt: r.prompt ?? "", kind: r.kind ?? "" };
 }
 
 /** The form now says what's true: drop what Settings had saved over the file for this routine. */
@@ -122,8 +146,38 @@ export function deleteRoutine(id: string) {
   if (!list.some((x) => x.name === id)) throw new RequestError(404, "No such routine");
   if (!block) throw new RequestError(409, "config.toml is laid out in a way the app can't edit safely; change this routine in the file");
   const after = text.slice(block.end).replace(/^\n+/, "");
+  writeFileSync(archiveDestination("routines", id, ".toml"), text.slice(block.start, block.end), { flag: "wx" });
   commit(after ? `${text.slice(0, block.start)}${after}` : `${text.slice(0, block.start).trimEnd()}\n`, list.filter((x) => x.name !== id));
-  mkdirSync(P("archive", "routines"), { recursive: true });
-  writeFileSync(P("archive", "routines", `${id}-${now().replace(/\W/g, "")}.toml`), text.slice(block.start, block.end));
   dropOverride(id);
+}
+
+/** Only one routine block can be restored; the archive cannot carry unrelated configuration. */
+export function validateArchivedRoutine(text: string, id: string): Record<string, any> {
+  let value: ReturnType<typeof parse>; try { value = parse(text); } catch { throw new RequestError(400, "The archived routine is not valid TOML"); }
+  if (Object.keys(value).some((key) => key !== "routine") || !Array.isArray(value.routine) || value.routine.length !== 1 || value.routine[0]?.name !== id
+    || !/^[a-zA-Z0-9][\w-]{0,79}$/.test(id) || value.routine[0].kind !== undefined && value.routine[0].kind !== "learn") throw new RequestError(400, "The archive must contain exactly the original routine block");
+  const original = value.routine[0];
+  const representable = (v: unknown): boolean => typeof v === "string" || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v) || Array.isArray(v) && v.length <= 100 && v.every(representable);
+  if (Object.entries(original).some(([key, value]) => !/^[A-Za-z_][\w-]*$/.test(key) || !representable(value))) throw new RequestError(400, "The archived routine contains unsupported nested settings");
+  const checked = clean(fields({ ...original, name: "restore-check", enabled: false }, original));
+  if (original.kind === "learn" && !existsSync(P("agents/apprentice/profile.md"))) throw new RequestError(409, "Restore the apprentice member before restoring a learning routine");
+  return { ...checked, name: id, enabled: false };
+}
+export function restoredRoutineMatches(text: string, id: string): boolean {
+  const expected = validateArchivedRoutine(text, id);
+  return restoredRoutineRecordMatches(expected, id);
+}
+export function restoredRoutineRecordMatches(expected: Record<string, any>, id: string): boolean {
+  const current = find(id);
+  return !!current && same(current) === same(expected) && (loadConfig().routine ?? []).find((routine: any) => routine.name === id)?.enabled === false;
+}
+export function restoreRoutine(text: string, id: string) {
+  const routine = validateArchivedRoutine(text, id), current = config(), routines = parse(current).routine ?? [];
+  if (routines.some((item) => item.name === id)) throw new RequestError(409, `There's already a routine called ${id}`);
+  const path = P("settings.json"), settings = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+  settings.routines ??= {}; settings.routines[id] = { enabled: false };
+  const preferences = JSON.stringify(settings, null, 2) + "\n", next = `${current.trimEnd()}\n\n${renderRoutine(routine)}`;
+  if (Buffer.byteLength(preferences) > 1_500_000 || Buffer.byteLength(next) > 1_500_000) throw new RequestError(409, "The restored configuration is too large to sync safely");
+  writeFileSync(`${path}.tmp`, preferences); renameSync(`${path}.tmp`, path);
+  commit(next, [...routines, routine]);
 }

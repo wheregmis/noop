@@ -1,15 +1,19 @@
-// Learn the owner: extract the owner's own words from local Claude Code / Codex session history
+// Learn the owner: extract the owner's own words from selected local AI conversation history
 // (instructions, corrections, vetoes, trade-offs, taste) into a redacted digest that an agent distills
 // into memory/taste.md + principles. Raw transcripts never leave this machine; only the distilled
 // principles are synced to the shared data.
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { providerAvailable } from "./providers";
+import { Database } from "bun:sqlite";
+import { DEFAULT_PROVIDERS } from "../cloud/src/providers";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
-import { type Cfg, P, list, readDoc, HOME_DIR } from "./core";
+import { basename, dirname, join, resolve } from "node:path";
+import { type Cfg, P, list, readDoc, HOME_DIR, allowedClis, accountCanRun } from "./core";
 import { feed } from "./server";
 
 /** Owner's interactions inside noop since `since`: chat instructions + decisions (incl. overrides of the judge). */
-function hubInteractions(since: string): string {
+function hubInteractions(since: string): { text: string; count: number } {
   const out: string[] = [];
   for (const e of feed(since, 2000)) if (e.kind === "owner") out.push(`- [${e.ts.slice(0, 16)} hub-chat${e.ref ? " ↳" + e.ref : ""}] ${redact(e.text)}`);
   for (const p of list(P("decisions", "closed"))) {
@@ -23,13 +27,69 @@ function hubInteractions(since: string): string {
     const m = readDoc(p).meta;
     if ((m.created ?? "") >= since) out.push(`- [hub-rejected] owner declined proposed task: ${redact(m.title ?? "")} (${m.agent})`);
   }
-  return out.join("\n");
+  return { text: out.join("\n"), count: out.length };
 }
 
-const STATE = join(HOME_DIR, "learn", "state.json");
-const OUT = join(HOME_DIR, "learn");
+export const LEARNING_DIR = join(HOME_DIR, "learn");
+const STATE = join(LEARNING_DIR, "state.json"), OUT = LEARNING_DIR;
+export class LearningBusyError extends Error { constructor() { super("Another learning operation is running on this machine. Try again after it finishes."); } }
+export function learningDirectory() {
+  mkdirSync(OUT, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(OUT);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe learning storage");
+  chmodSync(OUT, 0o700);
+}
+export function learningCheckpoint(): string | null {
+  let stat; try { stat = lstatSync(STATE); } catch (error: any) { if (error.code === "ENOENT") return null; throw error; }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8_000_000) throw new Error("Unsafe learning checkpoint");
+  return readFileSync(STATE, "utf8");
+}
+export function commitLearningCheckpoint(before: string | null, after: string) {
+  if (learningCheckpoint() !== before) throw new Error("The learning checkpoint changed");
+  learningDirectory();
+  const temporary = `${STATE}.${randomUUID()}.tmp`;
+  try { writeFileSync(temporary, after, { mode: 0o600, flag: "wx" }); renameSync(temporary, STATE); }
+  finally { rmSync(temporary, { force: true }); }
+}
+/** SQLite owns the cross-process lock; a crash releases it without unsafe stale-PID cleanup. */
+export function collectionLocked<T>(work: () => T): T {
+  learningDirectory();
+  const path = join(OUT, "collection.sqlite");
+  for (const file of [path, `${path}-journal`, `${path}-wal`, `${path}-shm`]) {
+    try { const stat = lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Unsafe learning lock"); }
+    catch (error: any) { if (error.code !== "ENOENT") throw error; }
+  }
+  const db = new Database(path, { create: true });
+  try { chmodSync(path, 0o600); db.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE"); }
+  catch { db.close(); throw new LearningBusyError(); }
+  try { return work(); } finally { try { db.exec("ROLLBACK"); } finally { db.close(); } }
+}
+function sourcePath(value: string): string {
+  let path = resolve(value.replace(/^~/, homedir())); const suffix: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(path), ...suffix); }
+    catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+      let present = false; try { lstatSync(path); present = true; } catch (entry: any) { if (entry.code !== "ENOENT") throw entry; }
+      if (present || dirname(path) === path) throw error;
+      suffix.unshift(basename(path)); path = dirname(path);
+    }
+  }
+}
+export function learningRoots(cfg: Cfg): { claude?: string; codex?: string; hermes?: string } {
+  const selected: string[] = cfg.learn?.sources ?? [...DEFAULT_PROVIDERS, "noop"], roots = cfg.learn ?? {};
+  const hermesHome = process.env.HERMES_HOME ?? (process.platform === "win32" && process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "hermes") : join(homedir(), ".hermes"));
+  return { ...(selected.includes("claude") ? { claude: sourcePath(roots.claude_dir ?? join(homedir(), ".claude", "projects")) } : {}),
+    ...(selected.includes("codex") ? { codex: sourcePath(roots.codex_dir ?? join(homedir(), ".codex", "sessions")) } : {}),
+    ...(selected.includes("hermes") ? { hermes: sourcePath(roots.hermes_db ?? join(hermesHome, "state.db")) } : {}) };
+}
+export type PreparedCollection = { before: string | null; after: string; content: string | null; turns: number; sessions: number; truncated: boolean };
 
-type Turn = { ts: string; project: string; tool: "claude" | "codex"; text: string; prev?: string };
+export class LearningSourceError extends Error {
+  constructor() { super("Could not read selected Hermes history. Check history permissions on this machine, or deselect Hermes in Settings → AI tools & onboarding."); this.name = "LearningSourceError"; }
+}
+
+type Turn = { ts: string; project: string; tool: "claude" | "codex" | "hermes"; text: string; prev?: string };
 
 // ---------------------------------------------------------------- redaction
 const SECRET = [
@@ -106,6 +166,49 @@ function readCodex(file: string): Turn[] {
   return out;
 }
 
+/** Read only owner-facing Hermes sessions; the source DB is never migrated or written. */
+function readHermes(file: string, state: Record<string, any>): { turns: Turn[]; sessions: number } {
+  if (!existsSync(file)) return { turns: [], sessions: 0 };
+  const db = new Database(file, { readonly: true, create: false });
+  try {
+    db.exec("BEGIN DEFERRED");
+    const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((row) => row.name));
+    const sessionColumns = new Set((db.query("PRAGMA table_info(sessions)").all() as { name: string }[]).map((row) => row.name));
+    const active = messageColumns.has("active") ? " AND active = 1" : "";
+    const observed = messageColumns.has("observed") ? " AND COALESCE(observed, 0) = 0" : "";
+    // shortcut: summarize the latest 200 sessions and 1,000 messages per session; add paged backfill for larger archives.
+    const rows = db.query(`SELECT s.id, ${sessionColumns.has("cwd") ? "s.cwd" : "NULL"} AS cwd, MAX(m.id) AS last_id
+      FROM sessions s JOIN messages m ON m.session_id = s.id WHERE s.source IN ('cli', 'desktop')
+      GROUP BY s.id HAVING MAX(CASE WHEN m.timestamp > 100000000000 THEN m.timestamp / 1000 ELSE m.timestamp END) < ? ORDER BY last_id DESC LIMIT 200`).all((Date.now() - 600_000) / 1000) as { id: string; cwd?: string; last_id: number }[];
+    const turns: Turn[] = [], seen: Record<string, boolean> = state.__hermes_seen ?? {};
+    let sessions = 0;
+    for (const session of rows) {
+      const key = `hermes:${file}:${session.id}`, previous = Number(state[key] ?? 0);
+      if (previous >= session.last_id) continue;
+      const first = db.query("SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id LIMIT 1").get(session.id) as { content?: string } | null;
+      if (FLEET_PROMPT.test(first?.content ?? "")) { state[key] = session.last_id; continue; }
+      const messages = db.query(`SELECT id, role, content, timestamp FROM messages WHERE session_id = ?${active}${observed} ORDER BY id DESC LIMIT 1000`).all(session.id) as { id: number; role: string; content?: string; timestamp: number }[];
+      let lastAssistant = "", count = 0;
+      for (const message of messages.reverse()) {
+        if (message.role === "assistant") { lastAssistant = message.content ?? ""; continue; }
+        if (message.role !== "user" || message.id <= previous) continue;
+        const text = ownerText(message.content ?? "");
+        if (!text) continue;
+        const fingerprint = new Bun.CryptoHasher("sha256").update(`${message.timestamp}\0${text}`).digest("hex");
+        if (seen[fingerprint]) continue;
+        seen[fingerprint] = true;
+        const stamp = Number(message.timestamp);
+        turns.push({ tool: "hermes", ts: new Date(stamp > 100000000000 ? stamp : stamp * 1000).toISOString(), project: session.cwd ? basename(session.cwd) : "hermes", text, prev: lastAssistant.slice(-400) });
+        count++;
+      }
+      if (count) sessions++;
+      state[key] = session.last_id;
+    }
+    state.__hermes_seen = Object.fromEntries(Object.entries(seen).slice(-20_000));
+    return { turns, sessions };
+  } finally { try { db.exec("ROLLBACK"); } finally { db.close(); } }
+}
+
 function walk(dir: string, re: RegExp, acc: string[] = []): string[] {
   if (!existsSync(dir)) return acc;
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -115,14 +218,28 @@ function walk(dir: string, re: RegExp, acc: string[] = []): string[] {
   return acc;
 }
 
+/** Do not consume local history until a learning task can use it on this machine. */
+export function learningBlockReason(cfg: Cfg, available: (cli: string) => boolean = (cli) => providerAvailable(cli) && accountCanRun(cli, cfg)): string | null {
+  if (cfg.learn?.enabled === false) return "Learning is turned off in Settings → AI tools & onboarding.";
+  if (Array.isArray(cfg.learn?.sources) && !cfg.learn.sources.length) return "Select a history source in Settings → AI tools & onboarding.";
+  if (cfg.host?.enabled === false) return "This machine is paused. Resume it in Machines before learning from its history.";
+  if (!existsSync(P("agents", "apprentice", "profile.md"))) return "Learning needs an apprentice member. Add one in Settings → Members.";
+  const tools = allowedClis({ agent: "apprentice" }, cfg);
+  if (!tools.length) return "Learning is paused. Enable an AI tool and select one for the apprentice member in Settings.";
+  if (!tools.some(available)) return "No selected apprentice AI tool/account is available on this machine. Check its AI account settings in Machines and Settings → AI tools & onboarding.";
+  return null;
+}
+
 /** Incrementally collect owner turns since the last run; writes a redacted digest file and returns its path. */
-export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = {}): { file: string | null; turns: number; sessions: number } {
-  mkdirSync(OUT, { recursive: true });
-  const state: Record<string, any> = !opts.full && existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
-  const roots = cfg.learn ?? {};
-  const claudeDir = (roots.claude_dir ?? join(homedir(), ".claude", "projects")).replace(/^~/, homedir());
-  const codexDir = (roots.codex_dir ?? join(homedir(), ".codex", "sessions")).replace(/^~/, homedir());
-  const files = [...walk(claudeDir, /\.jsonl$/).map((f) => ["claude", f] as const), ...walk(codexDir, /\.jsonl$/).map((f) => ["codex", f] as const)];
+export function prepareCollection(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = {}): PreparedCollection {
+  const before = learningCheckpoint();
+  const empty = { before, after: before ?? "{}", content: null, turns: 0, sessions: 0, truncated: false };
+  if (cfg.learn?.enabled === false) return empty;
+  const selected: string[] = cfg.learn?.sources ?? [...DEFAULT_PROVIDERS, "noop"];
+  if (!selected.length) return empty;
+  const state: Record<string, any> = !opts.full && before ? JSON.parse(before) : {};
+  const roots = learningRoots(cfg), claudeDir = roots.claude!, codexDir = roots.codex!;
+  const files = [...(selected.includes("claude") ? walk(claudeDir, /\.jsonl$/).map((f) => ["claude", f] as const) : []), ...(selected.includes("codex") ? walk(codexDir, /\.jsonl$/).map((f) => ["codex", f] as const) : [])];
   const turns: Turn[] = [];
   let sessions = 0;
   for (const [tool, f] of files) {
@@ -134,13 +251,23 @@ export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = 
     state[f] = m;
     if (t.length) { sessions++; turns.push(...t); }
   }
+  if (selected.includes("hermes")) {
+    const file = roots.hermes!;
+    try {
+      const pending = { ...state, __hermes_seen: { ...state.__hermes_seen } };
+      const history = readHermes(file, pending); Object.assign(state, pending);
+      turns.push(...history.turns); sessions += history.sessions;
+    }
+    catch (error) { console.warn(`Hermes learning source could not be read: ${error}`); throw new LearningSourceError(); }
+  }
   const hubSince = opts.full ? "" : (state.__hub_since as unknown as string) ?? "";
-  const hub = existsSync(P("decisions")) ? hubInteractions(hubSince) : "";
-  (state as any).__hub_since = new Date().toISOString();
-  writeFileSync(STATE, JSON.stringify(state));
-  if (!turns.length && !hub) return { file: null, turns: 0, sessions };
+  const hub = selected.includes("noop") ? hubInteractions(hubSince) : { text: "", count: 0 };
+  if (selected.includes("noop")) (state as any).__hub_since = new Date().toISOString();
+  const after = JSON.stringify(state);
+  if (!turns.length && !hub.text) return { ...empty, after, sessions };
   turns.sort((a, b) => a.ts.localeCompare(b.ts));
-  const max = opts.maxChars ?? cfg.learn?.max_digest_chars ?? 400_000;
+  const requestedMax = opts.maxChars ?? cfg.learn?.max_digest_chars ?? 400_000;
+  const max = Number.isFinite(requestedMax) ? Math.max(0, Math.floor(requestedMax)) : 400_000;
   const byProject = new Map<string, Turn[]>();
   for (const t of turns) byProject.set(t.project, [...(byProject.get(t.project) ?? []), t]);
   let body = "";
@@ -151,15 +278,34 @@ export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number } = 
       body += `\n- [${t.ts.slice(0, 16)} ${t.tool}] ${redact(t.text).replace(/\n/g, "\n  ")}\n${ctx}`;
     }
   }
-  if (body.length > max) body = body.slice(-max); // keep the most recent
-  const file = join(OUT, `digest-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`);
-  const hubPart = hub ? `\n\n## Noop (decisions & chat — how the owner judges the fleet's questions)\n${hub}\n` : "";
-  writeFileSync(file, `# Owner's own words from ${sessions} sessions (${turns.length} turns, redacted)\n${hubPart}${body}\n`, { mode: 0o600 });
-  return { file, turns: turns.length, sessions };
+  const hubPart = hub.text ? `\n\n## Noop (decisions & chat — how the owner judges the fleet's questions)\n${hub.text}\n` : "";
+  const heading = `# Owner's own words from ${sessions} sessions (${turns.length + hub.count} turns, redacted)\n`;
+  const content = redact(`${hubPart}${body}\n`), room = Math.max(0, max - heading.length);
+  const omitted = "\n[Earlier digest content omitted to fit the configured limit.]\n";
+  // shortcut: retain the combined digest's tail and advance all watermarks; page digests if every turn must be learned.
+  const excerpt = content.length <= room ? content : room > omitted.length ? omitted + content.slice(-(room - omitted.length)) : omitted.slice(0, room);
+  return { before, after, content: heading.slice(0, max) + excerpt, turns: turns.length + hub.count, sessions, truncated: content.length > room };
 }
 
-export const LEARN_PROMPT = (digest: string) => `Learn the owner. Read the redacted digest of the owner's own messages to AI coding agents at:
-${digest}
+/** Compatibility collector; daemon, CLI and UI queue through the durable learning operation. */
+export function collect(cfg: Cfg, opts: { full?: boolean; maxChars?: number; dry?: boolean; beforeCommit?: (digest: { file: string; turns: number; sessions: number }) => void } = {}): { file: string | null; turns: number; sessions: number } {
+  if (cfg.learn?.enabled === false || Array.isArray(cfg.learn?.sources) && !cfg.learn.sources.length) return { file: null, turns: 0, sessions: 0 };
+  return collectionLocked(() => {
+    const prepared = prepareCollection(cfg, opts);
+    const file = prepared.content === null ? null : join(OUT, `digest-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.md`);
+    if (file) writeFileSync(file, prepared.content!, { mode: 0o600, flag: "wx" });
+    const result = { file, turns: prepared.turns, sessions: prepared.sessions };
+    if (!opts.dry) {
+      if (file) opts.beforeCommit?.({ ...result, file });
+      commitLearningCheckpoint(prepared.before, prepared.after);
+    }
+    return result;
+  });
+}
+
+export const LEARN_PROMPT = (digest: string) => `Learn the owner. Read the redacted digest named:
+${basename(digest)}
+Resolve it under the machine-local Noop home's learn folder: $NOOP_HOME/learn when NOOP_HOME is set, otherwise ~/.noop/learn (or the existing legacy ~/.agent-hub/learn).
 (local to this machine; never copy raw text or the file into the hub repo, never quote anything that looks like a secret or a private person's data).
 
 Distill durable, actionable knowledge — how the owner works, judges and decides — and update the hub's memory:

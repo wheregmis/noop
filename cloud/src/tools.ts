@@ -1,3 +1,7 @@
+import { PROVIDER_IDS } from "./providers";
+import { ActionSyncError } from "./action-errors";
+import { learningTaskBinding, learningTaskHostError } from "./learning";
+import { pendingStopsView, pendingStopsError, readPendingStops, readStopIntent, readStopReviewAudit, type StopReviewAudit } from "./stop-intents";
 // noop's tools, defined and implemented ONCE. Used by:
 //   - the cloud MCP server (cloud/src/mcp.ts) over the Worker's mirror of the data repo (files table), and
 //   - the chat brain on the primary daemon (src/brain.ts) over the local data repo (~/.agent-hub/data).
@@ -17,6 +21,7 @@ export type WriteOp =
   | { tool: "cancel_task"; id: string }
   | { tool: "set_priority"; id: string; priority: Priority }
   | { tool: "reassign_task"; id: string; agent: string }
+  | { tool: "configure_task"; id: string; requires: string; host: string; cli: string; agent: string; priority: Priority; title?: string; prefer?: string; weight?: string; project?: string }
   | { tool: "remember"; text: string; file: string }
   | { tool: "edit_memory"; file: string; match: string; text: string }
   | { tool: "answer_decision"; id: string; answer: string }
@@ -99,9 +104,12 @@ export function parseTaskBody(title: string | undefined, body: string) {
 /** A task as the app shows it. Cancelled tasks live in rejected/, next to routine copies nobody approved. */
 const HISTORY_STATES = [...TASK_STATES, "rejected"] as const;
 const historyRow = (f: FileRow, folder: string) => {
-  const { meta: m } = parseDoc(f.text);
-  const state = folder === "waiting" && m.wake_at ? "parked" : folder === "inbox" && m.parked && m.requires ? "nohost" : folder === "rejected" ? "cancelled" : folder;
-  return { id: m.id || f.path.split("/").pop()!.replace(/\.md$/, ""), title: m.title ?? "", agent: m.agent, host: m.claimed_by, state, needs: state === "nohost" ? m.requires : undefined,
+  const { meta: m, body } = parseDoc(f.text);
+  const binding = learningTaskBinding(m, body), placementError = learningTaskHostError(m, body, m.host || "any");
+  const needs = [m.requires, m.host && m.host !== "any" ? `host:${m.host}` : ""].filter(Boolean).join(",");
+  const state = folder === "waiting" && m.wake_at ? "parked" : folder === "inbox" && m.parked ? "nohost" : folder === "rejected" ? "cancelled" : folder;
+  return { id: m.id || f.path.split("/").pop()!.replace(/\.md$/, ""), title: m.title ?? "", agent: m.agent, host: m.claimed_by ?? m.run_host, run_id: m.run_id, stops: pendingStopsView(m.pending_stops), stop_reviews: readPendingStops(m.pending_stops)?.reviews, stops_error: pendingStopsError(m.pending_stops), stop_owner: readStopIntent(m)?.owner, state, needs: state === "nohost" ? placementError || m.parked_need || needs || "accepting-tasks" : undefined,
+    prefer: m.prefer ?? "", weight: m.weight ?? "normal", project: m.project ?? "", repo: m.repo ?? "", requires: m.requires ?? "", target_host: m.host ?? "any", configured_cli: m.cli ?? "auto", priority: m.priority ?? "normal", ...binding,
     started: m.started, created: m.created, finished: m.finished ?? m.cancelled, updated: m.finished ?? m.cancelled ?? m.started ?? m.created ?? f.updated, attempt: m.attempt, cli: m.cli_used, model: m.model };
 };
 
@@ -126,7 +134,14 @@ export function taskInfo(st: ToolStore, id: string) {
     if (!f) continue;
     // the cards it asked: they belong to its conversation
     const decisions = ["open", "closed"].flatMap((w) => st.list(`decisions/${w}/`)).map((d) => parseDoc(d.text).meta).filter((m) => m.task === id && m.id).map((m) => String(m.id));
-    return { ...historyRow(f, s), ...parseTaskBody(parseDoc(f.text).meta.title, parseDoc(f.text).body), decisions };
+    const row = historyRow(f, s), reviews = new Map<string, StopReviewAudit>();
+    for (const file of st.list(`fleet/stop-reviews/task-${id}/`)) {
+      let entry: unknown; try { entry = JSON.parse(file.text); } catch { continue; }
+      const audit = readStopReviewAudit(entry);
+      if (audit?.owner.kind === "task" && audit.owner.id === id) reviews.set(audit.request_id, audit);
+    }
+    for (const audit of row.stop_reviews ?? []) if (!reviews.has(audit.request_id)) reviews.set(audit.request_id, audit);
+    return { ...row, stop_reviews: [...reviews.values()].sort((a, b) => b.at.localeCompare(a.at) || b.review_id.localeCompare(a.review_id)).slice(0, 500), ...parseTaskBody(parseDoc(f.text).meta.title, parseDoc(f.text).body), decisions };
   }
   return null;
 }
@@ -315,6 +330,11 @@ export const TOOLS: Tool[] = [
   { name: "reassign_task", title: "Reassign a task", annotations: RW_IDEM, write: true,
     inputSchema: obj({ id: str("A queued, waiting or blocked task"), agent: str("Agent name from list_agents") }, ["id", "agent"]),
     description: "Give a task that has not started yet (or is parked) to a different agent." },
+  { name: "configure_task", title: "Configure a queued task", annotations: RW_IDEM, write: true,
+    inputSchema: obj({ id: str("Queued task id"), requires: str("Comma-separated hard capabilities; empty for any OS"), host: str("Machine name or any"),
+      cli: str("CLI", { enum: ["auto", ...PROVIDER_IDS] }), agent: str("Agent from list_agents"), priority: str("Priority", { enum: [...PRIORITIES] }), title: str("Short task title"), prefer: str("Preferred capabilities; empty for no preference"),
+      weight: str("Resource needs", { enum: ["normal", "heavy"] }), project: str("Project id; empty detaches and clears the working folder. Omit to keep the current location") }, ["id", "requires", "host", "cli", "agent", "priority"]),
+    description: "Change a queued task's placement and member when the owner asks. Removing an OS requirement allows other operating systems; preserve toolchain requirements and only relax constraints the owner explicitly requests." },
   { name: "remember", title: "Remember", annotations: RW, write: true,
     inputSchema: obj({ text: str("The rule or fact, one or two sentences, phrased so it is useful later (who/what it applies to, and why)"),
       file: str("memory/owner.md (who the owner is), memory/principles.md (how to work), memory/taste.md (UI/code taste), memory/projects.md, or agents/<name>/memory.md for one agent's know-how") }, ["text", "file"]),
@@ -333,8 +353,16 @@ export const toolsFor = (where: "mcp" | "brain") => TOOLS.filter((t) => !t.only 
 export const isWrite = (name: string) => !!TOOLS.find((t) => t.name === name)?.write;
 
 // ---------------------------------------------------------------- run
-export type ToolResult = { ok: true; data: any } | { ok: false; error: string };
+export type ToolResult = { ok: true; data: any } | { ok: false; error: string; data?: Record<string, unknown> };
 const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+/** A comma-separated list of capabilities; a pipe permits alternatives within a requirement. */
+export function normalizeCaps(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 1000 || /[\r\n]/.test(value)) return null;
+  const parts = value.split(",").map((r) => r.trim()).filter(Boolean);
+  if (parts.some((r) => !/^[\w:.-]+(?:\|[\w:.-]+)*$/.test(r))) return null;
+  return [...new Set(parts)].join(",");
+}
 
 /** Validates a write's arguments; the op, or the problem. */
 export function writeOp(name: string, a: any, st: ToolStore): WriteOp | string {
@@ -389,6 +417,43 @@ export function writeOp(name: string, a: any, st: ToolStore): WriteOp | string {
       if (!open(id, ["inbox", "waiting", "blocked"])) return `${id} is not queued, waiting or blocked (a running task keeps its agent; amend it instead)`;
       return { tool: name, id, agent };
     }
+    case "configure_task": {
+      const id = s(a.id), agent = s(a.agent), host = s(a.host), cli = s(a.cli), priority = s(a.priority) as Priority;
+      if (!TASK_ID.test(id) || !open(id, ["inbox"])) return "only queued tasks can be configured; running tasks must finish or be cancelled first";
+      if (!/^[\w-]+$/.test(agent) || !st.read(`agents/${agent}/profile.md`)) return "unknown agent";
+      if (!/^[\w.-]+$/.test(host)) return "machine name or any required";
+      if (!["auto", ...PROVIDER_IDS].includes(cli) || !PRIORITIES.includes(priority)) return "invalid CLI or priority";
+      const requires = normalizeCaps(a.requires);
+      if (requires === null) return "invalid capabilities";
+      const extra: { title?: string; prefer?: string; weight?: string; project?: string } = {};
+      if (a.title !== undefined) {
+        if (typeof a.title !== "string" || !a.title.trim() || a.title.length > 120 || /[\r\n]/.test(a.title)) return "title must be one line, up to 120 characters";
+        extra.title = a.title.trim();
+      }
+      if (a.prefer !== undefined) {
+        const prefer = normalizeCaps(a.prefer);
+        if (prefer === null) return "invalid preferred capabilities";
+        extra.prefer = prefer;
+      }
+      if (a.weight !== undefined) {
+        if (!["normal", "heavy"].includes(a.weight)) return "choose normal or heavy resource use";
+        extra.weight = a.weight;
+      }
+      if (a.project !== undefined) {
+        if (typeof a.project !== "string" || (a.project && (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(a.project) || !st.read(`projects/${a.project}.md`)))) return "unknown project";
+        extra.project = a.project;
+      }
+      const { meta: current, body } = parseDoc(st.read(`tasks/inbox/${id}.md`)!.text);
+      const learningError = learningTaskHostError(current, body, host);
+      if (learningError) return learningError;
+      const project = a.project === undefined ? current.project : extra.project;
+      if (project) {
+        const file = st.read(`projects/${project}.md`);
+        if (!file) return "the task's project is missing; choose a different project or detach it";
+        if (parseDoc(file.text).meta.host !== host) return "the selected project's machine must be used; detach the project to choose another machine";
+      }
+      return { tool: name, id, agent, host, cli, priority, requires, ...extra };
+    }
     case "remember": {
       const text = s(a.text), file = s(a.file);
       if (!text) return "text required";
@@ -423,7 +488,13 @@ export async function runTool(st: ToolStore, name: string, a: any, base = ""): P
   if (isWrite(name)) {
     const op = writeOp(name, a, st);
     if (typeof op === "string") return bad(op);
-    try { return ok(await st.act(op)); } catch (e) { return bad(`${name} failed: ${e instanceof Error ? e.message : e}`); }
+    try {
+      const data = await st.act(op);
+      return data.ok === false ? { ok: false, error: String(data.error ?? "The change was not confirmed"), data } : ok(data);
+    } catch (e) {
+      if (e instanceof ActionSyncError) return { ok: false, error: e.message, data: e.data };
+      return bad(`${name} failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
   switch (name) {
     case "get_status": return ok(statusView(st));

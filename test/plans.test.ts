@@ -10,6 +10,8 @@ import { planRoute, status as hubStatus } from "../src/server";
 import { localStore } from "../src/brain";
 import { listPlansView, writeOp } from "../cloud/src/tools";
 
+const RECORD_IO = { pull: async () => true, push: async () => true };
+
 const status = (fn: () => unknown) => { try { fn(); return 0; } catch (e) { return (e as RequestError).status; } };
 let notes: string[] = [];
 let clock = Date.now();
@@ -32,6 +34,7 @@ function approved(...titles: string[]): Plan {
 const current = (id: string) => readPlan(id).steps.find((s) => s.status === "running")!;
 
 beforeEach(() => {
+  mkdirSync(P("journal"), { recursive: true });
   for (const d of ["plans", "tasks", "projects", "archive", "agents"]) rmSync(P(d), { recursive: true, force: true });
   for (const d of ["agents/lead", "agents/writer"]) { mkdirSync(P(d), { recursive: true }); writeFileSync(P(d, "profile.md"), "# Role\n\nWork.\n"); }
   writeFileSync(P("config.toml"), "");
@@ -305,7 +308,7 @@ test("saving leaves no temporary file behind", () => {
 
 test("the API drives a plan, refuses what doesn't apply, and reports open plans", async () => {
   const call = async (method: string, id?: string, action?: string, body?: unknown) => {
-    const r = await planRoute(new Request("http://x/api/plans", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id, action);
+    const r = await planRoute(new Request("http://x/api/plans", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id, action, RECORD_IO);
     return { status: r.status, data: (await r.json()) as any };
   };
   expect((await call("POST", undefined, undefined, {})).status).toBe(400);
@@ -355,7 +358,7 @@ test("a restart stops an agent the last daemon left behind, and nothing else", a
   const other = start("sleepy");
   await Bun.sleep(100);
   writeFileSync(P("logs", "pids", "T-2.pid"), String(other.pid));
-  expect(await stopOrphanedAgent("T-2")).toBe(false);
+  await expect(stopOrphanedAgent("T-2")).rejects.toThrow("cannot be verified");
   expect(other.killed).toBe(false);
   other.kill();
   expect(await stopOrphanedAgent("T-3")).toBe(false); // nothing recorded

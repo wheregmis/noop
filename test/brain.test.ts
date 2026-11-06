@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type Model, context, dataActs, localStore, reopenTask, parseTurn, think } from "../src/brain";
-import { DATA } from "../src/core";
+import { DATA, matches, readDoc } from "../src/core";
 import { runTool, taskInfo, toolsFor, TOOLS, type WriteOp, listRoutines } from "../cloud/src/tools";
 
 const put = (p: string, s: string) => { mkdirSync(dirname(join(DATA, p)), { recursive: true }); writeFileSync(join(DATA, p), s); };
@@ -172,4 +172,116 @@ test("list_routines: a change made in settings wins over config.toml, as it does
   };
   const rows = listRoutines({ read: (p: string) => (files[p] === undefined ? undefined : { text: files[p] }) } as any);
   expect(rows.map((r) => [r.name, r.enabled, r.every])).toEqual([["macos-check", false, "1d"], ["nightly", true, "2h"]]);
+});
+
+
+test("queued placement can move a Linux task to Mac without losing other requirements or task history", async () => {
+  put("tasks/inbox/T-0927.md", "---\nid: T-0927\ntitle: Review\nagent: reviewer\nrequires: os:linux,docker\nhost: old-linux\nparked: yesterday\n---\nReview the PR.\n\n## Run earlier\nKeep history.\n");
+  const { st } = store();
+  const { taskView } = await import("../src/server");
+  expect(taskInfo(st, "T-0927")).toMatchObject({ state: "nohost", needs: "os:linux,docker,host:old-linux" });
+  put("tasks/inbox/T-0928.md", "---\nid: T-0928\nagent: reviewer\nhost: old-linux\nparked: yesterday\n---\nReview.\n");
+  expect(taskView(join(DATA, "tasks/inbox/T-0928.md"), "inbox", [])).toMatchObject({ state: "nohost", needs: "host:old-linux" });
+  expect(taskInfo(st, "T-0928")).toMatchObject({ state: "nohost", needs: "host:old-linux" });
+  const args = { id: "T-0927", requires: "os:macos,docker", host: "any", cli: "claude", agent: "reviewer", priority: "high" };
+  expect((await runTool(st, "configure_task", args)).ok).toBe(true);
+  const { meta, body } = readDoc(join(DATA, "tasks/inbox/T-0927.md"));
+  expect(meta.parked).toBeUndefined();
+  expect(meta.planned).toBeTruthy();
+  expect(meta.requires).toBe("os:macos,docker");
+  expect(body).toContain("Keep history.");
+  expect(matches(meta, ["os:macos", "docker"])).toBe(true);
+  expect(matches(meta, ["os:macos"])).toBe(false);
+  expect(taskInfo(st, args.id)).toMatchObject({ requires: "os:macos,docker", target_host: "any", configured_cli: "claude", priority: "high", state: "inbox" });
+  for (const patch of [{ id: "T-0184" }, { agent: "../lead" }, { host: "mac\nrequires: " }, { requires: "os:macos\n" }, { cli: "shell" }, { priority: "asap" }]) {
+    expect((await runTool(st, "configure_task", { ...args, ...patch })).ok).toBe(false);
+  }
+});
+
+
+test("advanced task settings bind the selected project's machine and toolchain without changing the request", async () => {
+  put("tasks/inbox/T-0930.md", "---\nid: T-0930\ntitle: Review\nagent: reviewer\nrequires: os:linux\n---\nOriginal request and runs stay here.\n");
+  put("projects/remote.md", "---\nname: Remote\nhost: mac\npath: /worker/project\nrequires: cli:cargo\n---\nProject rules.\n");
+  const { st } = store();
+  const args = { id: "T-0930", host: "mac", agent: "reviewer", cli: "auto", priority: "normal", requires: "os:macos", project: "remote", title: "Review on Mac", prefer: "gpu, gpu", weight: "heavy" };
+  expect(await runTool(st, "configure_task", args)).toMatchObject({ ok: true, data: { ok: true } });
+  const file = join(DATA, "tasks/inbox/T-0930.md"), { meta, body } = readDoc(file);
+  expect(meta).toMatchObject({ title: "Review on Mac", project: "remote", repo: "/worker/project", host: "mac", requires: "os:macos,cli:cargo", prefer: "gpu", weight: "heavy" });
+  expect(body.trim()).toBe("Original request and runs stay here.");
+  expect(taskInfo(st, args.id)).toMatchObject({ project: "remote", prefer: "gpu", weight: "heavy", repo: "/worker/project" });
+  for (const patch of [{ host: "linux" }, { title: "bad\npriority: urgent" }, { prefer: "gpu; shell" }, { weight: "huge" }, { project: "../config" }])
+    expect((await runTool(st, "configure_task", { ...args, ...patch })).ok).toBe(false);
+  expect(await runTool(st, "configure_task", { ...args, project: "", host: "any", requires: "", prefer: "", weight: "normal" })).toMatchObject({ ok: true, data: { ok: true } });
+  expect(readDoc(file).meta).toMatchObject({ project: "", repo: "", host: "any", requires: "", prefer: "", weight: "normal" });
+});
+
+const syncTask = "tasks/inbox/T-0940.md", syncMemory = "memory/sync-coverage.md";
+const syncPlacement = { tool: "configure_task" as const, id: "T-0940", host: "any", agent: "lead", cli: "auto", priority: "high" as const, requires: "os:macos" };
+const syncOps: WriteOp[] = [
+  { tool: "set_priority", id: "T-0940", priority: "high" }, { tool: "reassign_task", id: "T-0940", agent: "lead" }, syncPlacement,
+  { tool: "remember", file: syncMemory, text: "Keep the result clear." }, { tool: "edit_memory", file: syncMemory, match: "Old rule", text: "New rule" },
+];
+function syncStore(io: { pull: () => Promise<boolean>; push: (summary: string) => Promise<boolean> }) {
+  put(syncTask, "---\nid: T-0940\ntitle: Review\nagent: reviewer\nrequires: os:linux\n---\nOriginal request and previous runs.\n");
+  put(syncMemory, "# Memory\n- Old rule\n");
+  put("agents/lead/profile.md", "# Lead\n"); put("agents/reviewer/profile.md", "# Reviewer\n");
+  mkdirSync(join(DATA, "journal"), { recursive: true });
+  return localStore({ acts: dataActs("pc", io), status: () => ({}), feed: () => [] });
+}
+
+test("task and memory writes never mutate stale data after a failed refresh", async () => {
+  for (const pull of [async () => false, async () => { throw new Error("offline"); }]) for (const op of syncOps) {
+    let pushes = 0;
+    const st = syncStore({ pull, push: async () => { pushes++; return true; } });
+    const task = readFileSync(join(DATA, syncTask), "utf8"), memory = readFileSync(join(DATA, syncMemory), "utf8");
+    const result = await runTool(st, op.tool, op);
+    expect(result).toMatchObject({ ok: false, data: { ok: false, status: 503 } });
+    expect(readFileSync(join(DATA, syncTask), "utf8")).toBe(task);
+    expect(readFileSync(join(DATA, syncMemory), "utf8")).toBe(memory); expect(pushes).toBe(0);
+  }
+});
+
+test("unconfirmed task and memory sync retains each local identity and reports a partial result", async () => {
+  for (const push of [async () => false, async () => { throw new Error("offline"); }]) for (const op of syncOps) {
+    const st = syncStore({ pull: async () => true, push });
+    const result = await runTool(st, op.tool, op);
+    expect(result).toMatchObject({ ok: false, data: { ok: false, status: 503, saved_locally: true, ...("id" in op ? { id: op.id } : "file" in op ? { file: op.file } : {}) } });
+    expect(result.ok ? "" : result.error).toContain("Saved on the main machine");
+    if (op.tool === "configure_task") {
+      const task = readDoc(join(DATA, syncTask));
+      expect(task.meta).toMatchObject({ id: "T-0940", requires: "os:macos" });
+      expect(task.body).toBe("Original request and previous runs.\n");
+    }
+  }
+});
+
+test("task configuration returns HTTP503 for failed refresh or partial sync and safely retries the same task", async () => {
+  const { recordRequest, setApplyOp } = await import("../src/server");
+  let refreshed = false, synced = false;
+  const st = syncStore({ pull: async () => refreshed, push: async () => synced });
+  setApplyOp((op) => runTool(st, op.tool, op));
+  const request = () => recordRequest(new Request("http://hub/api/tasks/configure", { method: "POST", body: JSON.stringify(syncPlacement) }));
+  try {
+    const stale = await request(); expect(stale.status).toBe(503);
+    expect(readDoc(join(DATA, syncTask)).meta.requires).toBe("os:linux");
+    refreshed = true;
+    const partial = await request(); expect(partial.status).toBe(503);
+    expect(await partial.json()).toMatchObject({ ok: false, id: "T-0940", saved_locally: true, data: { status: 503, saved_locally: true } });
+    synced = true;
+    const retry = await request(); expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ ok: true, data: { ok: true, id: "T-0940" } });
+    expect(readDoc(join(DATA, syncTask)).body).toBe("Original request and previous runs.\n");
+  } finally { setApplyOp(async () => null); }
+});
+
+test("an unconfirmed chat write posts an explicit correction and records failure", async () => {
+  const st = syncStore({ pull: async () => true, push: async () => false });
+  const replies: [string, string | undefined][] = [];
+  const out = await think({ text: "Move T-0940 to Mac" }, st,
+    scripted([JSON.stringify({ calls: [{ tool: "configure_task", args: syncPlacement }], reply: "Moved it to Mac." })]),
+    (text, ref) => replies.push([text, ref]));
+  expect(replies[0]).toEqual(["Moved it to Mac.", "T-0940"]);
+  expect(replies[1][0]).toContain("not confirmed"); expect(replies[1][0]).toContain("Saved on the main machine"); expect(replies[1][1]).toBe("T-0940");
+  expect(out.calls).toMatchObject([{ tool: "configure_task", ok: false }]);
+  expect(out.reply).toContain("not confirmed");
 });

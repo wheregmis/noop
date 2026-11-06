@@ -1,3 +1,5 @@
+import { enabledProviders, providerAvailable } from "./providers";
+import { accountEnv, pickAccount, markAccountSuccess } from "./accounts";
 // hub fix — the AI medic. When install/update/daemon breaks, call an agent directly (not through the queue,
 // which may be what is broken) with the error, logs and environment; it diagnoses, fixes, verifies, and
 // if framework code changed, pushes a branch + PR so every machine gets the fix. Inspired by Omarchy's
@@ -53,6 +55,9 @@ End with one \`\`\`json block: {"fixed": true|false, "summary": "...", "owner_ac
 /** Run the medic. `auto` = triggered by a failure (rate-limited to once per hour per problem kind). */
 export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; kind?: string } = {}) {
   if (process.env.HUB_NO_MEDIC || cfg.medic?.enabled === false) return null;
+  const account = pickAccount(cfg, enabledProviders(cfg).filter(providerAvailable));
+  const cli = account?.cli;
+  if (!cli || !account) { console.error("medic: no enabled AI tool is available"); return null; }
   const state: Record<string, string> = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
   const kind = opts.kind ?? "manual";
   if (opts.auto && state[kind] && Date.now() - Date.parse(state[kind]) < 60 * 60_000) return null;
@@ -60,14 +65,13 @@ export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; k
   mkdirSync(LOGDIR, { recursive: true });
   writeFileSync(STATE, JSON.stringify(state));
 
-  const cli = ["claude", "codex"].find((c) => Bun.which(c));
-  if (!cli) { console.error("medic: neither claude nor codex is installed"); return null; }
   const prompt = PROMPT(problem, await context(), cfg.medic?.push !== false);
   const cmd = cli === "claude"
     ? ["claude", "-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--disallowedTools", "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(rm -rf /:*)", "Bash(rm -rf ~:*)"]
+    : cli === "hermes" ? ["hermes", "chat", "--query-file", "-", "--quiet", "--source", "noop"]
     : ["codex", "exec", "--skip-git-repo-check", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-"];
   console.error(`🩺 medic (${cli}) is looking at: ${problem.split("\n")[0].slice(0, 120)}`);
-  const p = Bun.spawn(cmd, { cwd: CODE, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe", env: { ...process.env, HUB_NO_MEDIC: "1" } });
+  const p = Bun.spawn(cmd, { cwd: CODE, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe", env: { ...process.env, ...accountEnv(account), HUB_NO_MEDIC: "1" } });
   const timer = setTimeout(() => p.kill(), (cfg.medic?.timeout_minutes ?? 30) * 60_000);
   const out = await new Response(p.stdout).text();
   await p.exited; clearTimeout(timer);
@@ -75,6 +79,7 @@ export async function medic(problem: string, cfg: Cfg, opts: { auto?: boolean; k
   writeFileSync(log, `${problem}\n\n${out}`);
   const m = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].pop();
   let res: any = null; try { res = m ? JSON.parse(m[1]) : null; } catch {}
+  if (res && p.exitCode === 0) markAccountSuccess(account);
   const line = res ? `${res.fixed ? "✅ fixed" : "❌ not fixed"}: ${res.summary}${res.owner_action ? `\n👉 You need to do: ${res.owner_action}` : ""}${res.pr ? `\nPR: ${res.pr}` : ""}`
     : `medic finished without a result; log: ${log}`;
   console.error(`🩺 ${line}`);

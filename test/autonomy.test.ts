@@ -116,3 +116,58 @@ test("primary: named in the config, else only while no other host has a heartbea
   expect(core.isPrimary({}, "pc")).toBe(true); // its own heartbeat does not count
   expect(core.isPrimary({ fleet: { primary: "mac" } }, "mac")).toBe(true);
 });
+
+
+test("member autonomy governs new tasks while owner work keeps its approval", () => {
+  const policy = { autonomy: { level: "onboarding", agents: { reviewer: "autonomous", writer: "assisted", trainee: "onboarding" }, assisted_approve_followups: true } };
+  core.setApprovalGate((source, agent) => A.needsApproval(policy, source, agent));
+  try {
+    const automatic = core.newTask("Review", "", { agent: "reviewer", source: "routine:pr-review" });
+    expect(existsSync(P("tasks", "inbox", `${automatic}.md`))).toBe(true);
+    const proposed = core.newTask("Follow up", "", { agent: "writer", source: "followup:T-0001" });
+    expect(existsSync(P("tasks", "proposed", `${proposed}.md`))).toBe(true);
+    const owner = core.newTask("Owner request", "", { agent: "trainee", source: "owner" });
+    expect(existsSync(P("tasks", "inbox", `${owner}.md`))).toBe(true);
+    const inherited = core.newTask("Inherited learning", "", { source: "routine:pr-review" });
+    expect(existsSync(P("tasks", "proposed", `${inherited}.md`))).toBe(true);
+    const limited = { autonomy: { level: "autonomous", agents: { trainee: "onboarding" } } };
+    expect(A.needsApproval(limited, "routine:pr-review", "trainee")).toBe(true);
+    expect(A.needsApproval({ autonomy: { level: "autonomous", agents: { trainee: null } } }, "routine:pr-review", "trainee")).toBe(false);
+    expect(A.judgeMayDecide(limited, "trainee")).toBe(false);
+  } finally { core.setApprovalGate(() => false); }
+});
+
+test("absent and null members inherit while malformed levels and groups stay in onboarding", () => {
+  const automatic = { autonomy: { level: "autonomous", agents: { inherited: null, reviewer: "assisted" } } };
+  expect(A.level(automatic, "missing")).toBe("autonomous");
+  expect(A.level(automatic, "inherited")).toBe("autonomous");
+  expect(A.level(automatic, "reviewer")).toBe("assisted");
+  for (const value of ["trusted", "", false, 0, [], {}, undefined]) {
+    const invalidMember = { autonomy: { level: "autonomous", agents: { trainee: value } } };
+    expect(A.level(invalidMember, "trainee")).toBe("onboarding");
+    expect(A.judgeMayDecide(invalidMember, "trainee")).toBe(false);
+    expect(A.needsApproval(invalidMember, "followup:T-0001", "trainee")).toBe(true);
+    const invalidTeam = { autonomy: { level: value } };
+    expect(A.level(invalidTeam)).toBe("onboarding");
+    expect(A.judgeMayDecide(invalidTeam)).toBe(false);
+  }
+  for (const agents of [null, "autonomous", [], false, 0, undefined]) {
+    const invalidGroup = { autonomy: { level: "autonomous", agents } };
+    expect(A.level(invalidGroup, "trainee")).toBe("onboarding");
+    expect(A.judgeMayDecide(invalidGroup, "trainee")).toBe(false);
+  }
+});
+
+test("malformed member policy cannot auto-start new self-generated work", () => {
+  for (const value of ["trusted", "", false, 0, [], {}]) {
+    const policy = { autonomy: { level: "autonomous", agents: { trainee: value } } };
+    core.setApprovalGate((source, agent) => A.needsApproval(policy, source, agent));
+    try {
+      const proposed = core.newTask("Untrusted follow-up", "", { agent: "trainee", source: "followup:T-0001" });
+      expect(existsSync(P("tasks", "proposed", `${proposed}.md`))).toBe(true);
+      expect(existsSync(P("tasks", "inbox", `${proposed}.md`))).toBe(false);
+      const owner = core.newTask("Approved owner request", "", { agent: "trainee", source: "owner" });
+      expect(existsSync(P("tasks", "inbox", `${owner}.md`))).toBe(true);
+    } finally { core.setApprovalGate(() => false); }
+  }
+});

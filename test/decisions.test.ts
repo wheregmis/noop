@@ -78,10 +78,27 @@ test("judge failure is recorded as error; judge auto-decision keeps its shadow f
 
   judgeReply = { verdict: "decided", answer: "A", reason: "precedent" };
   const id2 = open();
-  await dec.routeDecision(id2, { ...cfg, autonomy: { level: "trusted" } }, "h");
+  await dec.routeDecision(id2, { ...cfg, autonomy: { level: "autonomous" } }, "h");
   expect(closed(id2).answered_by).toBe("judge");
   expect(closed(id2).shadow_verdict).toBe("decided");
   expect(closed(id2).shadow_agree).toBeUndefined();
+});
+
+test("malformed autonomy never turns the judge's recommendation into an automatic decision", async () => {
+  const policies = [
+    { level: "trusted" },
+    { level: "autonomous", agents: { lead: "trusted" } },
+    { level: "autonomous", agents: { lead: "" } },
+    { level: "autonomous", agents: [] },
+  ];
+  for (const autonomy of policies) for (const verdict of ["decided", "sent_back"]) {
+    judgeReply = { verdict, answer: "A", reason: "fixture recommendation" };
+    const id = open(), notified = sent.length;
+    await dec.routeDecision(id, { ...cfg, autonomy }, "h");
+    expect(existsSync(core.P("decisions", "closed", `${id}.md`))).toBe(false);
+    expect(core.readDoc(core.P("decisions", "open", `${id}.md`)).meta).toMatchObject({ shadow_verdict: verdict, shadow_answer: "A" });
+    expect(sent.length).toBe(notified + 1);
+  }
 });
 
 test("choice() normalises option answers", () => {

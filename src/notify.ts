@@ -70,7 +70,7 @@ export async function notify(text: string, cfg: Cfg, o: NotifyOpts = {}): Promis
 }
 
 /** Owner replies look like `D-0012 A`, `D-0012 do B but keep tests`, or `D-0012 override: ...`. */
-const ANSWER = /\b([DLP]-[A-Z]?\d{4})\b[\s:：,，\-]*([\s\S]+)/;
+const ANSWER = /\b((?:[DP]-[A-Z]?\d{4}|L-\d{4,}))\b[\s:：,，\-]*([\s\S]+)/;
 
 export type Reply = { id: string; answer: string; source: string };
 

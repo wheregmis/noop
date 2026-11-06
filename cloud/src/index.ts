@@ -18,6 +18,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { b64dec, b64enc, handleFiles, handleReadFiles, initFilesSchema } from "./files";
 import { taskHistory, taskInfo } from "./tools";
+import { initUiRequests, uiRequestRoute } from "./ui-requests";
+import { initMessageReceipts, nextMessageReceiptExpiry, pruneMessageReceipts, receiveOwnerMessage, validMessageKey } from "./message-receipts";
+import { identifyMachine, initMachineRequests, machineRequestRoute, mintMachineToken, nextMachineRequestExpiry, pruneMachineRequests, validMachineHost } from "./machine-requests";
 import { ownerAttachments, sniffImage, uploadId, uploadProblem } from "./uploads";
 import { sendMail, type SmtpCfg } from "./smtp";
 import { EmailMessage } from "cloudflare:email";
@@ -51,6 +54,8 @@ const STALE_MS = 3 * 60_000;
 const WRITE_LEAN = 40_000, WRITE_SHED = 70_000;
 const SHEDDABLE = new Set(["system", "daemon", "notice"]);
 const HOT = new Set(["status", "host_seen"]), HOT_PERSIST_MS = 5 * 60_000;
+// Credentials, targeted commands and session-scoped message receipts stay with this hub instance.
+const LOCAL_MACHINE_TABLES = new Set(["machine_credentials", "machine_requests", "message_receipts"]);
 const CODE_TTL = 10 * 60_000, CODE_TRIES = 5, RESEND_MS = 60_000, SENDS_PER_HOUR = 10, SEEN_EVERY = 3600_000;
 
 const hex = (b: ArrayBuffer | Uint8Array) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -68,14 +73,22 @@ function sixDigits() { // unbiased 000000–999999
 const normEmail = (e: unknown) => typeof e === "string" ? e.trim().toLowerCase() : "";
 const validEmail = (e: string) => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
+const MESSAGE_CORS = { "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "authorization, content-type, idempotency-key" };
+class MessageValidationError extends Error {}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    const mcp = isMcpPath(url.pathname);
+    const mcp = isMcpPath(url.pathname), messages = url.pathname === "/api/messages";
+    if (messages && req.method === "OPTIONS") return new Response(null, { status: 204, headers: MESSAGE_CORS });
     if (mcp && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (!mcp && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/media/")) return env.ASSETS.fetch(req);
     if (!env.HUB_TOKEN) return json({ error: "HUB_TOKEN secret not set" }, 500);
-    return env.HUB.get(env.HUB.idFromName("hub")).fetch(req);
+    const response = await env.HUB.get(env.HUB.idFromName("hub")).fetch(req);
+    if (!messages) return response;
+    const headers = new Headers(response.headers);
+    for (const [key, value] of Object.entries(MESSAGE_CORS)) headers.set(key, value);
+    return new Response(response.body, { status: response.status, headers });
   },
 };
 
@@ -99,6 +112,9 @@ export class Hub extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, email TEXT, created INTEGER, last_seen INTEGER, ua TEXT);
       CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, session TEXT, p256dh TEXT, auth TEXT, label TEXT, created INTEGER);`);
     initFilesSchema(this.sql);
+    initUiRequests(this.sql);
+    initMachineRequests(this.sql);
+    initMessageReceipts(this.sql);
     this.mcp = new Mcp({
       sql: this.sql,
       status: () => this.statusView(),
@@ -177,17 +193,20 @@ export class Hub extends DurableObject<Env> {
   }
   touchHost() { this.set("host_seen", Date.now()); }
 
-  append(e: Partial<Ev>): Ev {
+  append(e: Partial<Ev>, afterCommit?: (() => void)[]): Ev {
     const ev = { id: crypto.randomUUID(), ts: new Date().toISOString(), ...e } as Ev;
     this.spend(3);
     this.sql.exec("INSERT INTO events (ts, json) VALUES (?, ?)", ev.ts, JSON.stringify(ev));
     if (Math.random() < 0.02) this.sql.exec("DELETE FROM events WHERE seq <= (SELECT MAX(seq) - 5000 FROM events)");
-    const s = JSON.stringify(ev);
-    for (const ws of this.ctx.getWebSockets()) try { ws.send(s); } catch {}
-    try { this.mcp.onEvent(ev); } catch (err) { console.error(`mcp: ${err}`); }
-    this.pruneMedia();
-    const n = this.notification(ev);
-    if (n) this.ctx.waitUntil(this.pushAll(n.payload, n.urgency).catch((err) => console.error(`push: ${err}`)));
+    const publish = () => {
+      const s = JSON.stringify(ev);
+      for (const ws of this.ctx.getWebSockets()) try { ws.send(s); } catch {}
+      try { this.mcp.onEvent(ev); } catch (err) { console.error(`mcp: ${err}`); }
+      this.pruneMedia();
+      const n = this.notification(ev);
+      if (n) this.ctx.waitUntil(this.pushAll(n.payload, n.urgency).catch((err) => console.error(`push: ${err}`)));
+    };
+    if (afterCommit) afterCommit.push(publish); else publish();
     return ev;
   }
 
@@ -205,16 +224,17 @@ export class Hub extends DurableObject<Env> {
   /** Owner→fleet inbox. A waiting long-poll from the primary daemon is answered at once (no polling delay). */
   inboxWaiters = new Set<() => void>();
   acked = 0;
-  toInbox(item: Record<string, unknown>) {
+  toInbox(item: Record<string, unknown>, afterCommit?: (() => void)[]) {
     this.spend();
     this.sql.exec("INSERT INTO inbox (json) VALUES (?)", JSON.stringify(item));
-    for (const w of [...this.inboxWaiters]) w();
+    const wake = () => { for (const w of [...this.inboxWaiters]) w(); };
+    if (afterCommit) afterCommit.push(wake); else wake();
   }
 
-  ownerMessage(text: string, ref?: string, attachments?: string[], thread = false): Ev {
-    const ev = this.append({ from: "owner", kind: "owner", text, ref, ...(attachments?.length ? { attachments } : {}), ...(thread ? { thread } : {}) });
-    this.toInbox({ type: "message", event: ev });
-    if (!this.hostOnline()) this.append({ from: "hub", kind: "system", text: "Got it. None of the team's computers are online right now; I'll pick this up as soon as one is.", ref: ev.id });
+  ownerMessage(text: string, ref?: string, attachments?: string[], thread = false, afterCommit?: (() => void)[]): Ev {
+    const ev = this.append({ from: "owner", kind: "owner", text, ref, ...(attachments?.length ? { attachments } : {}), ...(thread ? { thread } : {}) }, afterCommit);
+    this.toInbox({ type: "message", event: ev }, afterCommit);
+    if (!this.hostOnline()) this.append({ from: "hub", kind: "system", text: "Got it. None of the team's computers are online right now; I'll pick this up as soon as one is.", ref: ev.id }, afterCommit);
     return ev;
   }
 
@@ -292,6 +312,19 @@ export class Hub extends DurableObject<Env> {
 
   hostOnline() { const seen = this.get("host_seen"); return !!seen && Date.now() - seen < STALE_MS; }
 
+  async scheduleCleanup() {
+    const times = [nextMachineRequestExpiry(this.sql), nextMessageReceiptExpiry(this.sql)].filter((time): time is number => time !== null);
+    if (!times.length) return;
+    const next = Math.min(...times);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || next < current) await this.ctx.storage.setAlarm(next);
+  }
+  async alarm() {
+    pruneMachineRequests(this.sql);
+    pruneMessageReceipts(this.sql);
+    await this.scheduleCleanup();
+  }
+
   // ---- auth
   credential(req: Request, url: URL) {
     const h = req.headers.get("authorization") ?? "";
@@ -303,6 +336,7 @@ export class Hub extends DurableObject<Env> {
     if (!t) return null;
     if (sameStr(t, this.env.HUB_TOKEN)) return "machine";
     if (!/^[0-9a-f]{64}$/.test(t)) return null;
+    if (await identifyMachine(this.sql, t)) return "machine";
     const id = await sha256(t); // store only hashes of session ids
     const r = this.sql.exec("SELECT last_seen FROM sessions WHERE id = ?", id).toArray()[0];
     if (!r) return null;
@@ -369,10 +403,42 @@ export class Hub extends DurableObject<Env> {
     const p = url.pathname, m = req.method;
 
     if (p.startsWith("/api/auth/")) return this.auth(p, req);
-    if (isMcpPath(p)) return this.mcp.fetch(req, await this.who(req, url));
     const who = await this.who(req, url);
+    const scoped = who === "machine" && !sameStr(this.credential(req, url), this.env.HUB_TOKEN) ? await identifyMachine(this.sql, this.credential(req, url)) : null;
+    if (isMcpPath(p)) return scoped ? json({ error: "forbidden" }, 403) : this.mcp.fetch(req, who);
     if (!who) return json({ error: "unauthorized" }, 401);
+    if (p === "/api/host/identity") {
+      if (m !== "GET") return json({ error: "method not allowed" }, 405);
+      return who === "machine" ? json({ host: scoped?.host ?? null, legacy: !scoped }) : json({ error: "machine credential required" }, 403);
+    }
+    if (p === "/api/host/register" || p === "/api/host/join") {
+      if (m !== "POST") return json({ error: "method not allowed" }, 405);
+      const joining = p.endsWith("/join");
+      if (joining ? who === "machine" : who !== "machine" || !!scoped) return json({ error: "forbidden" }, 403);
+      const text = await req.text();
+      if (text.length > 2048) return json({ error: "invalid machine registration" }, 400);
+      let body: any; try { body = JSON.parse(text); } catch { return json({ error: "invalid JSON" }, 400); }
+      if (!body || typeof body !== "object" || Array.isArray(body) || !validMachineHost(body.host)
+        || Object.keys(body).some((key) => key !== "host" && !(joining ? key === "replace" : key === "token"))
+        || body.replace !== undefined && typeof body.replace !== "boolean"
+        || body.token !== undefined && (typeof body.token !== "string" || !/^[a-f0-9]{64}$/.test(body.token))) return json({ error: "Choose a valid machine name" }, 400);
+      if (body.token !== undefined && (sameStr(body.token, this.env.HUB_TOKEN) || this.sql.exec("SELECT id FROM sessions WHERE id = ?", await sha256(body.token)).toArray().length))
+        return json({ error: "Use a new random credential for this machine" }, 400);
+      const credentials = await mintMachineToken(this.sql, body.host, joining && body.replace === true, joining ? undefined : body.token);
+      if (!credentials) return json({ error: "This machine name is already registered. Use its saved machine credential, choose another name, or explicitly replace it from an owner session." }, 409);
+      if (joining) this.append({ from: "hub", kind: "notice", text: `Machine ${body.host} joined the team.` });
+      return json(credentials);
+    }
+    const targeted = await machineRequestRoute(this.sql, req, scoped ?? (who === "machine" ? "legacy" : who));
+    if (targeted) { await this.scheduleCleanup(); return targeted; }
+    // A worker may sync shared files and report events, but cannot read the primary's owner inbox or administer auth.
+    if (scoped && !(p.startsWith("/api/files/") || p === "/api/events" && m === "POST" || p === "/api/media" && m === "POST" || p.startsWith("/media/") && m === "GET" || p === "/api/status" && m === "GET"))
+      return json({ error: "forbidden" }, 403);
     if (p.startsWith("/api/push/")) return this.push(p, req, who);
+    const form = await uiRequestRoute(this.sql, req, who, {
+      online: () => this.hostOnline(), supported: () => this.get("ui_api") === 1, enqueue: (item) => this.toInbox(item),
+    });
+    if (form) return form;
     if ((p === "/api/files/list" || p === "/api/files/read") && m === "GET") { // owner (and machine) read of READABLE prefixes
       const r = handleReadFiles(this.sql, url);
       if (r) return r;
@@ -380,7 +446,7 @@ export class Hub extends DurableObject<Env> {
     if (p.startsWith("/api/files/")) {
       const ownerOnly = p === "/api/files/history" || p === "/api/files/revert";
       if (ownerOnly ? who === "machine" : who !== "machine") return json({ error: "forbidden" }, 403);
-      const actor = who === "machine" ? (req.headers.get("x-noop-host") ?? "machine") : "owner";
+      const actor = who === "machine" ? scoped?.host ?? (req.headers.get("x-noop-host") ?? "machine") : "owner";
       const rev0 = Number(this.sql.exec("SELECT COALESCE(MAX(rev), 0) AS n FROM files").one().n);
       const r = await handleFiles(this.sql, req, url, actor);
       if (r && m === "POST") { // tasks / decisions changed → MCP resources/updated
@@ -400,12 +466,6 @@ export class Hub extends DurableObject<Env> {
       const c = this.get("cli_code");
       return c && c.expires > Date.now() ? json(c) : json({ error: "no pending code" }, 404);
     }
-    if (p === "/api/host/join" && m === "POST") { // a new machine, approved by the owner's login, gets the machine key
-      if (who === "machine") return json({ error: "forbidden" }, 403);
-      const { host } = (await req.json().catch(() => ({}))) as { host?: string };
-      this.append({ from: "hub", kind: "notice", text: `New machine ${String(host ?? "?").slice(0, 60)} joined the team.` });
-      return json({ token: this.env.HUB_TOKEN });
-    }
     if (p === "/api/host/revoke-sessions" && m === "POST") {
       await req.text().catch(() => ""); // drain body
       if (who !== "machine") return json({ error: "forbidden" }, 403);
@@ -420,7 +480,7 @@ export class Hub extends DurableObject<Env> {
     if (p === "/api/host/export" && m === "GET") {
       if (who !== "machine") return json({ error: "forbidden" }, 403);
       const t = url.searchParams.get("table");
-      const names = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray().map((r) => r.name as string);
+      const names = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray().map((r) => r.name as string).filter((name) => !LOCAL_MACHINE_TABLES.has(name));
       if (!t) return json({ tables: Object.fromEntries(names.map((n) => [n, this.sql.exec(`SELECT COUNT(*) AS n FROM "${n}"`).one().n])) });
       if (!names.includes(t)) return json({ error: "no such table" }, 404);
       const offset = Number(url.searchParams.get("offset") ?? 0), limit = Math.min(Number(url.searchParams.get("limit") ?? 100), 1000);
@@ -430,12 +490,16 @@ export class Hub extends DurableObject<Env> {
     }
     if (p === "/api/host/import" && m === "POST") {
       if (who !== "machine") return json({ error: "forbidden" }, 403);
-      const { table: t, rows, reset } = (await req.json()) as { table: string; rows: Record<string, unknown>[]; reset?: boolean };
-      const known = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray().map((r) => r.name as string));
+      const input = await req.json().catch(() => null) as { table?: unknown; rows?: unknown; reset?: unknown } | null;
+      if (!input || typeof input.table !== "string" || !Array.isArray(input.rows) || input.rows.length > 1000 || input.reset !== undefined && typeof input.reset !== "boolean") return json({ error: "invalid import" }, 400);
+      const { table: t, rows, reset } = input;
+      const known = new Set(this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray().map((r) => r.name as string).filter((name) => !LOCAL_MACHINE_TABLES.has(name)));
       if (!known.has(t)) return json({ error: "no such table" }, 404);
+      const columns = new Set(this.sql.exec(`PRAGMA table_info("${t}")`).toArray().map((row) => String(row.name)));
+      if (rows.some((row) => !row || typeof row !== "object" || Array.isArray(row) || !Object.keys(row).length || Object.keys(row).some((key) => !columns.has(key)))) return json({ error: "invalid import columns" }, 400);
       this.ctx.storage.transactionSync(() => {
         if (reset) this.sql.exec(`DELETE FROM "${t}"`);
-        for (const r of rows) {
+        for (const r of rows as Record<string, unknown>[]) {
           const cols = Object.keys(r);
           const vals = cols.map((c) => { const v = r[c] as any; return v && typeof v === "object" && "$b64" in v ? b64dec(v.$b64) : v; });
           this.sql.exec(`INSERT OR REPLACE INTO "${t}" (${cols.map((c) => `"${c}"`).join(",")}) VALUES (${cols.map(() => "?").join(",")})`, ...vals);
@@ -457,13 +521,32 @@ export class Hub extends DurableObject<Env> {
     }
 
     if (p === "/api/messages" && m === "POST") {
-      const { text = "", reply_to, attachments, thread } = (await req.json()) as { text?: string; reply_to?: string; attachments?: unknown; thread?: unknown };
-      const files = ownerAttachments(attachments);
+      const key = req.headers.get("Idempotency-Key");
+      if (key !== null && !validMessageKey(key)) return json({ error: "Use an Idempotency-Key of 8–128 letters, numbers, dots, underscores, colons or dashes" }, 400);
+      if (key !== null && who === "machine") return json({ error: "Owner session required for message retries" }, 403);
+      const body = await req.json().catch(() => null) as Record<string, unknown> | null;
+      if (!body || typeof body !== "object" || Array.isArray(body) || body.text !== undefined && typeof body.text !== "string"
+        || body.reply_to !== undefined && typeof body.reply_to !== "string" || body.thread !== undefined && typeof body.thread !== "boolean")
+        return json({ error: "Invalid message" }, 400);
+      const text = String(body.text ?? ""), ref = body.reply_to as string | undefined, thread = body.thread === true && /^T-/.test(ref ?? "");
+      const files = ownerAttachments(body.attachments);
       if (files === null) return json({ error: "bad attachments" }, 400);
-      if (files.some((f) => !this.sql.exec("SELECT 1 FROM media WHERE id = ? LIMIT 1", f.slice(7)).toArray().length))
-        return json({ error: "attachment not found" }, 400);
       if (!text.trim() && !files.length) return json({ error: "text required" }, 400);
-      return json(this.ownerMessage(text, reply_to, files, thread === true && /^T-/.test(reply_to ?? "")));
+      const afterCommit: (() => void)[] = [];
+      const create = () => {
+        if (files.some((f) => !this.sql.exec("SELECT 1 FROM media WHERE id = ? LIMIT 1", f.slice(7)).toArray().length)) throw new MessageValidationError("attachment not found");
+        return this.ownerMessage(text, ref, files, thread, key === null ? undefined : afterCommit);
+      };
+      try {
+        if (key === null) return json(create());
+        const result = await receiveOwnerMessage(this.sql, (callback) => this.ctx.storage.transactionSync(callback), (who as { session: string }).session, key,
+          JSON.stringify({ text, reply_to: ref, attachments: files, thread }), create);
+        if (result.status !== 200) return json({ error: result.error }, result.status);
+        if (!result.replayed) this.spend(3);
+        for (const publish of afterCommit) try { publish(); } catch (error) { console.error("accepted message notification failed", error); }
+        await this.scheduleCleanup();
+        return json(result.event);
+      } catch (error) { if (error instanceof MessageValidationError) return json({ error: error.message }, 400); throw error; }
     }
 
     // The owner's images for a message (paste / drop / pick in the app): images only, ≤ 10 MB, kept with the media.
@@ -506,16 +589,7 @@ export class Hub extends DurableObject<Env> {
       this.toInbox({ type: "update" });
       return json({ ok: true });
     }
-    if (p === "/api/settings" && m === "PUT") {
-      const patch = await req.json();
-      this.toInbox({ type: "settings", patch });
-      const view = this.get("settings") ?? { current: {} };
-      const deep = (a: any, b: any): any => { const o = { ...a }; for (const [k, v] of Object.entries(b ?? {})) o[k] = v && typeof v === "object" && !Array.isArray(v) ? deep(o[k] ?? {}, v) : v; return o; };
-      view.current = deep(view.current ?? {}, patch);
-      this.set("settings", view);
-      if (patch && typeof patch === "object" && "media_days" in patch) this.pruneMedia(true);
-      return json(view);
-    }
+
 
     if (p === "/api/media" && m === "POST") {
       const f = (await req.formData()).get("file") as File | null;
@@ -543,13 +617,20 @@ export class Hub extends DurableObject<Env> {
       return json(this.append(e));
     }
     if (p === "/api/host/state" && m === "PUT") {
-      const { status, settings } = (await req.json()) as { status?: unknown; settings?: unknown };
+      if (who !== "machine") return json({ error: "forbidden" }, 403);
+      const { status, settings, ui_api } = (await req.json()) as { status?: unknown; settings?: unknown; ui_api?: unknown };
+      if (status) this.set("ui_api", ui_api === 1 ? 1 : 0);
       if (status) { this.set("status", status); this.mcp.onChanged(["noop://status"]); }
-      if (settings) this.set("settings", settings);
+      if (settings) {
+        const previousDays = this.get("settings")?.current?.media_days;
+        this.set("settings", settings);
+        if (previousDays !== this.get("settings")?.current?.media_days) this.pruneMedia(true);
+      }
       this.touchHost();
       return json({ ok: true });
     }
     if (p === "/api/host/inbox") {
+      if (who !== "machine") return json({ error: "forbidden" }, 403);
       const after = Number(url.searchParams.get("after") ?? 0);
       if (after > this.acked) { this.sql.exec("DELETE FROM inbox WHERE seq <= ?", after); this.acked = after; this.spend(); } // acked
       this.touchHost();

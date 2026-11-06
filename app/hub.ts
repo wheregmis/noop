@@ -1,3 +1,8 @@
+import { deviceTimeZone } from "./notify";
+import { providerLabel, type ProviderStatus, type ToolPolicy, type ToolPolicyView } from "../cloud/src/providers";
+import { validAutonomyLevel, type AutonomyLevel, type AutonomyPolicy } from "../cloud/src/configuration";
+import { readLearningRunResult, readLearningDiscardResult, type LearningPreview, type LearningRunRequest } from "../cloud/src/learning";
+import type { PendingStops, StopOwner, StopReviewAudit } from "../cloud/src/stop-intents";
 // noop: the server's shapes and the pure logic of the timeline (no UI, no I/O), shared by App.tsx and the tests.
 
 export type Kind = "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system";
@@ -17,16 +22,17 @@ export type HubEvent = {
 };
 
 export type HostInfo = {
-  host: string;
+  host: string; providers?: ProviderStatus[];
   caps: string[];
+  online?: boolean; enabled?: boolean; max_parallel?: number | null; custom_caps?: string[];
   seen?: string;
   busy?: number;
-  stats?: { loadRatio?: number; load1?: number; cores?: number; memFreePct?: number; diskFreeGB?: number; diskFreePct?: number; [k: string]: unknown };
+  stats?: { loadRatio?: number; load1?: number; cores?: number; memFreePct?: number; diskFreeGB?: number; diskFreePct?: number; diskPath?: string; diskError?: string; [k: string]: unknown };
   os?: string;
   arch?: string;
   clis?: string[];
-  accounts?: { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string }[];
-  running?: { id: string; title: string; agent: string; started?: string; activity?: Activity }[];
+  accounts?: { cli: string; name: string; state: "unknown" | "ok" | "cooldown" | "login"; until?: string }[];
+  running?: { id: string; title: string; agent: string; run_id?: string; started?: string; activity?: Activity }[];
   recent?: { id: string; title: string; state?: string; finished?: string }[];
   /** The code the machine runs: its git commit, and that commit on GitHub. */
   rev?: string;
@@ -48,9 +54,11 @@ export function activityLine(a: Activity | undefined, now = Date.now()): { text:
 }
 
 export type TaskInfo = {
-  id: string; title: string; agent: string; host?: string; state?: string;
+  id: string; title: string; agent: string; host?: string; run_id?: string; state?: string; stops?: PendingStops; stops_error?: string; stop_owner?: StopOwner; stop_reviews?: StopReviewAudit[];
+  learning_host?: string; learning_host_error?: string;
   /** state "nohost": what the task needs that no online machine has ("os:windows"). */
   needs?: string;
+  requires?: string; target_host?: string; configured_cli?: string; priority?: string; prefer?: string; weight?: string; project?: string; repo?: string;
   started?: string; created?: string; finished?: string; updated?: string; attempt?: string; decision?: string; cli?: string; model?: string;
   request?: string;
   /** state "active": its agent's latest sign of life. */
@@ -60,7 +68,7 @@ export type TaskInfo = {
 };
 
 export type PlanStepInfo = { id: string; title: string; details: string; agent: string; checkpoint: boolean; status: "pending" | "running" | "done" | "stopped" | "skipped"; task?: string; result?: string };
-export type PlanInfo = { id: string; goal: string; project?: string; agent: string; status: "drafting" | "review" | "running" | "paused" | "done" | "cancelled"; branch: string; notes: string[]; steps: PlanStepInfo[]; reason?: string };
+export type PlanInfo = { id: string; goal: string; project?: string; agent: string; status: "drafting" | "review" | "running" | "paused" | "done" | "cancelled"; branch: string; notes: string[]; steps: PlanStepInfo[]; reason?: string; pending_stops?: PendingStops; stop_reviews?: StopReviewAudit[] };
 export type PlanSummary = { id: string; goal: string; status: PlanInfo["status"]; project?: string; reason?: string; done: number; total: number };
 /** What a plan's status says to the owner. */
 export const PLAN_STATUS: Record<PlanInfo["status"], string> = { drafting: "Drafting", review: "Needs your review", running: "Running", paused: "Paused", done: "Done", cancelled: "Cancelled" };
@@ -71,13 +79,14 @@ export type Status = {
   recent?: TaskInfo[];
   decisions: { id: string; kind: string; question?: string; held: boolean }[];
   hosts: HostInfo[];
+  offline_hosts?: HostInfo[];
   /** The owner's latest "update every machine" request. */
   update?: { at: string };
 };
 
 /** An item id the owner answers: decisions, proposals (lists to approve) and logins. */
-export const ITEM_ID = /^[DLP]-[A-Z]?\d{4}$/;
-const LEADING_ID = /^\s*([DLP]-[A-Z]?\d{4})\b/;
+export const ITEM_ID = /^(?:[DP]-[A-Z]?\d{4}|L-\d{4,})$/;
+const LEADING_ID = /^\s*((?:[DP]-[A-Z]?\d{4}|L-\d{4,}))\b/;
 
 /** Events that ask the owner something, shown as a card with buttons. */
 export function isAsk(e: HubEvent): boolean {
@@ -224,11 +233,15 @@ export function filePath(uri: string): string {
 // ---------------------------------------------------------------- team settings (GET / PUT /api/settings)
 
 export type Autonomy = "onboarding" | "assisted" | "autonomous" | (string & {});
-export type Project = { id: string; name: string; path: string; host: string; repo: string; instructions: string; exists: boolean };
+export type Project = { id: string; name: string; path: string; host: string; repo: string; instructions: string; exists: boolean | null; requires?: string[]; custom_repo?: string | null; custom_requires?: string[]; detected_repo?: string; detected_requires?: string[]; checked?: string };
 export type SettingsView = {
   current: Record<string, unknown>;
   effective: {
-    agents: { id: string; title?: string; about?: string; clis: string[]; autonomy: Autonomy }[];
+    primary_host?: string;
+    enabled_clis?: string[];
+    agents: { id: string; title?: string; about?: string; clis: string[]; paused?: boolean; tool_policy?: ToolPolicy; autonomy: Autonomy; autonomy_inherited?: boolean; autonomy_policy?: AutonomyPolicy }[];
+    tool_policy?: ToolPolicyView;
+    autonomy_policy_version?: number;
     projects?: Project[]; // absent from a hub that doesn't have them yet
     autonomy: Autonomy;
     routines: { name: string; desc?: string; every: string; agent: string; enabled: boolean; readonly?: boolean; project?: string; kind?: string }[];
@@ -238,6 +251,16 @@ export type SettingsView = {
   options: { clis: string[][]; autonomy: string[] };
 };
 
+/** A cloud hub has no settings snapshot until its main machine connects. */
+export function settingsSnapshot(value: unknown): value is SettingsView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Partial<SettingsView>, e = v.effective, o = v.options;
+  return !!v.current && typeof v.current === "object" && !Array.isArray(v.current) && !!e && !!o
+    && Array.isArray(e.agents) && e.agents.every((agent) => !!agent && typeof agent.id === "string" && Array.isArray(agent.clis) && agent.clis.every((id) => typeof id === "string"))
+    && Array.isArray(e.routines) && e.routines.every((routine) => !!routine && typeof routine.name === "string")
+    && Array.isArray(o.clis) && o.clis.every((order) => Array.isArray(order) && order.every((id) => typeof id === "string")) && Array.isArray(o.autonomy);
+}
+
 const CLI_LABELS: Record<string, string> = {
   claude: "Claude only",
   "codex,claude": "Codex → Claude",
@@ -245,9 +268,49 @@ const CLI_LABELS: Record<string, string> = {
   codex: "Codex only",
 };
 export const cliKey = (clis: string[]) => clis.join(",");
-export const cliLabel = (clis: string[]) => CLI_LABELS[cliKey(clis)] ?? clis.join(" → ");
+export const cliLabel = (clis: string[]) => !clis.length ? "Paused" : Object.prototype.hasOwnProperty.call(CLI_LABELS, cliKey(clis)) ? CLI_LABELS[cliKey(clis)]! : clis.map(providerLabel).join(" → ");
+export function readToolPolicy(value: unknown): ToolPolicy | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const order = (x: unknown): x is string[] => Array.isArray(x) && x.length <= 64 && x.every((id) => typeof id === "string" && id.length > 0 && id.length <= 80 && !/[\p{Cc}\p{Cs}]/u.test(id));
+  if (!(v.configured === null || order(v.configured)) || !order(v.effective) || !(v.file_default === null || order(v.file_default))
+    || typeof v.source !== "string" || !["ui", "local_file", "shared_file", "default"].includes(v.source) || typeof v.file_source !== "string" || !["local_file", "shared_file", "default"].includes(v.file_source)
+    || v.invalid !== undefined && typeof v.invalid !== "boolean" || v.file_invalid !== undefined && typeof v.file_invalid !== "boolean") return null;
+  return v as unknown as ToolPolicy;
+}
+export function readToolPolicyView(value: unknown): ToolPolicyView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as { version?: unknown; team?: unknown }, team = readToolPolicy(v.team);
+  return v.version === 1 && team ? { version: 1, team } : null;
+}
+export function readAutonomyPolicy(value: unknown): AutonomyPolicy | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (!(v.configured === null || validAutonomyLevel(v.configured)) || !validAutonomyLevel(v.effective) || !(v.file_default === null || validAutonomyLevel(v.file_default))
+    || typeof v.source !== "string" || !["ui", "local_file", "shared_file", "default"].includes(v.source) || typeof v.file_source !== "string" || !["local_file", "shared_file", "default"].includes(v.file_source)
+    || v.invalid !== undefined && typeof v.invalid !== "boolean" || v.file_invalid !== undefined && typeof v.file_invalid !== "boolean"
+    || v.invalid === true && (v.configured !== "onboarding" || v.effective !== "onboarding") || v.file_invalid === true && v.file_default !== "onboarding"
+    || v.configured !== null && v.effective !== v.configured) return null;
+  return v as unknown as AutonomyPolicy;
+}
+/** A learning receipt must describe the exact machine, authorization, reviewed counts and any earlier task identity. */
+export function learningReceipt(value: unknown, host: string, request: LearningRunRequest, preview: LearningPreview, knownId?: string) {
+  const result = readLearningRunResult(value);
+  return result && result.host === host && result.request_id === request.request_id && result.preview_digest === request.preview_digest
+    && preview.host === host && preview.preview_digest === request.preview_digest && result.turns === preview.turns && result.sessions === preview.sessions && result.truncated === preview.truncated
+    && (!knownId || result.id === knownId) && (result.id === null || result.id.length <= 80) ? result : undefined;
+}
+export function learningRelease(value: unknown, host: string, request: LearningRunRequest, knownId?: string) {
+  const result = readLearningDiscardResult(value);
+  return result && result.host === host && result.request_id === request.request_id && result.preview_digest === request.preview_digest
+    && (!knownId || result.id === knownId) && (result.id === null || result.id.length <= 80) ? result : undefined;
+}
+export function learningTaskId(value: Record<string, unknown>, host: string, request: LearningRunRequest, knownId?: string) {
+  return value.host === host && value.request_id === request.request_id && value.preview_digest === request.preview_digest
+    && typeof value.id === "string" && value.id.length <= 80 && /^T-[\w-]*\d{4}$/.test(value.id) && (!knownId || value.id === knownId) ? value.id : undefined;
+}
 const AUTONOMY_LABELS: Record<string, string> = { onboarding: "Learning", assisted: "Assisted", autonomous: "Autonomous" };
-export const autonomyLabel = (a: string) => AUTONOMY_LABELS[a] ?? a;
+export const autonomyLabel = (a: string) => Object.prototype.hasOwnProperty.call(AUTONOMY_LABELS, a) ? AUTONOMY_LABELS[a]! : a;
 export const INTERVALS = ["15m", "30m", "1h", "2h", "6h", "1d"];
 const DAYS: Record<string, string> = { MON: "Monday", TUE: "Tuesday", WED: "Wednesday", THU: "Thursday", FRI: "Friday", SAT: "Saturday", SUN: "Sunday" };
 /** A routine's schedule in words: "30m" → Every 30 minutes, "weekly FRI 17:00" → Every Friday 17:00. */
@@ -273,7 +336,11 @@ export const mediaDaysOf = (v: SettingsView | null | undefined): number => {
 
 export const patches = {
   clis: (agent: string, clis: string[]) => ({ clis: { agents: { [agent]: clis } } }),
-  autonomy: (agent: string, level: string) => ({ autonomy: { agents: { [agent]: level } } }),
+  toolOrder: (agent: string | undefined, order: string[] | null) => ({ tool_policy_version: 1, clis: agent ? { agents: { [agent]: order } } : { preference: order } }),
+  toolReset: (agent?: string) => ({ tool_policy_version: 1, clis: { reset: [agent ? `agents.${agent}` : "preference"] } }),
+  autonomyPolicy: (agent: string, level: AutonomyLevel | null) => ({ autonomy_policy_version: 1, autonomy: { agents: { [agent]: level } } }),
+  autonomyReset: (agent: string) => ({ autonomy_policy_version: 1, autonomy: { reset: [`agents.${agent}`] } }),
+  autonomy: (agent: string, level: string | null) => ({ autonomy: { agents: { [agent]: level } } }),
   routine: (name: string, change: { enabled?: boolean; every?: string }) => ({ routines: { [name]: change } }),
   maxParallel: (n: number) => ({ host: { max_parallel: n } }),
   mediaDays: (days: number) => ({ media_days: days }),
@@ -333,10 +400,15 @@ export const QUIET_PRESETS: { label: string; value: QuietHours }[] = [
 export const quietKey = (q: QuietHours) => (q ? `${q.start}-${q.end}` : "off");
 
 /** The saved preferences (every kind on and no quiet hours until the owner changes them). */
-export function notifyPrefsOf(view: SettingsView | null, tz: string): NotifyPrefs {
-  const saved = (view?.current?.notify_prefs ?? {}) as Partial<NotifyPrefs>;
+export function notifyPrefsOf(view: SettingsView | null, tz = deviceTimeZone()): NotifyPrefs {
+  const saved = (view?.current?.notify_prefs ?? {}) as Partial<Omit<NotifyPrefs, "quiet_hours">> & { quiet_hours?: QuietHours | string };
   const kinds = Object.fromEntries(NOTIFY_KINDS.map(([k]) => [k, saved.kinds?.[k] ?? true])) as Record<NotifyKind, boolean>;
-  return { kinds, quiet_hours: saved.quiet_hours ?? null, tz: saved.tz ?? tz };
+  let quiet = saved.quiet_hours;
+  if (typeof quiet === "string") {
+    const range = quiet.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    quiet = range ? { start: `${range[1].padStart(2, "0")}:${range[2]}`, end: `${range[3].padStart(2, "0")}:${range[4]}` } : null;
+  }
+  return { kinds, quiet_hours: quiet ?? null, tz: saved.tz ?? tz };
 }
 export const notifyPatch = (prefs: NotifyPrefs) => ({ notify_prefs: prefs });
 
@@ -347,7 +419,7 @@ export function firstUnread(events: HubEvent[], seenTs: string | null): string |
   return e ? e.id : null;
 }
 
-// ---------------------------------------------------------------- the team's rules and memory (read-only views)
+// ---------------------------------------------------------------- the team's rules and memory
 
 export type DataFile = { path: string; size: number; updated?: string; version?: number };
 export type RuleItem = { path: string; title: string; detail: string };
@@ -380,6 +452,9 @@ export const stripFrontMatter = (s: string) => s.replace(/^---\r?\n[\s\S]*?\r?\n
 
 /** A task's hard requirement as words: "os:windows" → "Windows machine". */
 export function needsLabel(needs = ""): string {
+  if (needs === "enabled-ai-tool") return "enabled AI tool (check AI tools & onboarding)";
+  if (/^cli:[^,]+$/.test(needs)) return `machine with ${needs.split("|").map((part) => providerLabel(part.replace(/^cli:/, ""))).join(" or ")}`;
+  if (needs === "accepting-tasks") return "machine accepting tasks";
   const os: Record<string, string> = { windows: "Windows", linux: "Linux", macos: "Mac", darwin: "Mac", ios: "iOS", android: "Android" };
   const parts = needs.split(",").map((x) => x.trim()).filter(Boolean);
   const o = parts.find((x) => x.startsWith("os:"));

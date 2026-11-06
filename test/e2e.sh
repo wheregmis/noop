@@ -2,14 +2,21 @@
 # End-to-end: sandbox data mirror synced to an offline fake of the Worker files API
 # (HUB_SYNC_FAKE = the real cloud/src/files.ts over a local SQLite file), fake agent CLIs, run ticks.
 set -euo pipefail
+if [ "${NOOP_E2E_CLEAN:-}" != 1 ]; then
+  exec env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin NOOP_E2E_CLEAN=1 NOOP_E2E_BUN="$(command -v bun)" /bin/bash "$0"
+fi
 SRC=$(cd "$(dirname "$0")/.." && pwd)
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-export HUB_DATA="$W/data" HUB_HOST=pc HUB_SYNC_FAKE="$W/worker.sqlite"
+W=$(mktemp -d /tmp/noop-e2e.XXXXXX); trap 'rm -rf "$W"' EXIT
+mkdir -p "$W/home" "$W/tmp" "$W/bin"
+ln -s "${NOOP_E2E_BUN:?}" "$W/bin/bun"
+export PATH="$W/bin:/usr/bin:/bin:/usr/sbin:/sbin" NOOP_HOME="$W/home" TMPDIR="$W/tmp"
+export HUB_DATA="$W/data" HUB_HOST=pc HUB_SYNC_FAKE="$W/worker.sqlite" HUB_NO_MEDIC=1
 cd "$SRC"; hub() { bun "$SRC/src/cli.ts" "$@"; }
 hub init --primary >/dev/null
 cd "$W/data"
 cat > "$W/fake-agent" <<'F'
 #!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then echo noop-fixture-1; exit; fi
 p=$(cat)
 if grep -q "You are the owner.s JUDGE" <<<"$p"; then echo '```json
 {"verdict":"hold","reason":"new taste call"}
@@ -31,7 +38,7 @@ elif grep -q "^# Task T-[0-9]*: PLANSTEP" <<<"$p"; then
 {"status":"done","summary":"finished '"$n"'"}
 ```'; fi
 elif grep -q "^# Task T-[0-9]*: SPLIT" <<<"$p" && ! grep -q "Results from delegated subtasks" <<<"$p"; then echo '```json
-{"status":"delegated","summary":"split in two","followups":[{"title":"part one","agent":"reviewer"},{"title":"part two","agent":"rust-maintainer"}]}
+{"status":"delegated","summary":"split in two","followups":[{"title":"part one","agent":"reviewer"},{"title":"part two","agent":"maintainer"}]}
 ```'
 elif grep -q "^# Task T-[0-9]*: part" <<<"$p"; then echo '```json
 {"status":"done","summary":"part finished"}
@@ -54,14 +61,29 @@ cli = "claude"
 [autonomy]
 batch_minutes = 0
 [clis]
-routine_agents = []
+enabled = ["claude"]
+preference = ["claude"]
 [idle]
 enabled = false
+[resources]
+cleanup_enabled = false
+[[accounts]]
+cli = "claude"
+name = "fixture"
+dir = "$W/provider-home"
 F
 # judge uses 'claude' binary directly → shim PATH
-mkdir -p "$W/bin"; ln -s "$W/fake-agent" "$W/bin/claude"; export PATH="$W/bin:$PATH"
+ln -s "$W/fake-agent" "$W/bin/claude"
+cat > "$W/bin/gh" <<'F'
+#!/bin/sh
+if [ "$*" != 'api rate_limit' ]; then echo 'unexpected fixture gh call' >&2; exit 1; fi
+printf '%s\n' '{"resources":{"core":{"remaining":5000,"reset":4102444800},"graphql":{"remaining":5000,"reset":4102444800}}}'
+F
+chmod +x "$W/bin/gh"
+hub role add maintainer >/dev/null
+hub role add release-manager >/dev/null
 sed -i.bak 's/^\[\[routine\]\]/[[routine_disabled]]/' config.toml && rm config.toml.bak
-hub add "plain task" -a rust-maintainer >/dev/null
+hub add "plain task" -a maintainer >/dev/null
 hub add "ASKME task" -a release-manager >/dev/null
 hub add "windows only" -r os:windows >/dev/null
 # how many tasks one tick runs depends on the host load (a busy macOS runner runs one), so tick until a condition holds
@@ -80,7 +102,7 @@ grep -q "owner likes options" agents/release-manager/memory.md
 test "$(bun -e "import {Database} from 'bun:sqlite'; console.log(new Database('$W/worker.sqlite').query('SELECT COUNT(DISTINCT ts) AS n FROM history').get().n)")" -gt 5
 # onboarding: self-generated (routine) work waits for approval; owner-derived follow-ups do not
 ls tasks/done/T-0004.md >/dev/null   # follow-up of an owner task ran without approval
-RT=$(bun -e "import {newTask,setApprovalGate} from '$SRC/src/core.ts'; import {needsApproval} from '$SRC/src/autonomy.ts'; import {loadConfig} from '$SRC/src/core.ts'; setApprovalGate(s=>needsApproval(loadConfig(),s)); console.log(newTask('routine job','x',{source:'routine:pr-review'}))")
+RT=$(bun -e "import {newTask,setApprovalGate} from '$SRC/src/core.ts'; import {needsApproval} from '$SRC/src/autonomy.ts'; import {loadConfig} from '$SRC/src/core.ts'; setApprovalGate((s,a)=>needsApproval(loadConfig(),s,a)); console.log(newTask('routine job','x',{source:'routine:pr-review'}))")
 test -f tasks/proposed/$RT.md
 hub tick >/dev/null
 P=$(ls decisions/open | grep '^P-' | head -1 | sed 's/.md//'); test -n "$P"
@@ -124,7 +146,7 @@ hub plan continue "$PL" also do more >/dev/null
 tick_until 'pstat | grep -q "^review"'
 test "$(pstat)" = "review done,done,done,pending,pending,pending"
 # a second host joins and mirrors the same data
-HUB_DATA="$W/w2/data" HUB_HOST=w2 bun "$SRC/src/cli.ts" init --worker http://unused --token x >/dev/null
+NOOP_HOME="$W/w2/home" HUB_DATA="$W/w2/data" HUB_HOST=w2 bun "$SRC/src/cli.ts" init --worker http://unused --token x >/dev/null
 cmp tasks/done/T-0001.md "$W/w2/data/tasks/done/T-0001.md"
 test ! -e "$W/w2/data/config.local.toml.pc" && ! grep -q fake-agent "$W/w2/data/config.local.toml"
 echo "E2E OK"; cat journal/*.md

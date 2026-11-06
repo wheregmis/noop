@@ -37,9 +37,10 @@ export function writeHubToml(patch: Record<string, Record<string, string>>) {
   const q = (v: unknown) => JSON.stringify(String(v));
   const text = "# machine-local Noop bootstrap (never synced): your Worker URL + this machine's token\n" +
     Object.entries(cur).map(([s, kv]) => `[${s}]\n${Object.entries(kv as object).map(([k, v]) => `${k} = ${q(v)}`).join("\n")}\n`).join("\n");
-  mkdirSync(dirname(hubTomlPath()), { recursive: true });
-  writeFileSync(hubTomlPath(), text);
-  try { chmodSync(hubTomlPath(), 0o600); } catch {}
+  const file = hubTomlPath(), temporary = `${file}.${crypto.randomUUID()}.tmp`;
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  try { writeFileSync(temporary, text, { mode: 0o600, flag: "wx" }); renameSync(temporary, file); }
+  finally { rmSync(temporary, { force: true }); }
 }
 
 // ------------------------------------------------------------------ transport

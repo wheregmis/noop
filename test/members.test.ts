@@ -6,10 +6,13 @@ import { RequestError, createMember, deleteBlockers, deleteMember, parseProfile,
 import { agentRole, memberRoute, settingsView } from "../src/server";
 import { buildPrompt } from "../src/runner";
 
+const RECORD_IO = { pull: async () => true, push: async () => true };
+
 const FORM = { title: "Backend Engineer", name: "Ada", about: "owns the API", instructions: "Run the tests first.\n\nName: not this one" };
 const status = (fn: () => unknown) => { try { fn(); return 0; } catch (e) { return (e as RequestError).status; } };
 
 beforeEach(() => {
+  mkdirSync(P("journal"), { recursive: true });
   for (const d of ["agents", "tasks", "archive"]) rmSync(P(d), { recursive: true, force: true });
   rmSync(P("settings.json"), { force: true });
   mkdirSync(P("agents"), { recursive: true });
@@ -98,7 +101,7 @@ test("a member with work left can't be deleted", () => {
 
 test("the API creates, reads, edits and deletes, and reports errors", async () => {
   const call = async (method: string, id?: string, body?: unknown) => {
-    const r = await memberRoute(new Request("http://x/api/members", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id);
+    const r = await memberRoute(new Request("http://x/api/members", { method, body: body === undefined ? undefined : JSON.stringify(body) }), id, RECORD_IO);
     return { status: r.status, data: (await r.json()) as any };
   };
   const made = await call("POST", undefined, FORM);

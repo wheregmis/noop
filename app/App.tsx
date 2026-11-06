@@ -1,3 +1,12 @@
+import { DEFAULT_PROVIDERS, PROVIDER_IDS, providerLabel, providerOrders, type ProviderStatus, type ToolPolicy } from "../cloud/src/providers";
+import { encodeAccountSegment, validMachineHost, validRunId, type ProjectFolderCheck } from "../cloud/src/machine-requests";
+import { hasPendingStops, pendingStopsError, pendingStopsView, readPendingStops, readStopReviewPreview, readStopReviewAudit, validStopResolveRequest, type PendingStops, type StopOwner, type StopReviewPreview, type StopResolveRequest, type StopReviewAudit } from "../cloud/src/stop-intents";
+import { ARCHIVE_KINDS, readArchiveList, readArchivePreview, readArchiveRestoreResult, type ArchiveKind, type ArchiveItem, type ArchivePreview, type ArchiveRestoreRequest, type ArchiveRestoreResult } from "../cloud/src/archives";
+import { readTaskFormResult, readTaskReopenPreview, validTaskCreateRequest, validTaskReopenRequest, type TaskCreateRequest, type TaskReopenRequest, type TaskReopenPreview, type TaskFormResult, type TaskRunSettings } from "../cloud/src/task-forms";
+import { machineLearningPath, readLearningStatus, readLearningPreview, type LearningStatus, type LearningPreview, type LearningRunRequest, type LearningRunResult } from "../cloud/src/learning";
+import { createPendingStore, intentScope, type PendingEntry } from "./pending-intents";
+import { createIntentStorage } from "./intent-storage";
+import { editableDocument, documentBody } from "../cloud/src/documents";
 // noop chat client: one TSX app for the web (served by the hub), macOS, Linux and phones.
 // Design: the NSH gallery's (~/work/nsh/examples/gallery): its theme tokens (theme.json is the
 // gallery's), its shared UI layer (nsh-gallery-ui: palette, icons, tooltips, scroll bars), its
@@ -35,6 +44,7 @@ import type { InputRef, JSX, SpeechSession, ViewStyle } from "nsh";
 import { AlertDialog, ContextMenu, Dialog, Menu, MenuItem, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline } from "nsh/base";
 import { isAvailable as hasWindow, titleBar, Window } from "nsh/desktop";
 import { checkForUpdate, downloadUpdate, installAndRestart } from "nsh/updater";
+import { AUTONOMY_LEVELS, CONFIGURATION_FIELDS, CONFIGURATION_GROUPS, MACHINE_CONFIGURATION_FIELDS, validAutonomyLevel, type AutonomyLevel, type ConfigValue, type ConfigurationField } from "../cloud/src/configuration";
 import { CHECK_EVERY_MS, createUpdates, type UpdateState } from "./update";
 import {
   alpha,
@@ -82,6 +92,12 @@ import {
   autonomyLabel,
   cliKey,
   cliLabel,
+  readToolPolicy,
+  readToolPolicyView,
+  readAutonomyPolicy,
+  learningReceipt,
+  learningRelease,
+  learningTaskId,
   intervalsWith,
   activityLine,
   everyLabel,
@@ -89,6 +105,7 @@ import {
   MEDIA_DAYS,
   mediaDaysOf,
   type SettingsView,
+  settingsSnapshot,
   NOTIFY_KINDS,
   type NotifyKind,
   type NotifyPrefs,
@@ -122,7 +139,7 @@ import {
   isQueued,
   type TaskInfo,
 } from "./hub";
-import { notificationFor, type NotifyRules } from "./notify";
+import { deviceTimeZone, notificationTimeZone, notificationFor, type NotifyRules } from "./notify";
 
 type Config = { url: string; token: string };
 /** `token` holds the login session (sent as `Bearer`, and `?token=` on the WebSocket and media URLs). */
@@ -190,6 +207,7 @@ type Conn = "connecting" | "live" | "offline" | "unauthorized";
 
 /** Failed reconnects in a row before the owner hears about it; anything shorter recovers silently. */
 const OFFLINE_AFTER = 5;
+const newRequestKey = () => `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 function createHub(cfg: Config) {
   const events = signal<HubEvent[]>([]);
@@ -266,42 +284,227 @@ function createHub(cfg: Config) {
     return ((await r.json()) as { url: string }).url;
   }
 
-  async function send(text: string, replyTo: string | null, files: Attachment[] = [], thread = false) {
-    const attachments: string[] = [];
-    for (const f of files) attachments.push(await upload(f));
+  const pendingMessages = new Map<string, string>(), messageUploads = new Map<string, string[]>();
+  const stopReviews = signal(new Map<string, { intent: StopReviewIntent; preview?: StopReviewPreview }>());
+  const taskDrafts = new Map<string, Signal<string>>();
+  const archiveRestores = signal(new Map<string, { request: ArchiveRestoreRequest; preview: ArchivePreview }>());
+  const taskForms = signal(new Map<string, TaskFormState>());
+  const savedEntries = signal<PendingEntry[]>([]), savedReady = signal(false), savedLoading = signal(false), savedError = signal("");
+  const scope = intentScope(cfg.url, cfg.token), pendingStore = createPendingStore(createIntentStorage(scope), scope);
+  const savedAt = (kind: PendingEntry["kind"], key: string) => savedEntries().find((entry) => entry.kind === kind && entry.key === key)?.at ?? new Date().toISOString();
+  function restorePending(entries: PendingEntry[]) {
+    const tasks = new Map(taskForms()), archives = new Map(archiveRestores()), stops = new Map(stopReviews());
+    const retained = (kind: PendingEntry["kind"], key: string, id: string) => entries.some((entry) => entry.kind === kind && entry.key === key && entry.request.request_id === id);
+    for (const [key, state] of tasks) if (state.pending() && !retained("task", key, state.pending()!.request_id)) clearTaskRequest(state, key);
+    for (const [key, state] of archives) if (!retained("archive", key, state.request.request_id)) archives.delete(key);
+    for (const [key, state] of stops) if (!retained("stop", key, state.intent.request_id)) stops.delete(key);
+    for (const entry of entries) {
+      // Requests discovered during a reload stay in Saved requests without replacing an open unsent draft.
+      if (savedReady() && !(entry.kind === "task" ? tasks.get(entry.key)?.pending() : entry.kind === "archive" ? archives.has(entry.key) : stops.has(entry.key))) continue;
+      if (entry.kind === "task") {
+        const previous = tasks.get(entry.key);
+        const state = previous ?? newTaskFormState();
+        if (!previous?.pending() || previous.pending()!.request_id !== entry.request.request_id) {
+          fillTaskRunDraft(state.draft, entry.request.settings); state.instructions.set(entry.request.instructions);
+          state.preview.set(entry.preview); state.pending.set(entry.request); state.result.set(undefined); state.initialized = true;
+        }
+        if (entry.known_id || "id" in entry.request) state.knownId.set(entry.known_id ?? (entry.request as TaskReopenRequest).id);
+        tasks.set(entry.key, state);
+      } else if (entry.kind === "archive") {
+        if (archives.get(entry.key)?.request.request_id !== entry.request.request_id) archives.set(entry.key, { request: entry.request, preview: entry.preview });
+      } else if (entry.kind === "stop" && stops.get(entry.key)?.intent.request_id !== entry.request.request_id) stops.set(entry.key, { intent: entry.request, preview: entry.preview });
+    }
+    taskForms.set(tasks); archiveRestores.set(archives); stopReviews.set(stops);
+  }
+  async function reloadSaved() {
+    if (savedLoading() || disposed) return false;
+    savedLoading.set(true);
+    try {
+      const entries = await pendingStore.load();
+      if (disposed) return false;
+      savedEntries.set(entries); restorePending(entries); savedError.set(""); return true;
+    } catch (error) { if (!disposed) savedError.set(String((error as Error).message ?? error)); return false; }
+    finally { savedLoading.set(false); savedReady.set(true); }
+  }
+  async function keepPending(entry: PendingEntry) {
+    if (disposed || !savedReady() || savedLoading()) return false;
+    try {
+      await pendingStore.put(entry);
+      if (disposed) return false;
+      savedEntries.set(pendingStore.entries()); savedError.set(""); return true;
+    } catch (error) { savedError.set(String((error as Error).message ?? error)); return false; }
+  }
+  async function dropPending(kind: PendingEntry["kind"], key: string, requestId: string) {
+    if (disposed || savedLoading()) return false;
+    try {
+      await pendingStore.remove(kind, key, requestId);
+      if (disposed) return false;
+      savedEntries.set(pendingStore.entries()); savedError.set(""); return true;
+    } catch (error) { savedError.set(String((error as Error).message ?? error)); return false; }
+  }
+  async function resetSaved() {
+    if (disposed || savedLoading()) return false;
+    savedLoading.set(true);
+    try {
+      await pendingStore.reset();
+      if (disposed) return false;
+      for (const [key, state] of taskForms()) if (state.pending()) clearTaskRequest(state, key);
+      archiveRestores.set(new Map()); stopReviews.set(new Map()); savedEntries.set([]); savedError.set(""); return true;
+    } catch (error) { savedError.set(String((error as Error).message ?? error)); return false; }
+    finally { savedLoading.set(false); savedReady.set(true); }
+  }
+  async function send(text: string, replyTo: string | null, files: Attachment[] = [], thread = false, messageKey?: string) {
+    const intent = JSON.stringify([text, replyTo, thread, files.map((file) => file.name)]);
+    const key = messageKey ?? pendingMessages.get(intent) ?? newRequestKey();
+    pendingMessages.set(intent, key);
+    const attachments = messageUploads.get(key) ?? [];
+    messageUploads.set(key, attachments);
+    for (let index = attachments.length; index < files.length; index++) attachments.push(await upload(files[index]!));
     const r = await fetch(`${cfg.url}/api/messages`, {
       method: "POST",
-      headers,
+      headers: { ...headers, "Idempotency-Key": key },
       body: JSON.stringify({ text, ...(replyTo ? { reply_to: replyTo } : {}), ...(attachments.length ? { attachments } : {}), ...(thread ? { thread } : {}) }),
     });
     if (r.status === 401) conn.set("unauthorized");
-    if (!r.ok) throw new Error(`Send failed (${r.status})`);
-    const ev = (await r.json()) as HubEvent;
-    if (ev?.id) events.update((evs) => merge(evs, [ev]));
+    const raw = await r.json().catch(() => null);
+    const data = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    if (!r.ok) throw Object.assign(new Error(String(data.error ?? `Send failed (${r.status})`)), {
+      saved_locally: data.saved_locally === true,
+      id: typeof data.id === "string" && /^(?:T-[A-Z]?\d{4,}|PL-[A-Z]?\d+)$/.test(data.id) ? data.id : undefined,
+    });
+    if (typeof data.id !== "string" || !data.id || typeof data.ts !== "string" || data.from !== "owner" || data.kind !== "owner" || typeof data.text !== "string")
+      throw new Error("Couldn't confirm delivery. Retry to check the same request.");
+    if (pendingMessages.get(intent) === key) pendingMessages.delete(intent);
+    messageUploads.delete(key);
+    const ev = data as unknown as HubEvent;
+    events.update((evs) => merge(evs, [ev]));
     loadStatus();
   }
 
-  async function settings(patch?: Record<string, unknown>): Promise<SettingsView> {
-    const r = await fetch(`${cfg.url}/api/settings`, patch ? { method: "PUT", headers, body: JSON.stringify(patch) } : { headers });
-    if (r.status === 401) conn.set("unauthorized");
-    if (!r.ok) throw new Error(`Couldn't ${patch ? "save" : "load"} settings (${r.status})`);
-    return (await r.json()) as SettingsView;
+  async function settings(patch?: Record<string, unknown>, requestKey?: string): Promise<SettingsView> {
+    const r = await api(patch ? "PUT" : "GET", "/api/settings", patch, requestKey);
+    if (!r.ok) throw new Error(String(r.data.error ?? `Couldn't ${patch ? "save" : "load"} settings (${r.status})`));
+    if (!settingsSnapshot(r.data)) throw new Error("Connect the main machine to load team settings, then reopen Settings.");
+    return r.data;
   }
 
   /** A JSON call of the hub's API: never throws (status 0 when unreachable); a 401 ends the session. */
-  async function api(method: string, path: string, body?: unknown): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }> {
+  const formTickets = new Map<string, string>();
+  const learningAttempts = new Map<string, string>();
+  const controlKeys = new Map<string, string>();
+  const discardPolicyConfirmation = (patch: Record<string, unknown>, requestKey: string) => {
+    if (patch.tool_policy_version === 1 || patch.autonomy_policy_version === 1) formTickets.delete(JSON.stringify(["PUT", "/api/settings", patch, requestKey]));
+  };
+  function learningRun(host: string, request: LearningRunRequest, discard = false) {
+    const path = `/api/machines/${encodeURIComponent(host)}/learning/${discard ? "discard" : "run"}`, identity = JSON.stringify(["POST", path, request]);
+    const previous = learningAttempts.get(identity);
+    if (previous) formTickets.delete(JSON.stringify(["POST", path, request, previous]));
+    const key = newRequestKey(); learningAttempts.set(identity, key);
+    return api("POST", path, request, key);
+  }
+  async function api(method: string, path: string, body?: unknown, requestKey?: string): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }> {
+    if (disposed) return { ok: false, status: 0, data: { error: "This connection was closed. Open the saved request after reconnecting." } };
+    const machine = /^\/api\/machines\/[^/]+\/(?:accounts(?:\/|$)|project-folder-check$|learning(?:\/|$))/.test(path) || path.startsWith("/api/machine-requests/");
+    const keyBody = machine && path.endsWith("/code") ? { id: (body as { id?: string } | undefined)?.id } : body;
+    const key = JSON.stringify(requestKey ? [method, path, keyBody, requestKey] : [method, path, keyBody]);
+    let ticket = formTickets.get(key);
+    const controlKey = method === "POST" && path === "/api/tasks/cancel" ? requestKey ?? controlKeys.get(key) ?? newRequestKey() : undefined;
+    if (controlKey) controlKeys.set(key, controlKey);
+    const confirmation = machine ? "/api/machine-requests/" : "/api/ui-requests/";
+    const pendingNote = (error: string) => ({ error, pending: !!ticket, ...(machine && ticket ? { confirmation: `${confirmation}${ticket}` } : {}) });
     try {
-      const r = await fetch(`${cfg.url}${path}`, method === "GET" ? { headers } : { method, headers, body: JSON.stringify(body ?? {}) });
-      if (r.status === 401) conn.set("unauthorized");
-      let data: Record<string, unknown> = {};
-      try {
-        data = ((await r.json()) ?? {}) as Record<string, unknown>;
-      } catch {
-        /* no body */
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (disposed) return { ok: false, status: 0, data: { error: "This connection was closed. Check the saved request after reconnecting." } };
+        const r = ticket
+          ? await fetch(`${cfg.url}${confirmation}${ticket}`, { headers })
+          : await fetch(`${cfg.url}${path}`, method === "GET" ? { headers } : { method, headers: { ...headers, ...(controlKey ? { "Idempotency-Key": controlKey } : {}) }, body: JSON.stringify(body ?? {}) });
+        if (r.status === 401) conn.set("unauthorized");
+        let data: Record<string, unknown> = {};
+        try { data = ((await r.json()) ?? {}) as Record<string, unknown>; } catch { /* no body */ }
+        if (ticket && r.status >= 500 && r.headers.get("X-Noop-Confirmed") !== "1")
+          return { ok: false, status: r.status, data: pendingNote(machine ? "Connection lost while confirming. Try again to check the same request." : "Connection lost while confirming. Try saving again to check the same request.") };
+        if (r.status !== 202 || typeof data.ticket !== "string" || !/^[a-f0-9-]{36}$/.test(data.ticket)) {
+          const learning = machineLearningPath(path);
+          if (method === "POST" && (learning?.action === "run" || learning?.action === "discard") && r.ok) {
+            const entry = savedEntries().find((e) => e.kind === "learning" && e.key === learning.host && e.request.request_id === (body as { request_id?: string })?.request_id);
+            if (entry?.kind !== "learning" || !(learning.action === "run" && learningReceipt(data, entry.key, entry.request, entry.preview, entry.known_id) || learningRelease(data, entry.key, entry.request, entry.known_id)))
+              return { ok: false, status: 502, data: { ...pendingNote("Couldn't confirm this learning run. Check the saved run before authorizing another one."), uncertain: true } };
+          }
+          const policyKind = (body as { tool_policy_version?: number })?.tool_policy_version === 1 ? "tools" : (body as { autonomy_policy_version?: number })?.autonomy_policy_version === 1 ? "autonomy" : undefined;
+          if (method === "PUT" && path === "/api/settings" && policyKind && r.ok) {
+            const requested = (body as Record<string, { preference?: string[] | null; agents?: Record<string, string[] | AutonomyLevel | null>; reset?: string[] }>)[policyKind === "tools" ? "clis" : "autonomy"]!;
+            const reset = requested.reset?.[0], agent = reset?.startsWith("agents.") ? reset.slice(7) : Object.keys(requested.agents ?? {})[0];
+            const snapshot = settingsSnapshot(data) ? data : undefined, capability = readToolPolicyView(snapshot?.effective.tool_policy);
+            const member = snapshot?.effective.agents.find((a) => a.id === agent);
+            const policy = policyKind === "tools" ? agent ? capability && readToolPolicy(member?.tool_policy) : capability?.team
+              : snapshot?.effective.autonomy_policy_version === 1 ? readAutonomyPolicy(member?.autonomy_policy) : null;
+            const wanted = reset ? policy?.file_default : agent ? requested.agents?.[agent] : requested.preference;
+            const matches = policy && !policy.invalid && (reset ? policy.source !== "ui" : policy.source === "ui")
+              && JSON.stringify(policy.configured) === JSON.stringify(wanted)
+              && (policyKind !== "autonomy" || policy.configured !== null || policy.effective === snapshot?.effective.autonomy);
+            if (!matches) return { ok: false, status: 502, data: pendingNote(`Couldn't confirm this ${policyKind === "tools" ? "task tool" : "member autonomy"} setting. Retry the same selection or reopen Settings to reload confirmed policy.`) };
+          }
+          if (method === "POST" && path === "/api/tasks/cancel" && r.ok) {
+            const control = body as { id: string; done?: boolean; run_id?: string };
+            if (r.status !== 200 || data.ok !== true || data.id !== control.id || data.result !== (control.done ? "done" : "cancelled") || control.run_id !== undefined && data.run_id !== control.run_id)
+              return { ok: false, status: 502, data: { ...pendingNote("Could not confirm this task change. Check the same request before trying another run."), uncertain: true } };
+          }
+          if (method === "POST" && /^\/api\/plans\/[^/]+\/cancel$/.test(path) && r.ok) {
+            const plan = data.plan as PlanInfo | undefined, cleanup = data.cleanup as { remaining?: unknown; pending?: unknown; unresolved?: unknown } | undefined;
+            if (r.status !== 200 || data.ok !== true || data.id !== path.split("/")[3] || plan?.id !== data.id || plan?.status !== "cancelled" || hasPendingStops(plan?.pending_stops)
+              || cleanup?.remaining !== 0 || !Array.isArray(cleanup.pending) || cleanup.pending.length || !Array.isArray(cleanup.unresolved) || cleanup.unresolved.length)
+              return { ok: false, status: 502, data: { ...pendingNote("Couldn't confirm this plan cancellation. Update the main machine and refresh its progress."), uncertain: true } };
+          }
+          if (method === "POST" && (path === "/api/tasks/stops/retry" || /^\/api\/plans\/[^/]+\/retry-stops$/.test(path)) && r.ok) {
+            const cleanup = data.cleanup as { operation_id?: unknown; remaining?: unknown; pending?: unknown; unresolved?: unknown } | undefined;
+            const requested = body as { id?: string; operation_id: string };
+            const ownerId = requested.id ?? path.split("/")[3], owner = (requested.id ? data.task : data.plan) as (TaskInfo & PlanInfo) | undefined;
+            if (r.status !== 200 || data.ok !== true || data.id !== ownerId || owner?.id !== ownerId || cleanup?.operation_id !== requested.operation_id
+              || (requested.id ? !["done", "cancelled", "failed"].includes(owner?.state ?? "") || hasPendingStops(owner?.stops) || !!owner?.stops_error : owner?.status !== "cancelled" || hasPendingStops(owner?.pending_stops))
+              || cleanup.remaining !== 0 || !Array.isArray(cleanup.pending) || cleanup.pending.length || !Array.isArray(cleanup.unresolved) || cleanup.unresolved.length)
+              return { ok: false, status: 502, data: pendingNote("Couldn't confirm cleanup. Retry to check the same cleanup request.") };
+          }
+          if (method === "POST" && path === "/api/stops/resolve" && r.ok) {
+            const requested = body as StopReviewIntent, review = readStopReviewAudit(data.review), cleanup = data.cleanup as { operation_id?: unknown; remaining?: unknown; pending?: unknown; unresolved?: unknown } | undefined;
+            const owner = (requested.owner.kind === "task" ? data.task : data.plan) as { id?: unknown } | undefined;
+            if (r.status !== 200 || data.ok !== true || data.id !== requested.owner.id || data.operation_id !== requested.operation_id || data.request_id !== requested.request_id
+              || data.review_id !== requested.request_id || data.target_id !== requested.target_id || data.action !== requested.action || owner?.id !== requested.owner.id
+              || (data.owner as StopOwner | undefined)?.kind !== requested.owner.kind || (data.owner as StopOwner | undefined)?.id !== requested.owner.id
+              || !review || review.owner?.kind !== requested.owner.kind || review.owner.id !== requested.owner.id || review.operation_id !== requested.operation_id || review.request_id !== requested.request_id
+              || review.target_id !== requested.target_id || review.action !== requested.action || review.reason !== requested.reason || review.preview_digest !== requested.preview_digest || review.review_id !== data.review_id
+              || cleanup?.operation_id !== requested.operation_id || !Number.isInteger(cleanup.remaining) || !Array.isArray(cleanup.pending) || !Array.isArray(cleanup.unresolved)
+              || cleanup.remaining !== cleanup.pending.length + cleanup.unresolved.length
+              || !readPendingStops({ operation_id: requested.operation_id, requested_at: review.at, done: false, pending: cleanup.pending, unresolved: cleanup.unresolved }))
+              return { ok: false, status: 502, data: { ...pendingNote("Couldn't confirm this cleanup review. Retry the same decision before making another choice."), uncertain: true } };
+          }
+          if (method === "POST" && path === "/api/archive/restore" && r.ok) {
+            const requested = body as ArchiveRestoreRequest, result = readArchiveRestoreResult(data), cached = savedEntries().find((entry) => entry.kind === "archive" && entry.key === requested.key);
+            const expected = archiveRestores().get(requested.key)?.preview.entry ?? (cached?.kind === "archive" ? cached.preview.entry : undefined);
+            if (r.status !== 200 || data.ok !== true || !result || result.key !== requested.key || result.digest !== requested.digest || result.request_id !== requested.request_id
+              || expected && (result.kind !== expected.kind || result.id !== expected.id))
+              return { ok: false, status: 502, data: { ...pendingNote("Couldn't confirm this restoration. Check the saved restore before starting another request."), uncertain: true } };
+          }
+          if (method === "POST" && ["/api/tasks/create", "/api/tasks/reopen"].includes(path) && r.ok) {
+            const requested = body as TaskCreateRequest | TaskReopenRequest, result = readTaskFormResult(data), action = path.endsWith("/create") ? "create" : "reopen";
+            const cached = savedEntries().find((entry) => entry.kind === "task" && entry.request.request_id === requested.request_id), expectedId = cached?.kind === "task" ? cached.known_id : undefined;
+            if (r.status !== 200 || data.ok !== true || !result || result.action !== action || result.request_id !== requested.request_id
+              || "id" in requested && result.id !== requested.id || expectedId && result.id !== expectedId)
+              return { ok: false, status: 502, data: { ...pendingNote("Couldn't confirm this task request. Check the same request before starting another one."), uncertain: true } };
+          }
+          if (controlKey && !r.ok && (data.uncertain === true || data.saved_locally === true))
+            return { ok: false, status: r.status, data: { ...data, pending: true } };
+          formTickets.delete(key);
+          controlKeys.delete(key);
+          if (ticket) for (const [pendingKey, pendingTicket] of formTickets) if (pendingTicket === ticket) { formTickets.delete(pendingKey); controlKeys.delete(pendingKey); }
+          return { ok: r.ok, status: r.status, data };
+        }
+        ticket = data.ticket;
+        formTickets.set(key, ticket);
+        if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, 1000));
       }
-      return { ok: r.ok, status: r.status, data };
+      return { ok: false, status: 202, data: pendingNote(`Still waiting for ${machine ? "the selected machine" : "the main machine"} to confirm. Try again to check the same request; it will not be submitted twice.`) };
     } catch {
-      return { ok: false, status: 0, data: {} };
+      return { ok: false, status: 0, data: pendingNote(ticket ? "Connection lost while confirming. Try again to check the same request." : "Couldn't reach the server") };
     }
   }
 
@@ -313,6 +516,7 @@ function createHub(cfg: Config) {
     }
   }
 
+  void reloadSaved();
   loadFeed().then(stream);
   loadStatus();
   const timer = setInterval(loadStatus, 15000);
@@ -322,7 +526,7 @@ function createHub(cfg: Config) {
     clearTimeout(retry);
     socket?.close();
   };
-  return { events, status, conn, loaded, send, settings, api, logout, dispose, cfg };
+  return { events, status, conn, loaded, send, settings, api, learningRun, discardPolicyConfirmation, stopReviews, taskDrafts, archiveRestores, taskForms, savedEntries, savedReady, savedLoading, savedError, savedAt, reloadSaved, keepPending, dropPending, resetSaved, refreshStatus: loadStatus, logout, dispose, cfg };
 }
 type Hub = ReturnType<typeof createHub>;
 
@@ -733,7 +937,7 @@ function Media(props: { hub: Hub; path: string }) {
 // ---------------------------------------------------------------- timeline
 
 /** A message the owner sent that the hub has not confirmed yet: it reads as sent unless delivery fails. */
-type Outgoing = { id: string; ts: string; text: string; ref: string | null; files: Attachment[]; state: "held" | "sending" | "failed" };
+type Outgoing = { id: string; messageKey: string; ts: string; text: string; ref: string | null; files: Attachment[]; state: "held" | "sending" | "failed"; error?: string; saved_locally?: boolean; savedId?: string };
 
 /** Each agent's own color and mark, the same everywhere it appears (stable by its id). */
 const MARKS = ["★", "◆", "▲", "●", "✦", "☾", "✿", "♪"];
@@ -873,7 +1077,7 @@ function ProposalList(props: { event: HubEvent; selection: Map<string, Signal<Se
 const IGNORE = "Ignore";
 
 function answerText(t: string): string {
-  const [, ref, rest] = t.match(/^([DLP]-[A-Z]?\d{4}) (.+)$/) ?? [, "", t];
+  const [, ref, rest] = t.match(/^((?:[DP]-[A-Z]?\d{4}|L-\d{4,})) (.+)$/) ?? [, "", t];
   const a = rest.trim();
   if (ref.startsWith("P-")) {
     if (/^all$/i.test(a)) return "Approve all";
@@ -916,10 +1120,10 @@ function MsgActions(props: { text: string; show: () => boolean; onReply?: () => 
   );
 }
 
-function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry?: () => void; onRecall?: () => void; onRef?: (ref: string) => void }) {
+function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry?: () => void; onRecall?: () => void; onRef?: (ref: string) => void; onInspect?: (id: string) => void }) {
   const e = props.event;
   // an answer sent from the sidebar or a card ("D-0015 Ignore") names its card in the text, not in `ref`
-  const ref = e.ref ?? e.text.match(/^([DLP]-[A-Z]?\d{4}) \S/)?.[1];
+  const ref = e.ref ?? e.text.match(/^((?:[DP]-[A-Z]?\d{4}|L-\d{4,})) \S/)?.[1];
   const over = signal(false);
   // a reply to an agent's message about a task quotes that message (the last one about it before this)
   const said = () => [...props.hub.events()].reverse().find((x) => x.ref === ref && x.ts <= e.ts && x.kind !== "owner" && !isHub(x.from));
@@ -959,7 +1163,7 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
             gap: 4,
           }}
         >
-          {/^[DLP]-[A-Z]?\d{4} \S/.test(e.text) && !e.text.includes("\n")
+          {/^(?:[DP]-[A-Z]?\d{4}|L-\d{4,}) \S/.test(e.text) && !e.text.includes("\n")
             ? <Text style={{ fontSize: size.text, lineHeight: size.line, color: colors.text, userSelect: "text" }}>{answerText(e.text)}</Text>
             : <Rich text={e.text} />}
         </View>
@@ -969,7 +1173,7 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
           else={
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
               <If when={e.text.trim()}>
-                <MsgActions id={e.id} text={/^[DLP]-[A-Z]?\d{4} \S/.test(e.text) && !e.text.includes("\n") ? answerText(e.text) : e.text} show={() => touch || over()} align="flex-end" />
+                <MsgActions id={e.id} text={/^(?:[DP]-[A-Z]?\d{4}|L-\d{4,}) \S/.test(e.text) && !e.text.includes("\n") ? answerText(e.text) : e.text} show={() => touch || over()} align="flex-end" />
               </If>
               {/* only while it can still be taken back; the row keeps its height when this goes */}
               <If when={props.out?.state === "held"}>
@@ -981,9 +1185,13 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
             </View>
           }
         >
-          <View role="button" onPress={props.onRetry} accessibilityLabel="Retry sending" style={{ flexDirection: "row", gap: 6 }}>
-            <Text style={{ fontSize: size.tiny, color: colors.danger }}>Send failed</Text>
-            <Text style={{ fontSize: size.tiny, fontWeight: "600", color: colors.danger }}>Retry</Text>
+          <View style={{ gap: 6 }}>
+            <If when={props.out?.error}><Text testID="send-error" style={{ fontSize: 13, lineHeight: 18, color: colors.danger }}>{props.out!.error}</Text></If>
+            <If when={props.out?.savedId}><Btn testID="send-inspect" label={`Inspect ${props.out!.savedId}`} kind="ghost" onPress={() => props.onInspect?.(props.out!.savedId!)} /></If>
+            <View role="button" onPress={props.onRetry} accessibilityLabel={props.out?.saved_locally ? "Check same request" : "Retry sending"} style={{ flexDirection: "row", gap: 6 }}>
+              <Text style={{ fontSize: size.tiny, color: colors.danger }}>{props.out?.saved_locally ? "Synchronization unconfirmed" : "Send failed"}</Text>
+              <Text style={{ fontSize: size.tiny, fontWeight: "600", color: colors.danger }}>{props.out?.saved_locally ? "Check same request" : "Retry"}</Text>
+            </View>
           </View>
         </If>
       </View>
@@ -1138,12 +1346,18 @@ function since(iso?: string, end?: string): string {
 const HISTORY_PAGE = 50;
 
 /** All tasks: every task the team has, newest first, a page at a time. */
-function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => void }) {
+function TaskHistory(props: { hub: Hub; wide: boolean; isCurrent: () => boolean; onTask: (id: string) => void }) {
   const tasks = signal<TaskInfo[]>([]);
   const total = signal<number | null>(null);
   const error = signal("");
   const loading = signal(false);
   const query = signal("");
+  const creating = signal(false);
+  const startTask = () => {
+    const saved = props.hub.taskForms().get("create");
+    if (saved?.result() && !saved.pending()) props.hub.taskForms.update((all) => { const next = new Map(all); next.delete("create"); return next; });
+    creating.set(true);
+  };
   let asked = 0; // the newest request; an older answer that lands late is dropped
   async function load(reset: boolean) {
     const mine = ++asked;
@@ -1162,6 +1376,7 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
   return (
     <Scroll testID="task-history" style={{ flex: 1 }}>
       <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 12, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
+        <Btn testID="task-new" label="New task" kind="primary" onPress={startTask} />
         <Input
           testID="task-search"
           value={query()}
@@ -1196,11 +1411,12 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
           </View>
         </If>
       </View>
+      <If when={creating()}><TaskForm hub={props.hub} isCurrent={props.isCurrent} onClose={() => creating.set(false)} onOpen={(id) => { creating.set(false); props.onTask(id); }} /></If>
     </Scroll>
   );
 }
 
-const PLANS_LOCAL_ONLY = "Plans only work on a local hub for now";
+const PLANS_LOCAL_ONLY = "Update the hub and main machine to manage plans";
 /** Plans change as their steps run: keep asking while the page is open. */
 function poll(fn: () => void, ms = 4000) {
   fn();
@@ -1217,14 +1433,17 @@ function PlansPage(props: { hub: Hub; settings: Settings; wide: boolean; onPlan:
     if (r.ok) { plans.set((r.data.plans as PlanInfo[] | undefined) ?? []); error.set(""); }
     else error.set(r.status === 404 ? PLANS_LOCAL_ONLY : r.status ? `Couldn't load (${r.status})` : "can't reach the server");
   }));
-  const goal = signal(""), project = signal(""), agent = signal("lead"), note = signal(""), busy = signal(false);
+  const goal = signal(""), project = signal(""), agent = signal("lead"), note = signal(""), busy = signal(false), savedPlan = signal("");
   const eff = () => props.settings.view()?.effective;
   const create = async () => {
     busy.set(true);
     note.set("");
     const r = await props.hub.api("POST", "/api/plans", { goal: goal(), project: project() || undefined, agent: agent() });
     busy.set(false);
-    if (!r.ok) return note.set(r.status === 404 ? PLANS_LOCAL_ONLY : String(r.data.error ?? "Couldn't reach the server"));
+    if (!r.ok) {
+      if (r.data.saved_locally && (r.data.plan as PlanInfo | undefined)?.id) savedPlan.set((r.data.plan as PlanInfo).id);
+      return note.set(r.status === 404 ? PLANS_LOCAL_ONLY : String(r.data.error ?? "Couldn't reach the server"));
+    }
     goal.set("");
     props.onPlan((r.data.plan as PlanInfo).id);
   };
@@ -1252,8 +1471,9 @@ function PlansPage(props: { hub: Hub; settings: Settings; wide: boolean; onPlan:
                 onPick={(id) => agent.set(id)}
               />
               <View style={{ flex: 1 }} />
-              <Btn label="Draft the steps" kind="primary" disabled={!goal().trim() || busy()} busy={busy()} onPress={() => void create()} testID="plan-create" />
+              <Btn label="Draft the steps" kind="primary" disabled={!goal().trim() || busy() || !!savedPlan()} busy={busy()} onPress={() => void create()} testID="plan-create" />
             </View>
+            <If when={savedPlan()}><Btn testID="plan-open-saved" label="Open the plan saved on the main machine" kind="ghost" onPress={() => props.onPlan(savedPlan())} /></If>
             <If when={note()}><Text testID="plan-note" style={{ fontSize: 13.5, lineHeight: 19, color: colors.danger }}>{note()}</Text></If>
           </View>
         </Group>
@@ -1292,12 +1512,24 @@ type DraftStep = { key: number; title: string; details: string; agent: string; c
 /** One plan: its goal, its steps with where each stands, and what you can do next. */
 function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boolean; onTask: (id: string) => void; onGone: () => void }) {
   const plan = signal<PlanInfo | null>(null);
-  const error = signal("");
+  const error = signal(""), syncWarning = signal("");
   const busy = signal(false);
+  const cancelUnconfirmed = signal(false);
+  const cleanupAttempt = signal<PendingStops | undefined>(undefined);
+  const stops = () => pendingStopsView(plan()?.pending_stops) ?? cleanupAttempt();
+  const stopError = () => pendingStopsError(plan()?.pending_stops) ?? (cancelUnconfirmed() ? "The plan cancellation is not confirmed. Update the main machine and refresh its progress." : undefined);
+  const cleanupPending = () => hasPendingStops(plan()?.pending_stops) || !!cleanupAttempt() || cancelUnconfirmed();
   props.settings.load();
   const agents = () => props.settings.view()?.effective.agents ?? [];
   const agentTitle = (id: string) => agents().find((a) => a.id === id)?.title ?? id;
   const projectName = (id?: string) => props.settings.view()?.effective.projects?.find((p) => p.id === id)?.name ?? id;
+  const continuationIssue = () => {
+    const p = plan(), settings = props.settings.view();
+    if (!p || !settings) return "";
+    if (!settings.effective.agents.some((agent) => agent.id === p.agent)) return `Restore or add member ${p.agent} before continuing this plan.`;
+    if (p.project && !settings.effective.projects?.some((project) => project.id === p.project)) return `Restore or connect project ${p.project} before continuing this plan.`;
+    return "";
+  };
   /** The steps being edited; null when not editing. Polling leaves them alone. */
   const draft = signal<DraftStep[] | null>(null);
   let nextKey = 1;
@@ -1308,10 +1540,12 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
     if (p.status === "review" && seen !== "review") draft.set(editable(p)); // a fresh draft opens for editing
     if (p.status !== "review" && seen === "review") draft.set(null);
     seen = p.status;
+    const attempted = cleanupAttempt(), latest = readPendingStops(p.pending_stops);
+    if (attempted && latest?.operation_id === attempted.operation_id) cleanupAttempt.set(latest);
     plan.set(p);
   };
   poll(() => void props.hub.api("GET", `/api/plans/${props.id}`).then((r) => {
-    if (r.ok) { take(r.data.plan as PlanInfo); if (!busy()) error.set(""); }
+    if (r.ok) { take(r.data.plan as PlanInfo); if (!busy()) error.set(syncWarning()); }
     else if (!busy()) error.set(r.status === 404 ? "This plan isn't here any more, or the hub doesn't have plans" : r.status ? `Couldn't load (${r.status})` : "can't reach the server");
   }));
   const act = async (method: string, path: string, body?: unknown) => {
@@ -1319,7 +1553,20 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
     error.set("");
     const r = await props.hub.api(method, `/api/plans/${props.id}${path}`, body);
     busy.set(false);
-    if (!r.ok) { error.set(String(r.data.error ?? "Couldn't reach the server")); return false; }
+    if (!r.ok) {
+      const message = String(r.data.error ?? "Couldn't reach the server");
+      if (r.data.saved_locally) {
+        syncWarning.set(message);
+        if (r.data.plan) take(r.data.plan as PlanInfo);
+        if (path === "/continue") continuing.set(false);
+      }
+      if (path === "/cancel" || path === "/retry-stops") cleanupAttempt.set(stopAttempt(r.data, stops()));
+      if (path === "/cancel" && r.data.uncertain) cancelUnconfirmed.set(true);
+      error.set(message); return false;
+    }
+    syncWarning.set("");
+    if (path === "/cancel" || path === "/retry-stops") cancelUnconfirmed.set(false);
+    if (path === "/retry-stops") cleanupAttempt.set(undefined);
     if (r.data.plan) take(r.data.plan as PlanInfo);
     return true;
   };
@@ -1338,6 +1585,11 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
     if (await act("POST", "/continue", { instructions: instructions() })) { instructions.set(""); continuing.set(false); draft.set(null); }
   };
   const cancelPlan = async () => {
+    if (busy()) return;
+    busy.set(true);
+    const capability = await props.hub.api("GET", "/api/stops/capabilities");
+    busy.set(false);
+    if (!capability.ok || capability.data.family_stops !== 1) { error.set("Connect or update the main machine to confirm task-family stops."); return; }
     const r = await AlertDialog.show({
       title: "Cancel this plan?",
       description: "A running step is stopped and no further steps start. Work already done stays in the project.",
@@ -1348,7 +1600,7 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
   const remove = async () => {
     const r = await AlertDialog.show({
       title: "Remove this plan?",
-      description: "It leaves this list and moves to archive/plans/ in your data folder. Its tasks and any work done stay as they are.",
+      description: "It moves to Archive. Its tasks and any work done stay as they are. You can restore its history later.",
       actions: [{ id: "keep", label: "Keep it", role: "cancel" }, { id: "remove", label: "Remove", role: "destructive" }],
     });
     if (r.action === "remove" && (await act("DELETE", ""))) props.onGone();
@@ -1376,7 +1628,19 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
                   <Text testID="plan-reason" style={{ fontSize: 14, lineHeight: 20, color: stopped() || p().status === "review" ? colors.danger : colors.muted }}>{p().reason}</Text>
                 </If>
                 <If when={error()}><Text testID="plan-error" style={{ fontSize: 14, lineHeight: 20, color: colors.danger }}>{error()}</Text></If>
+                <If when={continuationIssue()}><Text testID="plan-dependency-warning" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{continuationIssue()}</Text></If>
               </View>
+
+              <RemainingStops hub={props.hub} owner={{ kind: "plan", id: props.id }} batch={stops()} error={stopError()} busy={busy()} onRetry={(operation_id) => { if (stops()?.operation_id === operation_id) void act("POST", "/retry-stops", { operation_id }); else error.set("The cleanup operation changed. Review its latest progress before retrying."); }} onRefresh={() => void props.hub.api("GET", `/api/plans/${props.id}`).then((r) => { if (r.ok) take(r.data.plan as PlanInfo); else error.set(String(r.data.error ?? "Couldn't refresh this plan")); })}
+                onReviewed={(data, saved) => {
+                  const batch = stopAttempt(data, stops());
+                  if ((data.plan as PlanInfo | undefined)?.id === props.id) take(data.plan as PlanInfo);
+                  cleanupAttempt.set(saved ? undefined : batch);
+                  const message = saved ? "" : String(data.error ?? "Review saved locally; synchronization is unconfirmed.");
+                  syncWarning.set(message); error.set(message);
+                  if (saved) cancelUnconfirmed.set(false);
+                }} />
+              <StopReviewHistory reviews={plan()?.stop_reviews ?? readPendingStops(plan()?.pending_stops)?.reviews ?? cleanupAttempt()?.reviews ?? []} />
 
               <If when={p().status === "drafting"}>
                 <Text testID="plan-drafting" style={{ fontSize: 14, color: colors.muted }}>{`${agentTitle(p().agent)} is drafting the steps. You'll be notified when they're ready to review.`}</Text>
@@ -1439,7 +1703,7 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
                   <TextArea label="What should happen next?" testID="plan-instructions" height={96} value={instructions()} onChange={(v) => instructions.set(v)} placeholder="e.g. Also cover the mobile navigation" hint="The planner proposes the remaining steps, and you approve them. A running step carries on meanwhile." />
                   <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
                     <Btn label="Never mind" kind="ghost" onPress={() => continuing.set(false)} testID="plan-continue-cancel" />
-                    <Btn label="Draft next steps" kind="primary" disabled={!instructions().trim() || busy()} onPress={() => void submitContinue()} testID="plan-continue-send" />
+                    <Btn label="Draft next steps" kind="primary" disabled={!instructions().trim() || busy() || !!continuationIssue()} onPress={() => void submitContinue()} testID="plan-continue-send" />
                   </View>
                 </View>
               </If>
@@ -1465,11 +1729,11 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
                     <Btn label="Discard edits" kind="ghost" onPress={() => draft.set(null)} testID="plan-edit-cancel" />
                   </>
                 </If>
-                <If when={p().status !== "drafting" && p().status !== "cancelled" && !continuing()}>
-                  <Btn label="Continue with instructions" kind="secondary" onPress={() => continuing.set(true)} testID="plan-continue" />
+                <If when={p().status !== "drafting" && !continuing() && !cleanupPending()}>
+                  <Btn label="Continue with instructions" kind="secondary" disabled={busy() || !!continuationIssue()} onPress={() => continuing.set(true)} testID="plan-continue" />
                 </If>
                 <View style={{ flex: 1 }} />
-                <If when={p().status === "done" || p().status === "cancelled"}><Btn label="Remove" kind="ghost" onPress={() => void remove()} testID="plan-remove" /></If>
+                <If when={p().status === "done" || p().status === "cancelled"}><Btn label="Remove" kind="ghost" disabled={busy() || cleanupPending()} onPress={() => void remove()} testID="plan-remove" /></If>
                 <If when={p().status !== "done" && p().status !== "cancelled"}><Btn label="Cancel plan" kind="ghost" disabled={busy()} onPress={() => void cancelPlan()} testID="plan-cancel" /></If>
               </View>
             </>
@@ -1480,24 +1744,539 @@ function PlanPage(props: { hub: Hub; settings: Settings; id: string; wide: boole
   );
 }
 
-function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
+function taskRunDraft(task: TaskInfo) {
+  return { requirements: signal(task.requires ?? task.needs ?? ""), host: signal(task.learning_host ?? task.target_host ?? "any"), cli: signal(task.configured_cli ?? "auto"),
+    agent: signal(task.agent), priority: signal(task.priority ?? "normal"), title: signal(task.title), prefer: signal(task.prefer ?? ""), weight: signal(task.weight ?? "normal"),
+    project: signal(task.project || (task.repo ? "__current__" : "")), advanced: signal(false) };
+}
+type TaskRunDraft = ReturnType<typeof taskRunDraft>;
+function taskRunCatalog(hub: Hub) {
+  const effective = signal<SettingsView["effective"] | undefined>(undefined), error = signal("");
+  let generation = 0;
+  cleanup(() => { generation++; });
+  async function load() {
+    const mine = ++generation;
+    const r = await hub.api("GET", "/api/settings");
+    if (mine !== generation) return;
+    const value = r.data.effective as SettingsView["effective"] | undefined;
+    if (r.ok && value && Array.isArray(value.agents) && value.agents.every((a) => a && typeof a.id === "string" && (a.clis === undefined || Array.isArray(a.clis) && a.clis.every((c) => typeof c === "string")))
+      && (value.projects === undefined || Array.isArray(value.projects) && value.projects.every((p) => p && [p.id, p.name, p.host, p.path].every((v) => typeof v === "string") && (p.requires === undefined || Array.isArray(p.requires) && p.requires.every((c) => typeof c === "string"))))
+      && (value.enabled_clis === undefined || Array.isArray(value.enabled_clis) && value.enabled_clis.every((c) => typeof c === "string"))) { effective.set(value); error.set(""); }
+    else error.set(String(r.data.error ?? "Couldn't load members and projects. Reconnect and reload settings before starting work."));
+  }
+  void load();
+  return { effective, error, load };
+}
+type TaskRunCatalog = ReturnType<typeof taskRunCatalog>;
+function matchingTaskHosts(hub: Hub, draft: TaskRunDraft, catalog: TaskRunCatalog, learningHost?: string, learningError?: string) {
+  const effective = catalog.effective(), enabled = effective?.enabled_clis ?? DEFAULT_PROVIDERS;
+  const member = effective?.agents.find((a) => a.id === draft.agent()), project = effective?.projects?.find((p) => p.id === draft.project());
+  if (learningError || effective && !member || draft.project() && draft.project() !== "__current__" && !project || learningHost && project && project.host !== learningHost) return [];
+  const host = learningHost ?? draft.host();
+  return (hub.status()?.hosts ?? []).filter((h) => !member?.paused && !member?.tool_policy?.invalid && !h.stats?.diskError && h.online !== false && h.enabled !== false && (host === "any" || host === h.host)
+    && (draft.cli() === "auto" ? (member?.clis ?? enabled).some((c) => enabled.includes(c) && h.caps.includes(`cli:${c}`)) : enabled.includes(draft.cli()) && h.caps.includes(`cli:${draft.cli()}`))
+    && [...draft.requirements().split(","), ...(project?.requires ?? [])].map((r) => r.trim()).filter(Boolean).every((r) => r.split("|").some((c) => h.caps.includes(c.trim()))));
+}
+function learningPlacementIssue(draft: TaskRunDraft, catalog: TaskRunCatalog, learningHost?: string, learningError?: string, repoHost?: string, repo?: string) {
+  if (learningError) return learningError;
+  if (!learningHost) return "";
+  const project = catalog.effective()?.projects?.find((p) => p.id === draft.project());
+  if (project && project.host !== learningHost || draft.project() === "__current__" && (!repo || repoHost !== learningHost))
+    return `This folder belongs to another machine. Choose None or a project on ${learningHost}; the private learning history stays there.`;
+  return "";
+}
+function TaskRunFields(props: { hub: Hub; draft: TaskRunDraft; catalog: TaskRunCatalog; repo?: string; repoHost?: string; taskProject?: string; learningHost?: string; learningError?: string; savedHost?: string }) {
+  const { requirements, host, cli, agent, priority, title, prefer, weight, project, advanced } = props.draft;
+  const enabled = () => props.catalog.effective()?.enabled_clis ?? DEFAULT_PROVIDERS;
+  const projects = () => props.catalog.effective()?.projects ?? [], agents = () => props.catalog.effective()?.agents ?? [];
+  const selectedProject = () => projects().find((p) => p.id === project()), selectedAgent = () => agents().find((a) => a.id === agent());
+  const projectChoices = () => projects().filter((p) => !props.learningHost || p.host === props.learningHost);
+  const sourceMachine = () => [...(props.hub.status()?.hosts ?? []), ...(props.hub.status()?.offline_hosts ?? [])].find((h) => h.host === props.learningHost);
+  const learningIssue = () => learningPlacementIssue(props.draft, props.catalog, props.learningHost, props.learningError, props.repoHost, props.repo);
+  const folderHost = () => selectedProject()?.host ?? (project() === "__current__" ? props.repoHost : undefined);
+  const os = () => requirements().split(",").map((x) => x.trim()).find((x) => /^os:/.test(x)) ?? "";
+  const chooseOS = (value: string) => requirements.set([...requirements().split(",").map((x) => x.trim()).filter((x) => x && !x.startsWith("os:")), value].filter(Boolean).join(","));
+  const eligible = () => matchingTaskHosts(props.hub, props.draft, props.catalog, props.learningHost, props.learningError);
+  return <View style={{ gap: 12 }}>
+    <Text role="header" style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>Run settings</Text>
+    <If when={props.learningHost} else={!props.learningError ? <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>Choose an available OS if this work can run there. Platform-specific builds still need their original OS. A local project folder must exist on the machine you choose.</Text> : undefined}>
+      <Text testID="task-learning-host" style={{ fontSize: 14, fontWeight: "600", color: colors.text }}>{`Learning source: ${props.learningHost} · ${!sourceMachine() || sourceMachine()?.online === false ? "Offline" : sourceMachine()?.enabled === false ? "Paused for new tasks" : "Online"}`}</Text>
+      <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>This task uses private history and a prepared collection on its source machine. Changing its run settings cannot move that history to another machine.</Text>
+      <If when={props.savedHost && props.savedHost !== props.learningHost}><Text testID="task-learning-repair" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{`The saved target is ${props.savedHost}. Saving returns this learning task to ${props.learningHost}.`}</Text></If>
+    </If>
+    <If when={props.learningError}><Text testID="task-learning-error" style={{ fontSize: 13, lineHeight: 19, color: colors.warn, userSelect: "text" }}>{learningIssue()}</Text></If>
+    <View disabled={!!props.learningError} style={{ gap: 12 }}>
+    <Field testID="task-title" label="Title" value={title()} onChange={(v) => title.set(v)} />
+    <Dropdown testID="task-project" label="Project" value={selectedProject()?.name ?? (project() === "__current__" ? "Current folder" : project() || "None")} selected={project()}
+      options={[{ id: "", label: "None", testID: "task-project-none" }, ...(props.repo && !props.taskProject && (!props.learningHost || props.repoHost === props.learningHost) ? [{ id: "__current__", label: "Current folder", detail: props.repo, testID: "task-project-current" }] : []), ...projectChoices().map((p) => ({ id: p.id, label: p.name, detail: `${p.host} · ${p.path}`, testID: `task-project-${p.id}` }))]}
+      onPick={(id) => { project.set(id); host.set(props.learningHost ?? (id === "__current__" ? props.repoHost ?? "any" : projects().find((p) => p.id === id)?.host ?? "any")); }} />
+    <If when={selectedProject() || project() === "__current__"}><Text style={{ fontSize: 13, color: colors.muted }}>{`Folder: ${selectedProject()?.path ?? props.repo}. ${props.learningHost ? "Choose None to detach this folder; learning stays on its source machine." : "Choose None to use a different machine."}`}</Text></If>
+    <If when={!props.learningHost && !props.learningError && folderHost() && folderHost() !== host()}><Btn testID="task-folder-machine" label={`Use folder's current machine (${folderHost()})`} kind="secondary" onPress={() => host.set(folderHost()!)} /></If>
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <Dropdown testID="task-os" label="OS" value={({ "os:macos": "macOS", "os:linux": "Linux", "os:windows": "Windows" } as Record<string, string>)[os()] ?? (os() || "Any OS")} selected={os()} onPick={chooseOS}
+        options={[{ id: "", label: "Any OS", testID: "task-os-any" }, ...["macos", "linux", "windows"].map((o) => ({ id: `os:${o}`, label: o === "macos" ? "macOS" : o === "linux" ? "Linux" : "Windows", testID: `task-os-${o}` }))]} />
+      <If when={!props.learningHost && !props.learningError}><Dropdown testID="task-machine" label="Machine" value={host() === "any" ? "Any matching machine" : host()} selected={host()} onPick={(v) => { host.set(v); if (selectedProject() && selectedProject()!.host !== v || project() === "__current__" && v !== props.repoHost) project.set(""); }}
+        options={[{ id: "any", label: "Any matching machine", testID: "task-machine-any" }, ...[...(props.hub.status()?.hosts ?? []), ...(props.hub.status()?.offline_hosts ?? [])].map((h) => ({ id: h.host, label: h.host, testID: `task-machine-${h.host}`, detail: h.online === false ? "Offline" : h.enabled === false ? "Paused for new tasks" : h.stats?.diskError ? "Disk monitoring unavailable" : h.os ?? h.caps.find((c) => c.startsWith("os:")) }))]} /></If>
+      <Dropdown testID="task-agent" label="Member" value={agent()} selected={agent()} onPick={(v) => agent.set(v)}
+        options={agents().map((a) => ({ id: a.id, label: a.title ?? a.id, testID: `task-agent-${a.id}` }))} />
+      <Dropdown testID="task-cli" label="CLI" value={cli()} selected={cli()} onPick={(v) => cli.set(v)} options={["auto", ...PROVIDER_IDS].map((id) => ({ id, label: id, testID: `task-cli-${id}`, detail: id !== "auto" && !enabled().includes(id) ? "Disabled in AI tools & onboarding" : undefined }))} />
+      <Dropdown testID="task-priority" label="Priority" value={priority()} selected={priority()} onPick={(v) => priority.set(v)} options={["urgent", "high", "normal", "low"].map((id) => ({ id, label: id, testID: `task-priority-${id}` }))} />
+    </View>
+    <Field testID="task-requires" label="Required capabilities" value={requirements()} onChange={(v) => requirements.set(v)} hint="Comma-separated, e.g. docker, cli:cargo. Leave empty when no special capability is needed." />
+    <Btn testID="task-advanced" label={advanced() ? "Hide advanced run settings" : "Advanced run settings"} kind="ghost" onPress={() => advanced.set(!advanced())} />
+    <If when={advanced()}>
+      <Field testID="task-prefer" label="Preferred capabilities" value={prefer()} onChange={(v) => prefer.set(v)} hint={props.learningHost ? `A soft preference on ${props.learningHost}; it does not move this learning task.` : "A soft preference, e.g. os:macos or gpu. Other machines can still run the task when a preferred machine is unavailable."} />
+      <Dropdown testID="task-weight" label="Resource use" value={weight()} selected={weight()} onPick={(v) => weight.set(v)} options={[{ id: "normal", label: "Normal", testID: "task-weight-normal" }, { id: "heavy", label: "Heavy", detail: "Waits for spare resources for benchmarks or full builds", testID: "task-weight-heavy" }]} />
+    </If>
+    </View>
+    <If when={!props.learningError}><Text testID="task-matches" style={{ fontSize: 13, lineHeight: 19, color: !learningIssue() && eligible().length ? colors.muted : colors.warn }}>{learningIssue() || (cli() !== "auto" && !enabled().includes(cli()) ? `${providerLabel(cli())} is disabled for execution. Choose another tool or enable it in Settings → AI tools & onboarding.`
+      : selectedAgent()?.paused ? "This member is paused. Choose another member or enable its AI tools in Settings."
+      : selectedAgent()?.tool_policy?.invalid ? "This member's task tool setting is invalid. Fix it in Settings → Members before running work."
+      : cli() === "auto" && !enabled().length ? "AI execution is disabled for the team. Enable tools in Settings → AI tools & onboarding."
+      : cli() === "auto" && selectedAgent()?.clis?.length === 0 ? "No enabled default task tools for this member. Choose an explicit task tool or change Settings → Members."
+      : eligible().length ? `Matching machines: ${eligible().map((h) => h.host).join(", ")}` : props.learningHost ? !sourceMachine() || sourceMachine()?.online === false
+        ? `The learning source machine ${props.learningHost} is offline. This task will wait for it; another machine cannot use its private history.`
+        : `${props.learningHost} cannot run these settings yet. Change the tool or required capabilities, or repair that machine. The task stays on its learning source.`
+        : "No connected machine is accepting tasks with these settings. Change them, resume a paused machine, or connect a matching machine.")}</Text></If>
+  </View>;
+}
+
+function TaskPlacement(props: { hub: Hub; task: TaskInfo }) {
+  const draft = taskRunDraft(props.task), catalog = taskRunCatalog(props.hub);
+  const { requirements, host, cli, agent, priority, title, prefer, weight, project } = draft;
+  const busy = signal(false), note = signal("");
+  const invalidMember = () => catalog.effective()?.agents.find((a) => a.id === agent())?.tool_policy?.invalid === true;
+  const learningIssue = () => learningPlacementIssue(draft, catalog, props.task.learning_host, props.task.learning_host_error, props.task.target_host, props.task.repo);
+  async function save() {
+    if (invalidMember() || learningIssue()) return;
+    busy.set(true); note.set("");
+    try {
+      const r = await props.hub.api("POST", "/api/tasks/configure", { id: props.task.id, requires: requirements(), host: props.task.learning_host ?? host(), cli: cli(), agent: agent(), priority: priority(), title: title(), prefer: prefer(), weight: weight(), ...(project() === "__current__" ? {} : { project: project() }) });
+      const result = r.data.data as { ok?: boolean; error?: string; queued?: boolean } | undefined;
+      if (!r.ok || r.data.ok === false || result?.ok === false) note.set(String(result?.error ?? r.data.error ?? "Couldn't save task settings"));
+      else note.set(result?.queued ? "Settings submitted. Waiting for the main machine to apply them." : props.task.learning_host ? `Settings saved. This learning task waits for ${props.task.learning_host} to accept its run settings.` : "Settings saved. The task will run when a matching machine has capacity.");
+    } catch (e) { note.set(String((e as Error).message ?? e)); }
+    finally { busy.set(false); }
+  }
+  return <View testID="task-placement" style={{ marginTop: 18, gap: 12, padding: 14, borderRadius: radius.inset, backgroundColor: colors.surface }}>
+    <TaskRunFields hub={props.hub} draft={draft} catalog={catalog} repo={props.task.repo} repoHost={props.task.target_host} taskProject={props.task.project} learningHost={props.task.learning_host} learningError={props.task.learning_host_error} savedHost={props.task.target_host} />
+    <Btn testID="task-placement-save" label="Save run settings" kind="primary" busy={busy()} disabled={busy() || invalidMember() || !!learningIssue()} onPress={() => void save()} />
+    <If when={note()}><Text testID="task-placement-note" style={{ fontSize: 13, color: colors.text }}>{note()}</Text></If>
+  </View>;
+}
+
+type TaskFormState = {
+  draft: TaskRunDraft; instructions: Signal<string>; preview: Signal<TaskReopenPreview | undefined>;
+  pending: Signal<TaskCreateRequest | TaskReopenRequest | undefined>; result: Signal<TaskFormResult | undefined>;
+  knownId: Signal<string>; initialized: boolean;
+};
+function newTaskFormState(instructions = ""): TaskFormState {
+  return { draft: taskRunDraft({ id: "", title: "", agent: "lead" }), instructions: signal(instructions), preview: signal(undefined), pending: signal(undefined), result: signal(undefined), knownId: signal(""), initialized: false };
+}
+function clearTaskRequest(state: TaskFormState, key: string) {
+  state.pending.set(undefined); state.result.set(undefined); state.knownId.set(key === "create" ? "" : key);
+}
+function fillTaskRunDraft(draft: TaskRunDraft, settings: TaskRunSettings) {
+  draft.title.set(settings.title); draft.agent.set(settings.agent); draft.cli.set(settings.cli); draft.host.set(settings.host); draft.requirements.set(settings.requires);
+  draft.priority.set(settings.priority); draft.prefer.set(settings.prefer); draft.weight.set(settings.weight); draft.project.set(settings.project);
+}
+
+/** Keep the exact authorization and draft when a modal or page is closed during confirmation. */
+function TaskForm(props: { hub: Hub; id?: string; isCurrent: () => boolean; onClose: () => void; onOpen: (id: string) => void }) {
+  const formKey = props.id ?? "create", saved = props.hub.taskForms().get(formKey);
+  const state = saved ?? newTaskFormState(props.id ? props.hub.taskDrafts.get(props.id)?.() ?? "" : "");
+  if (!saved && props.id) state.knownId.set(props.id);
+  if (!saved) props.hub.taskForms.update((all) => new Map(all).set(formKey, state));
+  const { draft, instructions, preview, pending, result, knownId } = state;
+  const catalog = taskRunCatalog(props.hub), busy = signal(false), note = signal(""), noteOk = signal(false), stale = signal(false);
+  let generation = 0;
+  cleanup(() => { generation++; });
+  async function loadPreview() {
+    if (!props.id || pending() || busy()) return;
+    const mine = ++generation;
+    busy.set(true); note.set(""); noteOk.set(false);
+    const r = await props.hub.api("POST", "/api/tasks/reopen-preview", { id: props.id });
+    if (mine !== generation) return;
+    busy.set(false);
+    const value = readTaskReopenPreview(r.data);
+    if (!r.ok || value?.id !== props.id) { stale.set(true); note.set(r.status === 404 ? "Update the hub and main machine, then refresh this task to reopen it." : String(r.data.error ?? "Couldn't verify this task for reopening.")); return; }
+    preview.set(value); stale.set(false);
+    if (!state.initialized) { fillTaskRunDraft(draft, value.settings); state.initialized = true; }
+  }
+  const settings = (): TaskRunSettings => {
+    const project = catalog.effective()?.projects?.find((p) => p.id === draft.project());
+    return { title: draft.title(), agent: draft.agent(), cli: draft.cli(), host: preview()?.learning_host ?? draft.host(), requires: draft.requirements(), priority: draft.priority() as TaskRunSettings["priority"],
+      prefer: draft.prefer(), weight: draft.weight() as TaskRunSettings["weight"], project: draft.project(),
+      ...(project ? { project_guard: { host: project.host, path: project.path, requires: project.requires ?? [] } } : {}) };
+  };
+  const selectionIssue = () => {
+    const learning = learningPlacementIssue(draft, catalog, preview()?.learning_host, preview()?.learning_host_error, preview()?.settings.host, preview()?.repo);
+    if (learning) return learning;
+    const effective = catalog.effective();
+    if (catalog.error() || !effective) return catalog.error() || "Loading members and projects…";
+    const member = effective.agents.find((a) => a.id === draft.agent());
+    if (!member) return "Choose an available member before starting this task.";
+    if (member.paused) return "This member is paused. Choose another member or enable its AI tools in Settings.";
+    if (member.tool_policy?.invalid) return "This member's task tool setting is invalid. Fix it in Settings → Members before running work.";
+    if (draft.cli() !== "auto" && !(effective.enabled_clis ?? DEFAULT_PROVIDERS).includes(draft.cli())) return "Choose an enabled AI tool before starting this task.";
+    const project = effective.projects?.find((p) => p.id === draft.project());
+    if (draft.project() && draft.project() !== "__current__" && !project) return "Choose a current project, or select None to detach the missing project.";
+    const host = preview()?.learning_host ?? draft.host();
+    if (draft.project() === "__current__" && host !== preview()?.settings.host || project && project.host !== host) return "The folder's machine changed. Use its current machine, or select None to use another machine.";
+    return "";
+  };
+  async function send(request: TaskCreateRequest | TaskReopenRequest) {
+    if (busy()) return;
+    const previous = pending();
+    if (previous && previous.request_id !== request.request_id) return;
+    busy.set(true); note.set(""); noteOk.set(false);
+    try {
+      const entry: PendingEntry = { kind: "task", key: formKey, at: props.hub.savedAt("task", formKey), request, ...(props.id ? { preview: preview() } : {}), ...(knownId() ? { known_id: knownId() } : {}) };
+      if (!await props.hub.keepPending(entry)) { note.set(props.hub.savedError() || "Wait for saved requests to finish loading before submitting."); return; }
+      pending.set({ ...request, confirm_only: undefined });
+      const r = await props.hub.api("POST", props.id ? "/api/tasks/reopen" : "/api/tasks/create", request);
+      if (pending()?.request_id !== request.request_id) return;
+      const value = readTaskFormResult(r.data), action = props.id ? "reopen" : "create";
+      const valid = value?.request_id === request.request_id && value.action === action && (!props.id || value.id === props.id) && (!knownId() || value.id === knownId());
+      if (r.data.request_id === request.request_id && r.data.action === action && typeof r.data.id === "string" && /^T-[\w-]*\d{4}$/.test(r.data.id) && (!props.id || r.data.id === props.id) && (!knownId() || r.data.id === knownId())) knownId.set(r.data.id);
+      if (r.ok && valid) {
+        result.set(value); knownId.set(value.id);
+        if (!await props.hub.dropPending("task", formKey, request.request_id)) { note.set("Task request confirmed, but its local recovery copy could not be cleared. Reload saved requests and check it again."); return; }
+        pending.set(undefined); noteOk.set(true);
+        note.set(value.replayed ? "Earlier task request confirmed. Open the task to check its current run." : props.id ? "Task reopened with these run settings." : "Task created with these run settings.");
+        if (props.id && props.hub.taskDrafts.get(props.id)?.() === instructions()) props.hub.taskDrafts.get(props.id)?.set("");
+        void props.hub.refreshStatus(); return;
+      }
+      if (knownId()) await props.hub.keepPending({ ...entry, known_id: knownId() });
+      if (r.data.saved_locally && valid) result.set(value);
+      note.set(r.status === 404 && !request.confirm_only ? "Update the hub and main machine to create and reopen tasks from this form." : String(r.data.error ?? "Couldn't confirm this task request. Check the saved request before starting another one."));
+      if (!(r.status === 0 || r.status === 202 || r.status >= 500 || r.data.saved_locally || r.data.pending || r.data.uncertain) && !request.confirm_only && await props.hub.dropPending("task", formKey, request.request_id)) { pending.set(undefined); stale.set(!!props.id); }
+    } finally { busy.set(false); }
+  }
+  async function submit() {
+    if (busy() || pending() || result() || selectionIssue() || props.id && (!preview()?.can_reopen || stale())) return;
+    const request = { request_id: crypto.randomUUID(), instructions: instructions(), settings: settings(), ...(props.id ? { id: props.id, preview_digest: preview()!.digest } : {}) };
+    if (!(props.id ? validTaskReopenRequest(request) : validTaskCreateRequest(request))) { noteOk.set(false); note.set("Enter instructions and a one-line title (up to 120 characters), and check the run settings before submitting."); return; }
+    await send(request);
+  }
+  async function fresh() {
+    if (busy()) return;
+    if (pending()) {
+      const answer = await AlertDialog.show({ title: "Start a fresh task request?", description: props.id ? "The earlier request may still finish. Inspect or confirm it first. A fresh preview will check the task again before reopening." : "The earlier task may still be created. Inspect or confirm it first to avoid duplicate work. Starting fresh authorizes another task.",
+        actions: [{ id: "keep", label: "Keep pending request", role: "cancel" }, { id: "fresh", label: props.id ? "Refresh preview" : "Start fresh" }] });
+      if (answer.action !== "fresh") return;
+      if (!await props.hub.dropPending("task", formKey, pending()!.request_id)) { noteOk.set(false); note.set(props.hub.savedError()); return; }
+    }
+    pending.set(undefined); result.set(undefined); note.set(""); noteOk.set(false); stale.set(!!props.id); knownId.set(props.id ?? "");
+    busy.set(true);
+    await catalog.load();
+    busy.set(false);
+    if (props.id) await loadPreview();
+  }
+  async function openTask() {
+    const id = knownId(); if (!id || busy()) return;
+    const mine = ++generation;
+    busy.set(true);
+    const r = await props.hub.api("GET", `/api/tasks/get?id=${encodeURIComponent(id)}`);
+    busy.set(false);
+    if (mine !== generation || !props.isCurrent()) return;
+    if (!r.ok || r.data.id !== id) { noteOk.set(false); note.set(String(r.data.error ?? "This task isn't currently available. Check the same saved request before starting another one.")); return; }
+    props.onOpen(id);
+  }
+  if (props.id && !pending() && !result()) void loadPreview();
+  return <Dialog testID="task-form" open onOpenChange={({ open }) => { if (!open && !busy()) props.onClose(); }} animation="fade" backdropClass="bg-scrim" style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}>
+    <View style={{ width: "100%", maxWidth: 680, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+      <View style={{ flexDirection: "row", alignItems: "center", height: 56, paddingLeft: 20, paddingRight: 10, borderBottomWidth: .5, borderBottomColor: surfaceEdge() }}>
+        <Text role="header" style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>{props.id ? `Reopen ${props.id}` : "New task"}</Text>
+        <Btn testID="task-form-close" label="Close" kind="ghost" disabled={busy()} onPress={props.onClose} />
+      </View>
+      <Scroll style={{ flexShrink: 1 }}><View style={{ padding: 20, gap: 14 }}>
+        <Text style={{ fontSize: 14, lineHeight: 20, color: colors.muted }}>{props.id ? "Keep this task's ID and history. New instructions start another attempt with the run settings below." : "Choose instructions and run settings together before the task enters the queue."}</Text>
+        <If when={preview()}>{(value) => <>
+          <Text testID="task-form-state" style={{ fontSize: 13, color: colors.muted }}>{`Previous state: ${STATE_OF()[value().state]?.[0] ?? value().state}`}</Text>
+          <Each of={[...value().conflicts, ...value().warnings]}>{(warning) => <Text testID="task-form-warning" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{warning()}</Text>}</Each>
+        </>}</If>
+        <View disabled={busy() || !!pending() || !!result() || !!props.hub.savedError() || props.hub.savedLoading() || !!props.id && !preview() || !!preview()?.learning_host_error} style={{ gap: 14 }}>
+          <TextArea testID="task-form-instructions" label={props.id ? "New instructions" : "Instructions"} value={instructions()} onChange={(v) => instructions.set(v)} height={110} placeholder="Describe the work to run" />
+          <TaskRunFields hub={props.hub} draft={draft} catalog={catalog} repo={preview()?.repo} repoHost={preview()?.settings.host} taskProject={preview()?.settings.project === "__current__" ? undefined : preview()?.settings.project} learningHost={preview()?.learning_host} learningError={preview()?.learning_host_error} />
+        </View>
+        <If when={selectionIssue() && !pending() && !result()}><Text testID="task-form-selection-error" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{selectionIssue()}</Text></If>
+        <If when={!pending() && !result()}><Btn testID="task-form-submit" kind="primary" label={matchingTaskHosts(props.hub, draft, catalog, preview()?.learning_host, preview()?.learning_host_error).length ? props.id ? "Reopen task" : "Create task" : props.id ? preview()?.learning_host ? `Reopen and wait for ${preview()!.learning_host}` : "Reopen and wait for a matching machine" : "Queue until a matching machine is available"}
+          disabled={busy() || !!props.hub.savedError() || props.hub.savedLoading() || !!selectionIssue() || !instructions().trim() || !draft.title().trim() || !!props.id && (!preview()?.can_reopen || stale())} busy={busy()} onPress={() => void submit()} /></If>
+        <If when={pending()}>{(request) => <View style={{ gap: 8 }}>
+          <Btn testID="task-form-confirm" label="Check saved task request" kind="primary" disabled={busy()} busy={busy()} onPress={() => void send({ ...request(), confirm_only: true })} />
+          <Btn testID="task-form-retry" label="Retry same request" disabled={busy()} onPress={() => void send(request())} />
+        </View>}</If>
+        <If when={note()}><Text testID="task-form-note" style={{ fontSize: 13, lineHeight: 19, color: noteOk() ? colors.up : colors.danger }}>{note()}</Text></If>
+        <Each of={result()?.warnings ?? []}>{(warning) => <Text style={{ fontSize: 13, color: colors.warn }}>{warning()}</Text>}</Each>
+        <If when={knownId() && (pending() || result())}><Btn testID="task-form-open" label={pending() ? "Inspect current task" : "Open task"} kind="secondary" disabled={busy()} onPress={() => void openTask()} /></If>
+        <Btn testID="task-form-refresh" label={props.id ? "Refresh task preview and settings" : pending() || result() ? "Start a fresh task request" : "Reload members and projects"} kind="ghost" disabled={busy()} onPress={() => void fresh()} />
+      </View></Scroll>
+    </View>
+  </Dialog>;
+}
+
+/** A local empty batch still needs a checked retry when its final synchronization failed. */
+function stopAttempt(data: Record<string, unknown>, previous?: PendingStops): PendingStops | undefined {
+  const cleanup = data.cleanup as { operation_id?: unknown; pending?: unknown; unresolved?: unknown } | undefined;
+  return readPendingStops(data.stops) ?? readPendingStops((data.plan as PlanInfo | undefined)?.pending_stops)
+    ?? readPendingStops((data.task as TaskInfo | undefined)?.stops)
+    ?? (previous && cleanup?.operation_id === previous.operation_id ? readPendingStops({ ...previous, pending: cleanup.pending, unresolved: cleanup.unresolved }) : previous);
+}
+
+type StopReviewIntent = StopResolveRequest;
+
+function RemainingStops(props: { hub: Hub; owner: StopOwner; batch?: PendingStops; error?: string; busy: boolean; onRetry: (operation_id: string) => void; onRefresh: () => void; onReviewed: (data: Record<string, unknown>, saved: boolean) => void }) {
+  const ownerKey = `${props.owner.kind}:${props.owner.id}`;
+  const intent = computed(() => props.hub.stopReviews().get(ownerKey)?.intent);
+  const reviewing = signal<string | undefined>(undefined), loadedPreview = signal<StopReviewPreview | undefined>(undefined);
+  const preview = () => intent() ? props.hub.stopReviews().get(ownerKey)?.preview : loadedPreview();
+  const reviewBusy = signal(false), reviewError = signal(""), previewRejected = signal(false), reason = signal("");
+  let generation = 0;
+  const close = () => { if (!reviewBusy()) { generation++; reviewing.set(undefined); if (!intent()) loadedPreview.set(undefined); } };
+  async function inspect(id: string) {
+    if (intent()) { reviewing.set(intent()!.target_id); return; }
+    const batch = props.batch;
+    if (!batch || reviewBusy() || props.busy) return;
+    const request = ++generation;
+    reviewing.set(id); loadedPreview.set(undefined); reviewError.set(""); previewRejected.set(false);
+    reviewBusy.set(true);
+    const r = await props.hub.api("POST", "/api/stops/review", { owner: props.owner, operation_id: batch.operation_id, target_id: id });
+    if (request !== generation) return;
+    const value = readStopReviewPreview(r.data);
+    if (r.ok && value && value.owner.id === props.owner.id && value.owner.kind === props.owner.kind && value.operation_id === batch.operation_id && value.target_id === id) loadedPreview.set(value);
+    else reviewError.set(r.status === 404 ? "Update the main machine to review saved cleanup requests." : String(r.data.error ?? "Couldn't load this cleanup review. Refresh before making a decision."));
+    reviewBusy.set(false);
+  }
+  async function submit(request: StopReviewIntent) {
+    if (reviewBusy()) return;
+    if (intent() && intent()!.request_id !== request.request_id) { reviewError.set("Confirm the pending cleanup review before making another decision."); return; }
+    const captured = preview();
+    reviewBusy.set(true); reviewError.set("");
+    if (!await props.hub.keepPending({ kind: "stop", key: ownerKey, at: props.hub.savedAt("stop", ownerKey), request, preview: captured })) { reviewBusy.set(false); reviewError.set(props.hub.savedError() || "Wait for saved requests to finish loading before submitting."); return; }
+    props.hub.stopReviews.update((saved) => new Map(saved).set(ownerKey, { intent: request, preview: captured }));
+    const r = await props.hub.api("POST", "/api/stops/resolve", request);
+    if (intent()?.request_id !== request.request_id) { reviewBusy.set(false); return; }
+    if (r.ok || r.data.saved_locally) props.onReviewed(r.data, r.ok);
+    if (r.ok) {
+      if (!await props.hub.dropPending("stop", ownerKey, request.request_id)) { reviewBusy.set(false); reviewError.set("Decision confirmed, but its local recovery copy could not be cleared. Reload saved requests and retry the same decision."); return; }
+      props.hub.stopReviews.update((saved) => { const next = new Map(saved); if (next.get(ownerKey)?.intent.request_id === request.request_id) next.delete(ownerKey); return next; });
+      reviewBusy.set(false);
+      close();
+      if (request.action === "include" && Number((r.data.cleanup as { remaining?: number } | undefined)?.remaining) > 0) props.onRetry(request.operation_id);
+      return;
+    }
+    reviewError.set(String(r.data.error ?? "Couldn't save this cleanup review."));
+    if (!(r.status === 0 || r.status === 202 || r.status >= 500 || r.data.pending || r.data.uncertain || r.data.saved_locally)) {
+      if (!await props.hub.dropPending("stop", ownerKey, request.request_id)) { reviewBusy.set(false); reviewError.set(`${reviewError()} The saved decision is kept until local storage recovers.`); return; }
+      loadedPreview.set(captured); reason.set(request.reason); previewRejected.set(r.status === 409);
+      props.hub.stopReviews.update((saved) => { const next = new Map(saved); if (next.get(ownerKey)?.intent.request_id === request.request_id) next.delete(ownerKey); return next; });
+    }
+    reviewBusy.set(false);
+  }
+  async function decide(action: StopReviewIntent["action"]) {
+    const value = preview(), text = reason().trim();
+    if (!value || reviewBusy() || intent() || previewRejected() || !text || text.length > 500 || action === "include" && !value.can_include) return;
+    const request: StopReviewIntent = { owner: value.owner, operation_id: value.operation_id, target_id: value.target_id, preview_digest: value.preview_digest, action, reason: text, request_id: crypto.randomUUID() };
+    if (!validStopResolveRequest(request)) { reviewError.set("Enter a reason of 1–500 characters on one line."); return; }
+    const confirmation = await AlertDialog.show({
+      title: `${action === "include" ? "Include" : "Exclude"} ${value.target_id} ${action === "include" ? "in" : "from"} cleanup?`,
+      description: action === "include" ? "This authorizes cleanup of the selected task and the related work shown in this review. A changed task requires a fresh review. Your reason is recorded."
+        : "This removes the task from future cleanup retries. An earlier stop request may still finish. The task may keep running, and this cleanup can finish without stopping it. Your reason is recorded.",
+      actions: [{ id: "back", label: "Back", role: "cancel" }, { id: "confirm", label: action === "include" ? "Include reviewed task" : "Exclude from cleanup", ...(action === "exclude" ? { role: "destructive" as const } : {}) }],
+    });
+    if (confirmation.action === "confirm") await submit(request);
+  }
+  const count = () => (props.batch?.pending.length ?? 0) + (props.batch?.unresolved.length ?? 0);
+  return <><If when={props.batch || props.error}>
+    <View testID="stop-progress" style={{ marginTop: 12, padding: 14, borderRadius: radius.inset, borderWidth: 0.5, borderColor: colors.border, backgroundColor: tints.warn, gap: 10 }}>
+      <Text style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>{props.error ? "Stop request needs review" : count() ? `${count()} remaining stop${count() === 1 ? "" : "s"}` : "Confirm cleanup synchronization"}</Text>
+      <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{props.error || count() ? "These requests keep the original runs. Newer runs need a separate confirmation." : "Confirm that the team has received the cleanup result and recorded reviews."}</Text>
+      <If when={props.error}><Text testID="stop-data-error" style={{ fontSize: 13, lineHeight: 19, color: colors.danger }}>{props.error}</Text></If>
+      <Each of={props.batch?.pending ?? []} key={(target) => `${target.id}:${target.run_id}`}>
+        {(target) => <View style={{ gap: 3 }}>
+          <Btn testID={`stop-target-${target().id}`} label={`${target().id} · ${target().host}`} kind="ghost" onPress={() => taskLink(target().id)} />
+          <Text style={{ fontFamily: MONO, fontSize: 11, color: colors.faint, userSelect: "text" }}>{`Run ${target().run_id}`}</Text>
+          <If when={target().error}><Text style={{ fontSize: 13, lineHeight: 18, color: colors.danger }}>{target().error}</Text></If>
+          <Btn testID={`stop-review-${target().id}`} label="Review this stop" kind="secondary" disabled={props.busy || reviewBusy() || !!intent()} onPress={() => { reason.set(""); void inspect(target().id); }} />
+        </View>}
+      </Each>
+      <Each of={props.batch?.unresolved ?? []} key={(target) => target.id}>
+        {(target) => <View style={{ gap: 3 }}>
+          <Btn testID={`stop-unresolved-${target().id}`} label={`Inspect ${target().id}`} kind="ghost" onPress={() => taskLink(target().id)} />
+          <Text style={{ fontSize: 13, lineHeight: 18, color: colors.danger }}>{target().error}</Text>
+          <Btn testID={`stop-review-${target().id}`} label="Review this stop" kind="secondary" disabled={props.busy || reviewBusy() || !!intent()} onPress={() => { reason.set(""); void inspect(target().id); }} />
+        </View>}
+      </Each>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+        <If when={props.batch && !props.error}><Btn testID="stop-retry" label={count() ? "Retry remaining stops" : "Confirm cleanup"} kind="secondary" disabled={props.busy || reviewBusy()} busy={props.busy} onPress={() => { const batch = props.batch; if (batch) props.onRetry(batch.operation_id); }} /></If>
+        <Btn testID="stop-refresh" label="Refresh progress" kind="ghost" disabled={props.busy || reviewBusy()} onPress={props.onRefresh} />
+      </View>
+    </View>
+  </If>
+  <If when={intent() && reviewing() === undefined}><Btn testID="stop-review-resume" label="Review saved decision" kind="secondary" onPress={() => { const request = intent(); if (request) reviewing.set(request.target_id); }} /></If>
+  <Dialog testID="stop-review-dialog" open={reviewing() !== undefined} onOpenChange={({ open }) => { if (!open) close(); }} animation="fade" backdropClass="bg-scrim" style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}>
+    <View style={{ width: "100%", maxWidth: 620, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+      <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: 20, paddingRight: 10, height: 56, borderBottomWidth: .5, borderBottomColor: surfaceEdge() }}>
+        <Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>{`Review ${reviewing() ?? ""}`}</Text>
+        <Btn testID="stop-review-close" label="Close" kind="ghost" disabled={reviewBusy()} onPress={close} />
+      </View>
+      <Scroll style={{ flexShrink: 1 }}><View style={{ gap: 14, padding: 20 }}>
+        <If when={preview()} else={<Text style={{ fontSize: 14, color: colors.muted }}>{reviewBusy() ? "Loading review…" : "Refresh to inspect the current task state."}</Text>}>
+          {(value) => <>
+            <If when={value().target.kind === "pending"}><Text style={{ fontSize: 12, lineHeight: 18, color: colors.faint, userSelect: "text" }}>{`Saved request: ${value().target.host} · run ${value().target.run_id}`}</Text></If>
+            <Text testID="stop-review-state" style={{ fontSize: 14, lineHeight: 21, color: colors.text }}>{`Current state: ${value().current.state}`}</Text>
+            <Each of={value().current.records} key={(record) => `${record.state}:${record.host}:${record.run_id}`}>
+              {(record) => <View style={{ gap: 4 }}>
+                <Text style={{ fontSize: 14, lineHeight: 20, color: colors.text }}>{record().title}</Text>
+                <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{[record().state, record().host].filter(Boolean).join(" · ")}</Text>
+                <If when={record().run_id}><Text testID="stop-review-run" style={{ fontFamily: MONO, fontSize: 11, color: colors.faint, userSelect: "text" }}>{`Run ${record().run_id}`}</Text></If>
+              </View>}
+            </Each>
+            <If when={value().related?.length}><View style={{ gap: 8 }}>
+              <Text style={{ fontSize: 14, fontWeight: "600", color: colors.text }}>{`${value().related!.length} related task${value().related!.length === 1 ? "" : "s"} in this review`}</Text>
+              <Each of={value().related ?? []} key={(related) => related.id}>
+                {(related) => <View testID={`stop-review-related-${related().id}`} style={{ gap: 3 }}>
+                  <Text style={{ fontSize: 13, color: colors.text }}>{`${related().id} · ${related().current.state}`}</Text>
+                  <Each of={related().current.records} key={(record) => `${record.state}:${record.host}:${record.run_id}`}>
+                    {(record) => <Text style={{ fontSize: 12, lineHeight: 18, color: colors.muted, userSelect: "text" }}>{[record().title, record().host, record().run_id ? `Run ${record().run_id}` : undefined].filter(Boolean).join(" · ")}</Text>}
+                  </Each>
+                </View>}
+              </Each>
+            </View></If>
+            <If when={value().include_reason}><Text style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{value().include_reason}</Text></If>
+            <View disabled={!!intent() || reviewBusy()}><Field testID="stop-review-reason" label="Reason for this review" value={intent()?.reason ?? reason()} onChange={(text) => reason.set(text)} hint="Required, up to 500 characters on one line. This stays in the cleanup review history." /></View>
+            <If when={!intent()}><View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+              <Btn testID="stop-review-include" label="Include reviewed task" kind="primary" disabled={reviewBusy() || previewRejected() || !value().can_include || !reason().trim() || reason().trim().length > 500} onPress={() => void decide("include")} />
+              <Btn testID="stop-review-exclude" label="Exclude from cleanup" kind="danger" disabled={reviewBusy() || previewRejected() || !reason().trim() || reason().trim().length > 500} onPress={() => void decide("exclude")} />
+            </View></If>
+          </>}
+        </If>
+        <If when={reviewError()}><Text testID="stop-review-error" style={{ fontSize: 13, lineHeight: 19, color: colors.danger }}>{reviewError()}</Text></If>
+        <If when={intent()}><View style={{ gap: 8 }}><Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>Retrying may apply your original decision if it was not saved. It keeps the original target and reason, and does not choose a newer run.</Text><Btn testID="stop-review-check" label="Retry same decision" kind="secondary" busy={reviewBusy()} disabled={reviewBusy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => { const request = intent(); if (request) void submit(request); }} /></View></If>
+        <If when={!intent()}><Btn testID="stop-review-refresh" label="Refresh review" kind="ghost" disabled={reviewBusy()} onPress={() => { const id = reviewing(); if (id) void inspect(id); }} /></If>
+      </View></Scroll>
+    </View>
+  </Dialog></>;
+}
+
+function StopReviewHistory(props: { reviews: StopReviewAudit[] }) {
+  return <If when={props.reviews.length}><View testID="stop-review-history" style={{ marginTop: 14, gap: 10, padding: 14, borderWidth: .5, borderColor: colors.border, borderRadius: radius.inset }}>
+    <Text role="header" style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>Cleanup reviews</Text>
+    <Each of={props.reviews} key={(review) => review.review_id}>
+      {(review) => <View testID={`stop-reviewed-${review().target_id}`} style={{ gap: 4 }}>
+        <Text style={{ fontSize: 13.5, lineHeight: 20, color: review().action === "exclude" ? colors.warn : colors.text }}>{review().action === "exclude" ? `Excluded ${review().target_id} from cleanup. The task may continue running.` : `Included ${review().target_id} for cleanup.`}</Text>
+        <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted, userSelect: "text" }}>{review().reason}</Text>
+        <Text style={{ fontSize: 11, color: colors.faint }}>{review().at}</Text>
+      </View>}
+    </Each>
+  </View></If>;
+}
+
+function TaskDetail(props: { hub: Hub; id: string; wide: boolean; isCurrent: () => boolean }) {
   // a task past the status snapshot's newest few is read on its own
   const older = signal<(TaskInfo & { decisions?: string[]; events?: HubEvent[] }) | null>(null);
+  const detailSnapshot = signal<Status | null>(null);
   const missing = signal(false);
   const t = () => {
     const s = props.hub.status();
-    return [...(s?.active ?? []), ...(s?.recent ?? [])].find((x) => x.id === props.id) ?? older() ?? undefined;
+    const current = [...(s?.active ?? []), ...(s?.recent ?? [])].find((x) => x.id === props.id), detail = older();
+    if (current?.state === "active" && current.run_id && detail?.run_id !== current.run_id) return current;
+    if (detail?.id === props.id && detail.state && detailSnapshot() === s) return detail;
+    if (current?.state === "active" && current.run_id && current.run_id === detail?.run_id && ["done", "cancelled", "failed"].includes(detail.state ?? "")) return detail;
+    return current ?? detail ?? undefined;
   };
-  // always read: the page shows the task's whole conversation, and the app only holds the newest events
-  void props.hub.api("GET", `/api/tasks/get?id=${encodeURIComponent(props.id)}`).then((r) => {
-    if (r.ok) older.set(r.data as TaskInfo); else missing.set(true);
-  });
   const section = (title: string) => (
     <Text role="header" style={{ fontSize: 13, fontWeight: "600", color: colors.muted, marginTop: 24, marginBottom: 8 }}>{title}</Text>
   );
   const cancellable = () => ["active", "inbox", "nohost", "waiting", "parked", "blocked", "proposed"].includes(t()?.state ?? "");
-  const cancelling = signal(false);
+  type Control = { key: string; done: boolean; queued?: true; expected?: { host: string; run_id: string } };
+  const cancelling = signal(false), editingRun = signal(false), reopening = signal(false), actionError = signal(""), actionNotice = signal("");
+  const pendingControl = signal<Control | null>(null);
+  const cleanupBusy = signal(false), cleanupError = signal("");
+  const cleanupAttempt = signal<PendingStops | undefined>(undefined);
+  const stopState = () => older() ?? t();
+  const stops = () => stopState()?.stops ?? cleanupAttempt();
+  const stopError = () => stopState()?.stops_error;
+  const stopOwner = () => stopState()?.stop_owner;
+  const pendingReopen = () => props.hub.taskForms().get(props.id)?.pending();
+  const startReopen = () => {
+    const saved = props.hub.taskForms().get(props.id);
+    if (saved?.result() && !saved.pending()) props.hub.taskForms.update((all) => { const next = new Map(all); next.delete(props.id); return next; });
+    reopening.set(true);
+  };
+  async function retryStops(operation_id: string) {
+    const batch = stops();
+    if (!batch || cleanupBusy() || cancelling()) return;
+    if (batch.operation_id !== operation_id) { cleanupError.set("The cleanup operation changed. Review its latest progress before retrying."); return; }
+    cleanupBusy.set(true); cleanupError.set("");
+    const r = await props.hub.api("POST", "/api/tasks/stops/retry", { id: props.id, operation_id: batch.operation_id });
+    if (r.data.task) older.set(r.data.task as TaskInfo);
+    if (!r.ok) { cleanupAttempt.set(stopAttempt(r.data, batch)); cleanupError.set(String(r.data.error ?? "Couldn't confirm the remaining stops")); }
+    else { cleanupAttempt.set(undefined); pendingControl.set(null); actionError.set(""); }
+    cleanupBusy.set(false);
+    await refreshTask();
+  }
+  async function readTask() {
+    const snapshot = props.hub.status();
+    const r = await props.hub.api("GET", `/api/tasks/get?id=${encodeURIComponent(props.id)}`);
+    if (r.ok && r.data.id !== props.id) return { ok: false, status: 502, data: { error: "Could not verify this task's identity. Refresh its details before changing it." } };
+    if (r.ok) {
+      const task = r.data as TaskInfo;
+      older.set(task);
+      detailSnapshot.set(snapshot);
+      const attempted = cleanupAttempt();
+      if (attempted && task.stops?.operation_id === attempted.operation_id) cleanupAttempt.set(task.stops);
+      else if (attempted && !task.stops && !task.stops_error && ["done", "cancelled", "failed"].includes(task.state ?? ""))
+        cleanupAttempt.set({ ...attempted, pending: [], unresolved: [] });
+      const pending = pendingControl();
+      if (pending && (task.state && !["active", "inbox", "nohost", "waiting", "parked", "blocked", "proposed"].includes(task.state)
+        || pending.expected && task.run_id && task.run_id !== pending.expected.run_id || pending.queued && task.state === "active")) pendingControl.set(null);
+    } else if (r.status === 404) missing.set(true);
+    return r;
+  }
+  async function refreshTask() { await props.hub.refreshStatus(); return readTask(); }
+  // Other devices and background recovery can change a terminal task's cleanup too.
+  poll(() => { if (!cleanupBusy() && !cancelling()) void readTask(); });
+  async function prepareControl(done: boolean): Promise<Control | null> {
+    if (cancelling() || cleanupBusy()) return null;
+    cancelling.set(true);
+    const capability = await props.hub.api("GET", "/api/stops/capabilities");
+    cancelling.set(false);
+    if (!capability.ok || capability.data.family_stops !== 1) { actionError.set("Connect or update the main machine to confirm task-family stops."); return null; }
+    let task = t();
+    if (task?.state !== "active") return { done, queued: true, key: newRequestKey() };
+    if (!validMachineHost(task.host) || !validRunId(task.run_id)) {
+      const r = await refreshTask();
+      if (r.ok) task = r.data as TaskInfo;
+      if (!task || task.state !== "active" || !validMachineHost(task.host) || !validRunId(task.run_id)) {
+        actionError.set("Refresh this task after updating its machine to use run-specific controls."); return null;
+      }
+    }
+    return { done, key: newRequestKey(), expected: { host: task.host!, run_id: task.run_id! } };
+  }
+  async function endTask(control: Control) {
+    if (cancelling()) return;
+    cancelling.set(true); actionError.set(""); actionNotice.set("");
+    const r = await props.hub.api("POST", "/api/tasks/cancel", { id: props.id, ...(control.done ? { done: true } : {}), ...(control.queued ? { queued: true } : {}), ...control.expected }, control.key);
+    cancelling.set(false);
+    if (!r.ok) {
+      pendingControl.set(r.status === 0 || r.status === 202 || r.data.pending === true || r.data.uncertain === true || r.data.saved_locally === true ? control : null);
+      if (r.data.saved_locally) cleanupAttempt.set(stopAttempt(r.data, stops()));
+      actionError.set(String(r.data.error ?? `Could not ${control.done ? "finish" : "cancel"} this task. Try again.`));
+      if (r.status === 409 || r.data.saved_locally) await refreshTask();
+      return;
+    }
+    pendingControl.set(null);
+    actionNotice.set(control.done ? "Marked done." : "Cancellation confirmed.");
+    await refreshTask();
+    const current = t();
+    if (current?.state === "active" && current.run_id && (control.queued || current.run_id !== control.expected?.run_id))
+      actionNotice.set("Earlier request confirmed. This task has a newer run; review it before taking another action.");
+  }
   async function cancel() {
+    const control = await prepareControl(false);
+    if (!control) return;
     const running = t()?.state === "active";
     const r = await AlertDialog.show({
       title: `Cancel ${props.id}?`,
@@ -1508,12 +2287,12 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
       ],
     });
     if (r.action !== "cancel") return;
-    cancelling.set(true);
-    try { await props.hub.api("POST", "/api/tasks/cancel", { id: props.id }); }
-    catch { cancelling.set(false); }
+    await endTask(control);
   }
   // the owner already finished it himself (merged by hand, …): end it as done, not cancelled
   async function finish() {
+    const control = await prepareControl(true);
+    if (!control) return;
     const r = await AlertDialog.show({
       title: `Mark ${props.id} as done?`,
       description: t()?.state === "active" ? "The running agent will be stopped and the task is recorded as done." : "The task is recorded as done and will not run again.",
@@ -1523,9 +2302,7 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
       ],
     });
     if (r.action !== "done") return;
-    cancelling.set(true);
-    try { await props.hub.api("POST", "/api/tasks/cancel", { id: props.id, done: true }); }
-    catch { cancelling.set(false); }
+    await endTask(control);
   }
   // the task is its own conversation: what the owner and the team said about it, and a box to keep talking
   const saying = signal<HubEvent[]>([]);
@@ -1534,13 +2311,15 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
     return merge(merge(older()?.events ?? [], props.hub.events()), saying()).filter((e) => !!e.ref && refs.has(e.ref) && (e.thread || !(isHub(e.from) && e.kind === "system")));
   });
   const settled = computed(() => answeredIds(talk()));
-  const text = signal("");
+  const text = props.hub.taskDrafts.get(props.id) ?? signal("");
+  props.hub.taskDrafts.set(props.id, text);
   const note = signal("");
   const hint = signal("");
   let said = 0;
   async function say() {
     const v = text().trim();
     if (!v) return;
+    if (t()?.state === "cancelled") { note.set("Reopen this task with instructions and run settings before continuing."); return; }
     // reads as sent at once; only a failure brings the words back to the box, with the reason
     const id = `local:${++said}`;
     saying.update((l) => [...l, { id, ts: new Date().toISOString(), from: "owner", kind: "owner", ref: props.id, thread: true, text: v }]);
@@ -1565,14 +2344,20 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
               <Badge label={t()!.state === "nohost" ? `Waiting for a ${needsLabel(t()!.needs)}` : STATE_OF()[t()!.state ?? ""]?.[0] ?? t()!.state ?? ""} tone={t()!.state === "failed" ? "danger" : t()!.state === "blocked" ? "warn" : "neutral"} />
               <Text style={{ fontFamily: MONO, fontSize: 13, color: colors.muted }}>{t()!.id}</Text>
               <View style={{ flex: 1 }} />
-              <If when={cancellable() && !cancelling()}>
+              <If when={cancellable() && !cancelling() && !pendingControl() && !cleanupBusy() && !stops() && !stopError() && !stopOwner()}>
                 <Btn testID="finish-task" label="Done" kind="ghost" icon="check" onPress={() => void finish()} />
                 <Btn testID="cancel-task" label="Cancel task" kind="ghost" icon="close" onPress={() => void cancel()} />
               </If>
               <If when={cancelling()}>
                 <Text style={{ fontSize: 13, color: colors.muted }}>Working…</Text>
               </If>
+              <If when={pendingControl() && !cancelling() && !cleanupBusy() && !stops() && !stopError() && !stopOwner()}>
+                <Btn testID="task-control-check" label="Check same request" kind="secondary" onPress={() => { const control = pendingControl(); if (control) void endTask(control); }} />
+              </If>
             </View>
+            <If when={actionError()}><Text testID="task-action-error" style={{ fontSize: 13, lineHeight: 19, color: colors.danger }}>{actionError()}</Text></If>
+            <If when={actionError()}><Btn testID="task-control-refresh" label="Refresh task" kind="ghost" onPress={() => void refreshTask()} /></If>
+            <If when={actionNotice()}><Text testID="task-action-notice" style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{actionNotice()}</Text></If>
             <Text style={{ userSelect: "text", fontSize: 20, fontWeight: "600", color: colors.text }}>{t()!.title}</Text>
             <Text style={{ fontSize: 14, color: colors.muted }}>
               {[displayName(t()!.agent), t()!.host, t()!.model ?? t()!.cli,
@@ -1581,6 +2366,24 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
                 Number(t()!.attempt ?? 1) > 1 ? `Attempt ${t()!.attempt}` : ""].filter(Boolean).join(" · ")}
             </Text>
           </View>
+          <RemainingStops hub={props.hub} owner={{ kind: "task", id: props.id }} batch={stops()} error={stopError()} busy={cleanupBusy() || cancelling()} onRetry={(operation_id) => void retryStops(operation_id)} onRefresh={() => void refreshTask()}
+            onReviewed={(data, saved) => {
+              const batch = stopAttempt(data, stops());
+              if ((data.task as TaskInfo | undefined)?.id === props.id) older.set(data.task as TaskInfo);
+              cleanupAttempt.set(saved ? undefined : batch);
+              cleanupError.set(saved ? "" : String(data.error ?? "Review saved locally; synchronization is unconfirmed."));
+              if (saved) { actionError.set(""); pendingControl.set(null); }
+            }} />
+          <StopReviewHistory reviews={stopState()?.stop_reviews ?? cleanupAttempt()?.reviews ?? []} />
+          <If when={pendingReopen() || ["done", "failed", "cancelled"].includes(t()!.state ?? "")}>
+            <Btn testID="task-reopen" label={pendingReopen() ? "Check task reopening" : "Reopen with run settings"} kind="secondary"
+              disabled={cancelling() || cleanupBusy() || !pendingReopen() && (hasPendingStops(stops()) || !!stopError() || !!stopOwner())} onPress={startReopen} />
+          </If>
+          <If when={cleanupError()}><Text testID="stop-error" style={{ marginTop: 8, fontSize: 13, lineHeight: 19, color: colors.danger }}>{cleanupError()}</Text></If>
+          <If when={stopOwner()}><View style={{ marginTop: 12, gap: 6 }}>
+            <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>This run is part of an earlier stop request.</Text>
+            <Btn testID="stop-open-owner" label={`Open ${stopOwner()!.id}`} kind="ghost" onPress={() => { const owner = stopOwner(); if (owner?.kind === "plan") planLink(owner.id); else if (owner) taskLink(owner.id); }} />
+          </View></If>
           <If when={t()!.state === "active" ? activityLine(t()!.activity) : null}>
             {(a) => (
               <Text testID="task-activity" style={{ marginTop: 10, fontSize: 13.5, lineHeight: 19, color: a().quiet ? colors.warn : colors.muted }}>{a().text}</Text>
@@ -1589,13 +2392,19 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
           <If when={t()!.state === "nohost"}>
             <View testID="task-nohost" style={{ marginTop: 16, paddingHorizontal: 14, paddingVertical: 11, borderRadius: radius.inset, backgroundColor: tints.warn }}>
               <Text style={{ fontSize: 14, lineHeight: 21, color: colors.text }}>
-                {`No ${needsLabel(t()!.needs)} is online right now, and other machines can't take this task even when idle. It starts automatically once one comes online; cancel it if you don't need it.`}
+                {`No ${needsLabel(t()!.needs)} is online right now. Change the run settings below to use an available machine, or keep these requirements and it will start when a matching machine connects.`}
               </Text>
             </View>
           </If>
           <If when={t()!.request}>
             {section("Request")}
             <View selectable><Rich text={t()!.request ?? ""} context={t()!.title} /></View>
+          </If>
+          <If when={t()!.state === "inbox" || t()!.state === "nohost"}>
+            <If when={t()!.state !== "nohost"}>
+              <Btn testID="task-edit-run" label={editingRun() ? "Hide run settings" : "Edit run settings"} kind="ghost" onPress={() => editingRun.set(!editingRun())} />
+            </If>
+            <If when={t()!.state === "nohost" || editingRun()}><TaskPlacement hub={props.hub} task={t()!} /></If>
           </If>
           <If when={talk().length}>
             {section("Conversation")}
@@ -1654,7 +2463,7 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
         </If>
       </View>
     </Scroll>
-    <If when={t()}>
+    <If when={t() && (t()!.state !== "cancelled" || !!text().trim())}>
       <View
         onLayout={({ bounds }) => composerHeight.set(bounds.size.height)}
         style={{ position: "absolute", bottom: 0, width: "100%", maxWidth: size.column, alignSelf: "center", gap: 6, paddingHorizontal: props.wide ? 32 : 10, paddingTop: 4, paddingBottom: 12, pointerEvents: "box-none" }}
@@ -1665,9 +2474,11 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
         <If when={hint() && !note()}>
           <Text style={{ fontSize: 13, color: colors.muted }}>{hint()}</Text>
         </If>
+        <If when={t()!.state === "cancelled"}><Text style={{ fontSize: 13, color: colors.muted }}>Your unsent draft is kept. Reopen this task to continue with it.</Text></If>
         <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8, paddingLeft: 16, paddingRight: 8, paddingVertical: 8, ...composerGlass() }}>
           <Input
             testID="task-composer"
+            disabled={t()!.state === "cancelled"}
             multiline
             value={text()}
             onChange={({ value }) => text.set(value)}
@@ -1677,10 +2488,11 @@ function TaskDetail(props: { hub: Hub; id: string; wide: boolean }) {
             class="placeholder:text-faint"
             style={{ flex: 1, minHeight: 36, maxHeight: 160, paddingVertical: 8, fontSize: 15, lineHeight: 21, color: colors.text, borderWidth: 0, backgroundColor: "transparent" }}
           />
-          <SendButton testID="task-send" disabled={!text().trim()} onPress={() => void say()} />
+          <SendButton testID="task-send" disabled={!text().trim() || t()!.state === "cancelled"} onPress={() => void say()} />
         </View>
       </View>
     </If>
+    <If when={reopening()}><TaskForm hub={props.hub} id={props.id} isCurrent={props.isCurrent} onClose={() => reopening.set(false)} onOpen={() => { reopening.set(false); void refreshTask(); }} /></If>
     </View>
   );
 }
@@ -1695,12 +2507,316 @@ function Meter(props: { pct: number; tone?: "up" | "warn" | "danger" }) {
   );
 }
 
-const ACCOUNT_STATE: Record<string, [string, "neutral" | "warn" | "danger"]> = { ok: ["Available", "neutral"], cooldown: ["Cooling down", "warn"], login: ["Needs sign-in", "danger"] };
+const ACCOUNT_STATE: Record<string, [string, "neutral" | "warn" | "danger"]> = { unknown: ["Not checked", "neutral"], ok: ["Signed in", "neutral"], cooldown: ["Cooling down", "warn"], login: ["Needs sign-in", "danger"] };
 
 const ago = (iso?: string) => { const s = since(iso); return s === "just now" || !s ? s : `${s} ago`; };
 
+function MachineSettings(props: { hub: Hub; host: string; onTask: (id: string) => void }) {
+  const enabled = signal(true), limit = signal<number | null>(null), caps = signal("");
+  const loaded = signal(false), busy = signal(false), note = signal(""), resources = signal(false);
+  async function load() {
+    const r = await props.hub.api("GET", `/api/machines/${encodeURIComponent(props.host)}`);
+    if (!r.ok) return note.set(String(r.data.error ?? "Couldn't load machine settings"));
+    enabled.set(r.data.enabled !== false);
+    limit.set(typeof r.data.max_parallel === "number" ? r.data.max_parallel : null);
+    caps.set(Array.isArray(r.data.caps) ? r.data.caps.join(", ") : "");
+    loaded.set(true);
+  }
+  void load();
+  async function save() {
+    busy.set(true); note.set("");
+    const r = await props.hub.api("PUT", `/api/machines/${encodeURIComponent(props.host)}`, {
+      enabled: enabled(), max_parallel: limit(), caps: caps().split(",").map((c) => c.trim()).filter(Boolean),
+    });
+    busy.set(false);
+    note.set(r.ok ? "Saved. This machine will apply these settings on its next sync. Running tasks keep going." : String(r.data.error ?? "Couldn't save machine settings"));
+  }
+  return <View testID="machine-settings" style={{ marginTop: 20, gap: 12, padding: 14, borderRadius: radius.inset, backgroundColor: colors.surface }}>
+    <Text role="header" style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>Run settings</Text>
+    <If when={loaded()} else={<Btn testID="machine-settings-reload" label="Load settings" disabled={busy()} onPress={() => void load()} />}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+        <Toggle testID="machine-enabled" label="Accept new tasks" value={enabled()} onChange={(v) => { enabled.set(v); note.set(""); }} />
+        <View style={{ flex: 1, gap: 3 }}>
+          <Text style={{ fontSize: 14, color: colors.text }}>Accept new tasks</Text>
+          <Text style={{ fontSize: 13, lineHeight: 18, color: colors.muted }}>Turn off to finish current work without starting more tasks.</Text>
+        </View>
+      </View>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+        <Toggle testID="machine-auto" label="Automatic parallelism" value={limit() === null} onChange={(v) => { limit.set(v ? null : 2); note.set(""); }} />
+        <Text style={{ flex: 1, fontSize: 14, color: colors.text }}>Automatic parallelism</Text>
+        <If when={limit() !== null}><ParallelInput value={limit() ?? 2} onChange={(v) => { limit.set(v); note.set(""); }} /></If>
+      </View>
+      <Field testID="machine-caps" label="Custom capabilities" value={caps()} onChange={(v) => { caps.set(v); note.set(""); }} hint="Labels such as docker, gpu or home, separated by commas. OS, architecture and installed tools are detected automatically." />
+      <Btn testID="machine-settings-save" label="Save machine settings" kind="primary" busy={busy()} disabled={busy()} onPress={() => void save()} />
+    </If>
+    <Btn testID="machine-resources" label={resources() ? "Hide advanced settings" : "Edit resources and learning history"} kind="ghost" onPress={() => resources.set(!resources())} />
+    <If when={resources()}><ConfigurationSettings hub={props.hub} machine={props.host} onTask={props.onTask} /></If>
+    <If when={note()}><Text testID="machine-settings-note" style={{ fontSize: 13, lineHeight: 19, color: colors.text }}>{note()}</Text></If>
+  </View>;
+}
+
+type MachineAccount = { cli: string; name: string; default: boolean; state: "unknown" | "ok" | "cooldown" | "login"; until?: string;
+  login?: { id: string; url?: string; user_code?: string; needs_code: boolean; expires: string; status: string } };
+type MachineAccountView = { host: string; providers: ProviderStatus[]; accounts: MachineAccount[] };
+
+/** Commands and sign-in challenges stay bound to the selected machine. */
+function MachineAccounts(props: { hub: Hub; host: string }) {
+  const expanded = signal(false), view = signal<MachineAccountView | null>(null), busy = signal(false), note = signal("");
+  const cli = signal("claude"), name = signal(""), codes = signal<Record<string, string>>({}), recovery = signal<string | null>(null);
+  const endpoint = `/api/machines/${encodeURIComponent(props.host)}/accounts`;
+  const key = (account: MachineAccount) => `${account.cli}-${encodeAccountSegment(account.name)}`;
+  const pending = (account: MachineAccount) => !!account.login && ["starting", "waiting", "submitted"].includes(account.login.status);
+  let timer: ReturnType<typeof setTimeout> | undefined, revision = 0, disposed = false;
+  cleanup(() => { disposed = true; clearTimeout(timer); });
+  function schedule() {
+    clearTimeout(timer);
+    if (!disposed && expanded() && view()?.accounts.some(pending)) timer = setTimeout(() => void load(true), 2000);
+  }
+  function accept(data: Record<string, unknown>) {
+    if (data.host === props.host && Array.isArray(data.accounts) && Array.isArray(data.providers)) view.set(data as MachineAccountView);
+  }
+  async function load(silent = false) {
+    if (busy() || disposed) return;
+    const started = ++revision;
+    if (!silent) { busy.set(true); note.set(""); }
+    const r = await props.hub.api("GET", endpoint);
+    if (!disposed && started === revision && expanded()) {
+      if (r.ok) accept(r.data);
+      else if (!silent) note.set(r.status === 404 ? "Update the hub and this machine to manage its AI accounts." : String(r.data.error ?? "Couldn't load accounts on this machine"));
+    }
+    if (!silent) busy.set(false);
+    schedule();
+  }
+  async function perform(method: string, path: string, body?: unknown) {
+    if (busy()) return;
+    ++revision; clearTimeout(timer); busy.set(true); note.set("");
+    const r = await props.hub.api(method, path, body);
+    if (r.ok) { accept(r.data); recovery.set(null); note.set("Confirmed on this machine."); }
+    else {
+      const confirmation = r.data.confirmation;
+      recovery.set(typeof confirmation === "string" && /^\/api\/machine-requests\/[a-f0-9-]{36}$/.test(confirmation) ? confirmation : null);
+      note.set(method === "PUT" && r.status === 405 ? "Update this machine to change account priority or restore file defaults." : String(r.data.error ?? "This machine could not confirm the account action"));
+    }
+    busy.set(false); schedule();
+  }
+  const accountPath = (account: MachineAccount) => `${endpoint}/${account.cli}/${encodeAccountSegment(account.name)}`;
+  const accountOrder = (provider: string) => (view()?.accounts ?? []).filter((account) => account.cli === provider).map((account) => account.name);
+  function move(account: MachineAccount, direction: number) {
+    const names = accountOrder(account.cli), from = names.indexOf(account.name), to = from + direction;
+    if (from < 0 || to < 0 || to >= names.length) return;
+    [names[from], names[to]] = [names[to]!, names[from]!];
+    void perform("PUT", endpoint, { cli: account.cli, names });
+  }
+
+  async function remove(account: MachineAccount) {
+    const result = await AlertDialog.show({ title: `Remove ${account.cli} account ${account.name}?`,
+      description: "This removes it from Noop's account rotation on this machine. Credentials and running work stay intact. Removing the last account pauses this tool until you add an account or its default login.",
+      actions: [{ id: "cancel", label: "Cancel", role: "cancel" }, { id: "remove", label: "Remove", role: "destructive" }] });
+    if (result.action === "remove") await perform("DELETE", accountPath(account));
+  }
+  function toggle() {
+    expanded.set(!expanded());
+    if (expanded()) void load();
+    else { ++revision; clearTimeout(timer); codes.set({}); note.set(""); }
+  }
+  return <View testID="machine-accounts" style={{ marginTop: 16, gap: 12 }}>
+    <Btn testID="machine-accounts-open" label={expanded() ? "Hide AI account settings" : "Manage AI accounts and sign-in"} kind="ghost" disabled={busy()} onPress={toggle} />
+    <If when={expanded()}><View style={{ gap: 14, padding: 14, borderRadius: radius.inset, backgroundColor: colors.surface }}>
+      <Text role="header" style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>AI accounts on {props.host}</Text>
+      <Text style={{ fontSize: 13, lineHeight: 18, color: colors.muted }}>Account choices and persistent credentials stay on this machine. Sign-in links and one-time codes use its private command channel. “Not checked” means no successful sign-in or authenticated run has been observed.</Text>
+      <If when={view()}>{(current) => <>
+        <Each of={current().providers} key={(provider) => provider.id}>{(provider) => <View style={{ gap: 8 }}>
+          <Text style={{ color: colors.text, fontWeight: "600" }}>{provider().label}{provider().enabled ? "" : " · disabled for work"}</Text>
+          <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>The first usable account is tried first. Move accounts to change their priority. File defaults restore this tool's configured accounts on this machine.</Text>
+          <If when={!provider().available}><Text style={{ color: colors.warn, fontSize: 13 }}>{provider().reason ?? "This tool cannot launch on this machine."}</Text></If>
+          <If when={!current().accounts.some((account) => account.cli === provider().id)}><Text testID={`accounts-empty-${provider().id}`} style={{ color: colors.warn, fontSize: 13 }}>No accounts selected. This tool is paused on this machine.</Text></If>
+          <Each of={current().accounts.filter((account) => account.cli === provider().id)} key={key}>{(account) => <View testID={`account-${key(account())}`} style={{ gap: 8, padding: 10, borderWidth: 0.5, borderColor: colors.line, borderRadius: radius.control }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <Text style={{ flex: 1, color: colors.text }}>{account().name}{account().default ? " · normal CLI login" : ""}</Text>
+              <Badge label={ACCOUNT_STATE[account().state]?.[0] ?? account().state} tone={ACCOUNT_STATE[account().state]?.[1] ?? "neutral"} />
+            </View>
+            <If when={account().until}><Text style={{ color: colors.muted, fontSize: 13 }}>Cooling down until {account().until}</Text></If>
+            <If when={account().cli === "hermes"}><Text style={{ color: colors.muted, fontSize: 13 }}>Hermes authentication currently uses its native model setup on this machine.</Text></If>
+            <If when={account().login}>{(login) => <View style={{ gap: 8 }}>
+              <Text testID={`login-state-${key(account())}`} style={{ color: colors.muted, fontSize: 13 }}>{`Sign-in ${login().id}: ${login().status} · expires ${login().expires}`}</Text>
+              <If when={pending(account()) && login().url && /^https:\/\//.test(login().url!)}><Btn testID={`login-open-${key(account())}`} label="Open sign-in page" kind="ghost" onPress={() => void openUrl(login().url!).catch(() => note.set("Couldn't open the sign-in page"))} /></If>
+              <If when={pending(account()) && login().user_code}><View selectable><Text testID={`login-device-${key(account())}`} style={{ color: colors.text, fontFamily: MONO }}>Device code: {login().user_code}</Text></View></If>
+              <If when={pending(account()) && login().needs_code && login().status === "waiting"}>
+                <Field testID={`login-code-${key(account())}`} label="Authorization code from the sign-in page" masked value={codes()[key(account())] ?? ""} onChange={(value) => codes.update((all) => ({ ...all, [key(account())]: value }))} maxLength={8192} />
+                <Btn testID={`login-submit-${key(account())}`} label="Submit authorization code" disabled={busy() || !codes()[key(account())]?.trim()} onPress={() => { const value = codes()[key(account())] ?? ""; codes.update((all) => ({ ...all, [key(account())]: "" })); void perform("POST", `${accountPath(account())}/code`, { id: login().id, code: value }); }} />
+              </If>
+              <If when={pending(account())}><Btn testID={`login-cancel-${key(account())}`} label="Cancel sign-in" kind="ghost" disabled={busy()} onPress={() => { codes.update((all) => ({ ...all, [key(account())]: "" })); void perform("POST", `${accountPath(account())}/cancel`, { id: login().id }); }} /></If>
+            </View>}</If>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+              <If when={account().cli !== "hermes"}><Btn testID={`account-login-${key(account())}`} label="Sign in" disabled={busy() || !provider().available || pending(account())} onPress={() => void perform("POST", `${accountPath(account())}/login`, {})} /></If>
+              <Btn testID={`account-remove-${key(account())}`} label="Remove from Noop" kind="ghost" disabled={busy() || pending(account())} onPress={() => void remove(account())} />
+              <Btn testID={`account-up-${key(account())}`} label="Move up" kind="ghost" disabled={busy() || accountOrder(account().cli).indexOf(account().name) <= 0} onPress={() => move(account(), -1)} />
+              <Btn testID={`account-down-${key(account())}`} label="Move down" kind="ghost" disabled={busy() || accountOrder(account().cli).indexOf(account().name) >= accountOrder(account().cli).length - 1} onPress={() => move(account(), 1)} />
+            </View>
+          </View>}</Each>
+          <Btn testID={`accounts-defaults-${provider().id}`} label="Use file account defaults" kind="ghost" disabled={busy()} onPress={() => void perform("PUT", endpoint, { cli: provider().id, names: null })} />
+        </View>}</Each>
+        <Text role="header" style={{ color: colors.text, fontWeight: "600" }}>Add an account</Text>
+        <Dropdown testID="account-provider" label="AI tool" selected={cli()} value={providerLabel(cli())} options={PROVIDER_IDS.map((id) => ({ id, label: providerLabel(id), testID: `account-provider-${id}` }))} onPick={(id) => cli.set(id)} />
+        <Field testID="account-name" label="Account name" value={name()} onChange={(value) => name.set(value)} hint="Lowercase letters, numbers, dashes or underscores. Existing file account names keep their configured folders. Otherwise default selects the tool's normal login; new names get their own folder." maxLength={40} />
+        <Btn testID="account-add" label="Add to account rotation" kind="primary" disabled={busy() || !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(name())} onPress={() => void perform("POST", endpoint, { cli: cli(), name: name() })} />
+      </>}</If>
+      <Btn testID="accounts-refresh" label={busy() ? "Waiting for this machine…" : "Refresh accounts"} kind="ghost" disabled={busy()} onPress={() => void load()} />
+      <If when={recovery()}><Btn testID="accounts-confirm" label="Check the same pending action" disabled={busy()} onPress={() => void perform("GET", recovery()!)} /></If>
+      <If when={note()}><Text testID="accounts-note" style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{note()}</Text></If>
+    </View></If>
+  </View>;
+}
+
+function MachineLearning(props: { hub: Hub; host: string; onTask: (id: string) => void; disabled?: boolean; refreshToken?: unknown }) {
+  return <Each of={[props.host]} key={(host) => host}>{(host) => <MachineLearningHost hub={props.hub} host={host()} onTask={props.onTask} disabled={props.disabled} refreshToken={props.refreshToken} />}</Each>;
+}
+function MachineLearningHost(props: { hub: Hub; host: string; onTask: (id: string) => void; disabled?: boolean; refreshToken?: unknown }) {
+  const status = signal<LearningStatus | undefined>(undefined), preview = signal<LearningPreview | undefined>(undefined), result = signal<LearningRunResult | undefined>(undefined);
+  const busy = signal(false), note = signal(""), good = signal(false), unavailable = signal(false), knownId = signal("");
+  let generation = 0, disposed = false;
+  cleanup(() => { disposed = true; generation++; });
+  const endpoint = `/api/machines/${encodeURIComponent(props.host)}/learning`;
+  const pending = () => props.hub.savedEntries().find((entry): entry is Extract<PendingEntry, { kind: "learning" }> => entry.kind === "learning" && entry.key === props.host);
+  const serverPending = () => status()?.pending;
+  const pendingConflict = () => { const local = pending(), remote = serverPending(); return !!local && !!remote && (local.request.request_id !== remote.request_id || local.request.preview_digest !== remote.preview_digest
+    || local.preview.turns !== remote.turns || local.preview.sessions !== remote.sessions || local.preview.truncated !== remote.truncated || JSON.stringify(local.preview.sources) !== JSON.stringify(remote.sources)
+    || !!local.known_id && local.known_id !== remote.id); };
+  const reviewed = () => pending()?.preview ?? preview(), taskId = () => pending()?.known_id ?? (knownId() || result()?.id || "");
+  async function load(keepNote = false) {
+    if (busy()) return;
+    const mine = ++generation;
+    busy.set(true); status.set(undefined); preview.set(undefined); if (!keepNote) { note.set(""); good.set(false); } unavailable.set(false);
+    const r = await props.hub.api("GET", endpoint, undefined, newRequestKey());
+    if (mine !== generation) return;
+    const value = readLearningStatus(r.data);
+    if (r.ok && value?.host === props.host) status.set(value);
+    else { unavailable.set(r.status === 404 || r.status === 409); note.set(r.status === 404 || r.status === 409 ? "Update this machine, hub and app to preview and run learning here." : String(r.data.error ?? `Couldn't load learning status for ${props.host}. No other machine was selected.`)); }
+    busy.set(false);
+  }
+  async function inspect() {
+    const id = taskId(); if (!id || busy()) return;
+    const mine = ++generation;
+    busy.set(true); const r = await props.hub.api("GET", `/api/tasks/get?id=${encodeURIComponent(id)}`);
+    if (mine !== generation) return;
+    busy.set(false);
+    if (!r.ok || r.data.id !== id) { good.set(false); note.set(String(r.data.error ?? "This learning task is no longer available. The saved receipt remains historical.")); return; }
+    props.onTask(id);
+  }
+  async function review() {
+    if (busy() || pending() || props.disabled || !status() || status()!.blocked_reason) return;
+    const mine = ++generation;
+    busy.set(true); preview.set(undefined); result.set(undefined); knownId.set(""); note.set(""); good.set(false);
+    const r = await props.hub.api("POST", `${endpoint}/preview`, {}, newRequestKey());
+    if (mine !== generation) return;
+    const value = readLearningPreview(r.data);
+    if (r.ok && value?.host === props.host) preview.set(value);
+    else note.set(String(r.data.error ?? "Couldn't verify a count-only learning preview for this machine. Refresh status and try again."));
+    busy.set(false);
+  }
+  async function run(mode: "run" | "check" | "retry" | "discard") {
+    if (disposed || busy() || props.hub.savedLoading() || props.hub.savedError()) return;
+    const started = generation;
+    let entry = pending();
+    if (!entry) {
+      if (mode !== "run" || !preview() || !status() || status()!.blocked_reason || props.disabled) return;
+      entry = { kind: "learning", key: props.host, at: props.hub.savedAt("learning", props.host), preview: preview()!, request: { request_id: crypto.randomUUID(), preview_digest: preview()!.preview_digest } };
+    }
+    if (mode === "retry" || mode === "discard") {
+      const answer = await AlertDialog.show({ title: mode === "discard" ? "Release the uncertain collection?" : "Retry the same learning run?",
+        description: mode === "discard" ? "This leaves tasks and current learning progress unchanged. A fresh preview may include the same history. It releases only this exact uncertain collection; it does not cancel a task."
+          : "If the original run was not applied, this may collect the same reviewed history and queue its learning task on this machine. It keeps the original request and preview; it does not select newer history.",
+        actions: [{ id: "back", label: "Back", role: "cancel" }, { id: "run", label: mode === "discard" ? "Release collection" : "Retry same run" }] });
+      if (answer.action !== "run" || disposed || started !== generation || busy() || pending()?.request.request_id !== entry.request.request_id) return;
+    }
+    const mine = ++generation, current = entry;
+    busy.set(true); note.set(""); good.set(false); let refreshAfter = false;
+    try {
+      if (!await props.hub.keepPending(current)) { note.set(props.hub.savedError() || "Load saved requests before starting learning."); return; }
+      if (mine !== generation) return;
+      const request = { ...current.request, ...(mode === "check" ? { confirm_only: true as const } : {}) };
+      const r = await props.hub.learningRun(props.host, request, mode === "discard");
+      if (mine !== generation || pending()?.request.request_id !== current.request.request_id) return;
+      const value = learningReceipt(r.data, props.host, current.request, current.preview, current.known_id);
+      const released = learningRelease(r.data, props.host, current.request, current.known_id);
+      const id = value?.id ?? released?.id ?? learningTaskId(r.data, props.host, current.request, current.known_id);
+      if (id) { knownId.set(id); if (!await props.hub.keepPending({ ...current, known_id: id })) { note.set(props.hub.savedError()); return; } }
+      if (!r.ok || !value && !released) { note.set(String(r.data.error ?? "This learning run is unconfirmed. Check the saved run before starting another one.")); return; }
+      result.set(value);
+      if (!await props.hub.dropPending("learning", props.host, current.request.request_id)) { note.set("Learning run confirmed, but its local recovery copy could not be cleared. Reload saved requests and check the same run again."); return; }
+      preview.set(undefined); good.set(true);
+      note.set(released ? "The uncertain collection was released. Tasks and current learning progress were left unchanged. Review a fresh preview before another run."
+        : mode === "check" || value!.replayed ? value!.id ? "Earlier learning run confirmed. Inspect the task to check its current state." : "Earlier learning run confirmed. It did not create a learning task."
+        : value!.id ? `Learning task ${value!.id} queued on ${props.host} from ${value!.turns} owner turns in ${value!.sessions} provider sessions.` : `No new selected history on ${props.host}. No learning task was created.`);
+      refreshAfter = true;
+      void props.hub.refreshStatus();
+    } finally { busy.set(false); if (refreshAfter && mine === generation) void load(true); }
+  }
+  async function adopt() {
+    const remote = serverPending(); if (!remote || busy() || pendingConflict()) return;
+    const entry: Extract<PendingEntry, { kind: "learning" }> = { kind: "learning", key: props.host, at: props.hub.savedAt("learning", props.host),
+      request: { request_id: remote.request_id, preview_digest: remote.preview_digest },
+      preview: { host: props.host, preview_digest: remote.preview_digest, sources: remote.sources, turns: remote.turns, sessions: remote.sessions, truncated: remote.truncated }, ...(remote.id ? { known_id: remote.id } : {}) };
+    const mine = ++generation;
+    busy.set(true); note.set(""); good.set(false);
+    try {
+      const saved = await props.hub.keepPending(entry); if (mine !== generation) return;
+      if (!saved) note.set(props.hub.savedError() || "Reload saved requests before reviewing this collection.");
+      else { knownId.set(remote.id ?? ""); preview.set(undefined); result.set(undefined); note.set("Saved collection reviewed. Check its saved run or explicitly release the uncertainty; no history was read and no task was queued."); }
+    } finally { busy.set(false); }
+  }
+  async function forget() {
+    const entry = pending(); if (!entry || disposed || busy()) return;
+    const started = generation;
+    const answer = await AlertDialog.show({ title: "Forget this saved learning run?", description: "This removes only this device's recovery copy. The earlier run may still finish. No learning task or collected history is undone.",
+      actions: [{ id: "keep", label: "Keep saved run", role: "cancel" }, { id: "forget", label: "Forget saved run", role: "destructive" }] });
+    if (answer.action !== "forget" || disposed || started !== generation || busy() || pending()?.request.request_id !== entry.request.request_id) return;
+    const mine = ++generation;
+    busy.set(true);
+    try {
+      const dropped = await props.hub.dropPending("learning", props.host, entry.request.request_id); if (mine !== generation) return;
+      if (dropped) { knownId.set(""); result.set(undefined); preview.set(undefined); note.set(""); }
+      else note.set(props.hub.savedError());
+    } finally { busy.set(false); }
+  }
+  effect(() => { props.refreshToken; untracked(() => void load()); });
+  return <View testID="learning-controls" style={{ gap: 10, marginTop: 20 }}>
+    <Text role="header" style={{ color: colors.text, fontSize: 17, fontWeight: "600" }}>{`Learning on ${props.host}`}</Text>
+    <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 19 }}>Status reads settings and saved collection receipts without reading histories. Preview reads selected local histories and reports counts, without advancing learning progress or creating a task. Run collects that reviewed history and queues a learning task on this machine.</Text>
+    <If when={status()}>{(value) => <>
+      <Text testID="learning-sources" style={{ color: colors.muted, fontSize: 13 }}>{`Selected sources: ${value().sources.map(providerLabel).join(", ") || "None"}`}</Text>
+      <If when={value().blocked_reason}><Text testID="learning-blocked" style={{ color: colors.warn, fontSize: 13 }}>{value().blocked_reason}</Text></If>
+      <If when={props.disabled}><Text style={{ color: colors.warn, fontSize: 13 }}>Save your settings before previewing or starting learning.</Text></If>
+      <Btn testID="learning-preview" label="Preview selected history" disabled={busy() || !!pending() || props.disabled || !!value().blocked_reason} onPress={() => void review()} />
+      <Btn testID="learning-run" label="Run reviewed learning" kind="primary" disabled={busy() || !!pending() || !preview() || props.disabled || !!value().blocked_reason || !props.hub.savedReady() || !!props.hub.savedError()} onPress={() => void run("run")} />
+    </>}</If>
+    <If when={serverPending()}>{(value) => <View testID="learning-server-pending" style={{ gap: 8 }}>
+      <Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>{`${props.host} reports an unfinished collection: ${value().turns} owner turns in ${value().sessions} provider sessions${value().truncated ? " (digest truncated)" : ""}.`}</Text>
+      <Text style={{ color: colors.muted, fontSize: 13 }}>{`Saved sources: ${value().sources.map(providerLabel).join(", ") || "None"}`}</Text>
+      <Text style={{ color: colors.muted, fontSize: 12.5, userSelect: "text" }}>{`Request ${value().request_id}${value().id ? ` · Task ${value().id}` : ""}`}</Text>
+      <If when={pendingConflict()}><Text testID="learning-pending-conflict" style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>A different local saved run already exists for this machine. Check it or explicitly forget its local copy before reviewing the machine's unfinished collection. Neither authorization was replaced.</Text></If>
+      <Btn testID="learning-adopt" label="Review saved collection" disabled={busy() || pendingConflict() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void adopt()} />
+    </View>}</If>
+    <If when={reviewed()}>{(value) => <View testID="learning-preview-counts" style={{ gap: 4 }}>
+      <Text style={{ color: colors.text, fontSize: 14 }}>{`${value().turns} owner turns · ${value().sessions} provider sessions · ${props.host}`}</Text>
+      <Text style={{ color: colors.muted, fontSize: 13 }}>{`Reviewed sources: ${value().sources.map(providerLabel).join(", ") || "None"}`}</Text>
+      <Text style={{ color: value().truncated ? colors.warn : colors.muted, fontSize: 13, lineHeight: 19 }}>{value().truncated ? "The prepared digest exceeded its limit; earlier collected content was omitted. Counts describe the full prepared collection." : "No digest truncation reported."}</Text>
+    </View>}</If>
+    <If when={pending()}><View style={{ gap: 8 }}>
+      <Text testID="learning-pending" style={{ color: colors.warn, fontSize: 13 }}>This learning run is unconfirmed. Checking its saved result does not read history or create another task.</Text>
+      <Btn testID="learning-check" label="Check saved run" kind="primary" disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void run("check")} />
+      <Btn testID="learning-retry" label="Retry same learning run…" disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void run("retry")} />
+      <Btn testID="learning-release" label="Release uncertain collection…" disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void run("discard")} />
+      <Btn testID="learning-forget" label="Forget local copy…" kind="ghost" disabled={busy()} onPress={() => void forget()} />
+    </View></If>
+    <If when={taskId()}><Btn testID="learning-inspect" label="Inspect learning task" disabled={busy()} onPress={() => void inspect()} /></If>
+    <Btn testID="learning-refresh" label="Refresh learning status" kind="ghost" disabled={busy()} onPress={() => void load()} />
+    <If when={note()}><Text testID={unavailable() ? "learning-unsupported" : "learning-note"} style={{ color: good() ? colors.up : colors.warn, fontSize: 13, lineHeight: 19 }}>{note()}</Text></If>
+  </View>;
+}
+
 function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (id: string) => void }) {
-  const h = () => props.hub.status()?.hosts.find((x) => x.host === props.host);
+  const h = () => [...(props.hub.status()?.hosts ?? []), ...(props.hub.status()?.offline_hosts ?? [])].find((x) => x.host === props.host);
   const section = (title: string) => (
     <Text role="header" style={{ fontSize: 13, fontWeight: "600", color: colors.muted, marginTop: 24, marginBottom: 8 }}>{title}</Text>
   );
@@ -1713,7 +2829,7 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
   );
   const load = () => loadOf(h()!);
   const memUsed = () => 100 - (h()!.stats?.memFreePct ?? 100);
-  const diskUsed = () => 100 - (h()!.stats?.diskFreePct ?? 100);
+  const diskUsed = () => h()!.stats?.diskError ? 0 : 100 - (h()!.stats?.diskFreePct ?? 100);
   const toneOf = (pct: number): "up" | "warn" | "danger" => (pct >= 90 ? "danger" : pct >= 70 ? "warn" : "up");
   const row = (id: string, title: string, right: string, mark?: JSX.Element) => (
     <View
@@ -1735,22 +2851,30 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
         <If when={h()} else={<Text style={{ fontSize: 15, color: colors.muted }}>{`${props.host} is offline right now.`}</Text>}>
           <View style={{ gap: 8 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-              <Dot tone="on" />
+              <Dot tone={h()!.online === false ? "off" : h()!.enabled === false ? "wait" : "on"} />
               <Text style={{ userSelect: "text", fontSize: 20, fontWeight: "600", color: colors.text }}>{h()!.host}</Text>
             </View>
             <Text style={{ fontSize: 14, color: colors.muted }}>
-              {["Online", [h()!.os ?? osOf(h()!), h()!.arch].filter(Boolean).join(" "), h()!.seen ? `Last seen ${ago(h()!.seen)}` : "", `${h()!.busy ?? 0} running`].filter(Boolean).join(" · ")}
+              {[h()!.online === false ? "Offline" : h()!.enabled === false ? "Paused for new tasks" : "Online", [h()!.os ?? osOf(h()!), h()!.arch].filter(Boolean).join(" "), h()!.seen ? `Last seen ${ago(h()!.seen)}` : "", `${h()!.busy ?? 0} running`].filter(Boolean).join(" · ")}
             </Text>
+            <If when={h()!.providers?.length}>
+              <View style={{ gap: 5 }}><Each of={h()!.providers ?? []} key={(provider) => provider.id}>{(provider) => <Text style={{ fontSize: 13, color: provider().available ? colors.muted : colors.warn }}>
+                {`${provider().label}: ${provider().available ? "CLI available" : provider().reason ?? "Unavailable"}${provider().enabled ? "" : " · not selected for execution"}`}
+              </Text>}</Each></View>
+            </If>
             <If when={h()!.rev}>
               <RevLink host={h()!} />
             </If>
           </View>
-          {section("Resources")}
+          <MachineSettings hub={props.hub} host={props.host} onTask={props.onTask} />
+          {section(h()!.online === false ? "Last reported resources" : "Resources")}
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
             {stat("Load", `${load()}%${h()!.stats?.cores ? ` · ${h()!.stats!.cores} cores` : ""}`, load(), toneOf(load()))}
             {stat("Memory", h()!.stats?.memFreePct != null ? `${memUsed()}% used` : "Unknown", memUsed(), toneOf(memUsed()))}
-            {stat("Disk", `${h()!.stats?.diskFreeGB ?? "?"} GB free`, diskUsed(), toneOf(diskUsed()))}
+            {stat("Disk", h()!.stats?.diskError ? "Unavailable" : `${h()!.stats?.diskFreeGB ?? "?"} GB free`, diskUsed(), h()!.stats?.diskError ? "warn" : toneOf(diskUsed()))}
           </View>
+          <If when={h()!.stats?.diskPath}><Text testID="machine-disk-path" style={{ marginTop: 8, fontSize: 13, color: colors.muted }}>{`Monitoring: ${h()!.stats!.diskPath}`}</Text></If>
+          <If when={h()!.stats?.diskError}><Text testID="machine-disk-error" style={{ marginTop: 8, fontSize: 13, lineHeight: 19, color: colors.warn }}>{`${h()!.stats!.diskError} New tasks wait until disk monitoring is available. Check this machine's resource configuration.`}</Text></If>
           <If when={h()!.clis?.length || h()!.accounts?.length}>
             {section("Tools and accounts")}
             <View style={{ gap: 8 }}>
@@ -1769,6 +2893,8 @@ function MachineDetail(props: { hub: Hub; host: string; wide: boolean; onTask: (
               </Each>
             </View>
           </If>
+          <MachineAccounts hub={props.hub} host={props.host} />
+          <MachineLearning hub={props.hub} host={props.host} onTask={props.onTask} />
           {section("Running")}
           <If when={h()!.running?.length} else={<Text style={{ fontSize: 14, color: colors.faint }}>Idle</Text>}>
             <View>
@@ -1913,7 +3039,12 @@ function Sidebar(props: {
               <Text style={rowText()}>Memory</Text>
             </SideRow>
           </View>
-          <SideHeading title="Needs your decision" count={waits().length || undefined} accent />
+          <SideHeading title="Needs your decision" count={(waits().length + (s()?.recent ?? []).filter((t) => t.state === "nohost").length) || undefined} accent />
+          <Each of={(s()?.recent ?? []).filter((t) => t.state === "nohost")} key={(t) => t.id}>
+            {(t) => <SideRow onPress={() => props.onTask(t().id)} selected={props.task() === t().id} title={`${t().id} · Change run settings`}>
+              <Dot tone="wait" /><Text style={rowText()}>{t().title}</Text><Text style={{ fontSize: 12.5, color: colors.warn }}>Choose machine</Text>
+            </SideRow>}
+          </Each>
           <Each of={waits()} key={(d) => d.id}>
             {(d) => (
               <ContextMenu
@@ -1938,7 +3069,7 @@ function Sidebar(props: {
               </ContextMenu>
             )}
           </Each>
-          <If when={!waits().length}>
+          <If when={!waits().length && !(s()?.recent ?? []).some((t) => t.state === "nohost")}>
             <SideEmpty text="Nothing pending; the team is moving on its own" />
           </If>
 
@@ -1999,13 +3130,14 @@ function Sidebar(props: {
             <Text style={{ ...rowText(), color: colors.muted }}>All tasks</Text>
           </SideRow>
 
-          <SideHeading title="Machines" count={s()?.hosts.length || undefined} />
-          <Each of={s()?.hosts ?? []} key={(h) => h.host}>
+          <SideHeading title="Machines" count={((s()?.hosts.length ?? 0) + (s()?.offline_hosts?.length ?? 0)) || undefined} />
+          <Each of={[...(s()?.hosts ?? []), ...(s()?.offline_hosts ?? [])]} key={(h) => h.host}>
             {(h) => (
-              <SideRow onPress={() => props.onMachine(h().host)} selected={props.machine() === h().host} title={`Load ${loadOf(h())}% · Disk ${h().stats?.diskFreeGB ?? "?"}GB · ${h().busy ?? 0} running`}>
-                <Dot tone="on" />
+              <SideRow onPress={() => props.onMachine(h().host)} selected={props.machine() === h().host} title={`Load ${loadOf(h())}% · Disk ${h().stats?.diskError ? "unavailable" : `${h().stats?.diskFreeGB ?? "?"}GB`} · ${h().busy ?? 0} running`}>
+                <Dot tone={h().online === false ? "off" : h().enabled === false ? "wait" : "on"} />
                 <Text style={rowText()}>{h().host}</Text>
-                <If when={(h().busy ?? 0) > 0}>
+                <If when={h().online === false || h().enabled === false}><Text style={{ fontSize: 12.5, color: colors.faint }}>{h().online === false ? "Offline" : "Paused"}</Text></If>
+                <If when={h().online !== false && (h().busy ?? 0) > 0}>
                   <Text style={{ fontSize: 13, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${h().busy} running`}</Text>
                 </If>
               </SideRow>
@@ -2152,13 +3284,144 @@ const AUTONOMY_DETAIL: Record<string, string> = {
   assisted: "Handles routine work itself, asks you first on important things",
   autonomous: "Decides on its own, asks only about high-risk things",
 };
-const cliDetail = (c: string[]) =>
-  c.length === 1 ? `Use ${cliLabel([c[0]!]).replace(/\s*only$/, "")} only` : `Use ${cliLabel([c[0]!]).replace(/\s*only$/, "")} first, switch to ${cliLabel([c[1]!]).replace(/\s*only$/, "")} on failure or when quota runs out`;
+const cliDetail = (clis: string[]) => !clis.length ? "Pause new work for this member" : clis.length === 1
+  ? `Use ${providerLabel(clis[0]!)} only` : `Try ${clis.map(providerLabel).join(" → ")} in this order; fallback stays within this selection`;
+
+const taskOrderLabel = (order: string[] | null, member = false) => order === null ? member ? "Use team default" : "Automatic"
+  : order.length ? cliLabel(order) : member ? "Pause this member" : "No default task tools";
+const memberToolsLabel = (agent: SettingsView["effective"]["agents"][number]) => agent.paused === true ? "Paused"
+  : !agent.clis.length ? "No enabled task tools" : cliLabel(agent.clis);
+const TOOL_ORDERS = providerOrders(PROVIDER_IDS);
+
+/** Saved policy and the selection being confirmed stay separate; a file reset is never an inheritance value. */
+function TaskToolPolicy(props: { settings: Settings; agent?: string; phone?: boolean }) {
+  const view = props.settings.view, member = () => view()?.effective.agents.find((agent) => agent.id === props.agent);
+  const capability = () => readToolPolicyView(view()?.effective.tool_policy);
+  const policy = () => props.agent ? capability() && readToolPolicy(member()?.tool_policy) : capability()?.team;
+  const base = props.agent ? `cli-${props.agent}` : "team-tools";
+  const edit = () => props.settings.toolEdit(props.agent);
+  const pending = () => props.settings.toolSaving(props.agent);
+  const order = () => edit() ? edit()!.reset ? policy()?.file_default ?? null : edit()!.order : policy()?.configured ?? null;
+  const fromFile = () => edit() ? edit()!.reset : policy()?.source !== "ui";
+  const selected = () => fromFile() ? "file" : order() === null ? "inherit" : `order:${cliKey(order()!)}`;
+  const selectedLabel = () => !edit() && policy()?.invalid ? "Invalid saved task tool setting"
+    : `${fromFile() ? (edit()?.reset ? policy()?.file_source : policy()?.source) === "default" ? "Built-in default · " : "File setting · " : ""}${taskOrderLabel(order(), !!props.agent)}`;
+  const enabled = () => view()?.effective.enabled_clis ?? DEFAULT_PROVIDERS;
+  const disabledNote = (order: string[]) => {
+    const disabled = order.filter((id) => !enabled().includes(id));
+    return disabled.length ? `${disabled.map(providerLabel).join(", ")} disabled for execution; kept in this selection.` : "";
+  };
+  const options = () => [{ id: "inherit", label: props.agent ? "Use team default" : "Automatic", testID: `${base}-inherit`,
+    detail: props.agent ? "Follow the team's default task tool policy." : "Let planning choose among enabled tools." },
+    ...TOOL_ORDERS.map((tools) => ({ id: `order:${cliKey(tools)}`, label: taskOrderLabel(tools, !!props.agent), testID: `${base}-${cliKey(tools)}`,
+      detail: [tools.length ? cliDetail(tools) : props.agent ? "Pause this member, including tasks pinned to a tool." : "Tasks with an explicit tool or member order can still run.", disabledNote(tools)].filter(Boolean).join(" ") }))];
+  const choose = (key: string) => {
+    if (key === "inherit") void props.settings.saveTools(props.agent, null);
+    else { const tools = TOOL_ORDERS.find((tools) => `order:${cliKey(tools)}` === key); if (tools) void props.settings.saveTools(props.agent, tools); }
+  };
+  const confirmed = (value: ToolPolicy) => {
+    if (value.invalid) return "The saved task tool setting is invalid. Choose a valid order. An invalid member setting does not count as a deliberate pause.";
+    if (props.agent && value.configured?.length === 0) return "This member is paused for new work, including tasks pinned to a tool.";
+    if (!props.agent && value.configured?.length === 0) return "No default task tools. Tasks with an explicit tool or member order can still run.";
+    if (!value.effective.length) return "No selected task tools are enabled. Change this selection or enable its tools in AI tools & onboarding.";
+    return `Main machine reports enabled task tools: ${cliLabel(value.effective)}. Unavailable tools are skipped on the machine claiming the task.`;
+  };
+  const source = (value: ToolPolicy) => value.source === "ui" ? "Saved UI setting" : value.source === "local_file" ? "Main machine's local configuration file"
+    : value.source === "shared_file" ? "Shared configuration file" : "Built-in default";
+  const legacyOptions = () => view()?.options.clis.map((tools) => ({ id: cliKey(tools), label: cliLabel(tools), detail: cliDetail(tools), testID: `${base}-${cliKey(tools)}` })) ?? [];
+  const legacyPick = (key: string) => { const tools = view()?.options.clis.find((tools) => cliKey(tools) === key); if (props.agent && tools) void props.settings.save(patches.clis(props.agent, tools)); };
+  return <View style={{ gap: 8, flexShrink: 1, maxWidth: props.agent && !props.phone ? 360 : undefined }}>
+    <If when={policy()} else={<>
+      <If when={props.agent ? member() : undefined}>{(agent) => props.phone
+        ? <Choices label="Model" choices={legacyOptions()} selected={agent().paused === false && !agent().clis.length ? "unavailable" : cliKey(agent().clis)} onPick={legacyPick} />
+        : <Dropdown testID={base} label="Model" value={memberToolsLabel(agent())} options={legacyOptions()} selected={agent().paused === false && !agent().clis.length ? "unavailable" : cliKey(agent().clis)} onPick={legacyPick} />}</If>
+      <Text testID={`${base}-unsupported`} style={{ color: colors.warn, fontSize: 13, lineHeight: 18 }}>Update the app, hub and main machine to configure default task tool order, inheritance and file resets. Existing member orders remain available.</Text>
+    </>}>
+      {(value) => <>
+        {props.phone ? <Choices label="Task tools" choices={options()} selected={selected()} onPick={choose} />
+          : <Dropdown testID={base} label={props.agent ? "Task tools" : "Default task tool order"} value={selectedLabel()} selected={selected()} options={options()} onPick={choose} scrollable />}
+        <Text testID={`${base}-source`} style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{`${source(value())} · ${value().invalid ? "Invalid task tool setting" : taskOrderLabel(value().configured, !!props.agent)}`}</Text>
+        <Text testID={`${base}-confirmed`} style={{ color: value().invalid || !value().effective.length ? colors.warn : colors.muted, fontSize: 13, lineHeight: 18 }}>{confirmed(value())}</Text>
+        <Text style={{ color: colors.muted, fontSize: 12.5, lineHeight: 18 }}>{props.agent ? "An explicit task tool can override a nonempty member order. A paused member also blocks pinned tools." : "Explicit member orders and task tool pins can override this default."}</Text>
+        <If when={disabledNote(value().configured ?? capability()!.team.configured ?? [])}><Text style={{ color: colors.warn, fontSize: 13, lineHeight: 18 }}>{disabledNote(value().configured ?? capability()!.team.configured ?? [])}</Text></If>
+        <Text testID={`${base}-file`} style={{ color: colors.muted, fontSize: 12.5, lineHeight: 18 }}>{value().file_invalid ? "The main machine's file setting is invalid. Choose a valid saved order instead."
+          : `Main machine file setting: ${taskOrderLabel(value().file_default, !!props.agent)}. Other machines use their own files after a reset.`}</Text>
+        <Btn testID={`${base}-reset`} label="Restore file setting" kind="ghost" disabled={value().source !== "ui" || value().file_invalid === true || pending()}
+          onPress={() => void props.settings.saveTools(props.agent, null, true)} />
+      </>}
+    </If>
+    <If when={edit()}><Text testID={`${base}-pending`} style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{`${pending() ? "Saving selection" : "Selection not confirmed"}: ${edit()!.reset ? "Restore file setting" : taskOrderLabel(edit()!.order, !!props.agent)}. Confirmed settings are shown separately.`}</Text>
+      <If when={!pending()}><>
+        <Btn testID={`${base}-retry`} label="Retry same tool setting" kind="ghost" onPress={() => void props.settings.retryTools(props.agent)} />
+        <Btn testID={`${base}-discard`} label="Discard unconfirmed selection…" kind="ghost" disabled={props.settings.saving() > 0} onPress={() => void props.settings.discardTools(props.agent)} />
+      </></If>
+    </If>
+  </View>;
+}
+
+/** Member inheritance and restoring machine files are separate, explicit choices. */
+function MemberAutonomyPolicy(props: { settings: Settings; agent: string; phone?: boolean }) {
+  const view = props.settings.view, member = () => view()?.effective.agents.find((a) => a.id === props.agent);
+  const policy = () => view()?.effective.autonomy_policy_version === 1 ? readAutonomyPolicy(member()?.autonomy_policy) : null;
+  const base = `autonomy-${props.agent}`, edit = () => props.settings.autonomyEdit(props.agent);
+  const pending = () => props.settings.policySaving("autonomy", props.agent);
+  const level = () => edit() ? edit()!.reset ? policy()?.file_default ?? null : edit()!.level : policy()?.configured ?? null;
+  const fromFile = () => edit() ? edit()!.reset : policy()?.source !== "ui";
+  const label = (value: AutonomyLevel | null) => value === null ? `Use team default (${autonomyLabel(view()?.effective.autonomy ?? "onboarding")})` : autonomyLabel(value);
+  const selected = () => fromFile() ? "file" : level() ?? "inherit";
+  const selectedLabel = () => !edit() && policy()?.invalid ? "Invalid saved autonomy setting"
+    : `${fromFile() ? (edit()?.reset ? policy()?.file_source : policy()?.source) === "default" ? "Built-in default · " : "File setting · " : ""}${label(level())}`;
+  const choices = () => [{ id: "inherit", label: label(null), detail: "Follow the team's current autonomy default.", testID: `${base}-inherit` },
+    ...AUTONOMY_LEVELS.map((level) => ({ id: level, label: autonomyLabel(level), detail: AUTONOMY_DETAIL[level], testID: `${base}-${level}` }))];
+  const choose = (value: string) => { if (value === "inherit" || validAutonomyLevel(value)) void props.settings.saveAutonomy(props.agent, value === "inherit" ? null : value); };
+  const legacyChoices = () => [{ id: "inherit", label: label(null), detail: "Follow the team's default.", testID: `${base}-inherit` },
+    ...(view()?.options.autonomy ?? []).filter(validAutonomyLevel).map((value) => ({ id: value, label: autonomyLabel(value), detail: AUTONOMY_DETAIL[value], testID: `${base}-${value}` }))];
+  const legacyPick = (value: string) => { if (value === "inherit" || validAutonomyLevel(value)) void props.settings.save(patches.autonomy(props.agent, value === "inherit" ? null : value)); };
+  const source = () => policy()?.source === "ui" ? "Saved UI setting" : policy()?.source === "local_file" ? "Main machine's local configuration file"
+    : policy()?.source === "shared_file" ? "Shared configuration file" : "Built-in default";
+  return <View style={{ gap: 8, flexShrink: 1, maxWidth: props.phone ? undefined : 360 }}>
+    <If when={policy()} else={<>
+      {props.phone ? <Choices label="Autonomy" choices={legacyChoices()} selected={member()?.autonomy_inherited ? "inherit" : member()?.autonomy ?? "onboarding"} onPick={legacyPick} />
+        : <Dropdown testID={base} label="Autonomy" value={member()?.autonomy_inherited ? label(null) : autonomyLabel(member()?.autonomy ?? "onboarding")}
+          options={legacyChoices()} selected={member()?.autonomy_inherited ? "inherit" : member()?.autonomy ?? "onboarding"} onPick={legacyPick} />}
+      <Text testID={`${base}-unsupported`} style={{ color: colors.warn, fontSize: 13, lineHeight: 18 }}>Update the app, hub and main machine to see autonomy sources and restore file settings. Existing autonomy choices remain available.</Text>
+    </>}>
+      {(value) => <>
+        {props.phone ? <Choices label="Autonomy" choices={choices()} selected={selected()} onPick={choose} />
+          : <Dropdown testID={base} label="Autonomy" value={selectedLabel()} options={choices()} selected={selected()} onPick={choose} />}
+        <Text testID={`${base}-source`} style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{`${source()} · ${value().invalid ? "Invalid autonomy setting" : label(value().configured)}`}</Text>
+        <Text testID={`${base}-confirmed`} style={{ color: value().invalid ? colors.warn : colors.muted, fontSize: 13, lineHeight: 18 }}>{value().invalid
+          ? "The saved autonomy setting is invalid. This member uses Learning until it is repaired."
+          : `Main machine reports ${autonomyLabel(value().effective)}${value().configured === null ? " from the team default" : ""}.`}</Text>
+        <Text testID={`${base}-file`} style={{ color: colors.muted, fontSize: 12.5, lineHeight: 18 }}>{value().file_invalid
+          ? "The main machine's file setting is invalid. Choose a valid saved autonomy level instead."
+          : `Main machine file setting: ${label(value().file_default)}. Other machines use their own files after a reset.`}</Text>
+        <Btn testID={`${base}-reset`} label="Restore file setting" kind="ghost" disabled={value().source !== "ui" || value().file_invalid === true || pending()}
+          onPress={() => void props.settings.saveAutonomy(props.agent, null, true)} />
+      </>}
+    </If>
+    <Text testID={`${base}-scope`} style={{ color: colors.muted, fontSize: 12.5, lineHeight: 18 }}>Controls approval for this member's self-generated work. Owner-requested tasks still run; tool permissions remain separate.</Text>
+    <If when={edit()}><Text testID={`${base}-pending`} style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{`${pending() ? "Saving selection" : "Selection not confirmed"}: ${edit()!.reset ? "Restore file setting" : label(edit()!.level)}. Confirmed settings are shown separately.`}</Text>
+      <If when={!pending()}><>
+        <Btn testID={`${base}-retry`} label="Retry same autonomy setting" kind="ghost" onPress={() => void props.settings.retryPolicy("autonomy", props.agent)} />
+        <Btn testID={`${base}-discard`} label="Discard unconfirmed selection…" kind="ghost" disabled={props.settings.saving() > 0} onPress={() => void props.settings.discardPolicy("autonomy", props.agent)} />
+      </></If>
+    </If>
+  </View>;
+}
 
 type DropdownOption = { id: string; label: string; detail?: string; testID?: string };
 
 /** A labelled value that opens a menu of its choices (each with a line saying what it means). */
-function Dropdown(props: { label: string; value: string; options: DropdownOption[]; selected: string; onPick: (id: string) => void; testID?: string }) {
+function Dropdown(props: { label: string; value: string; options: DropdownOption[]; selected: string; onPick: (id: string) => void; testID?: string; scrollable?: boolean }) {
+  const items = () => <Each of={props.options}>{(o) => <MenuItem testID={o().testID} role="menuitemradio" checked={o().id === props.selected}
+    onSelect={() => o().id !== props.selected && props.onPick(o().id)} hoverStyle={hovered()}
+    style={{ flexDirection: "row", alignItems: "flex-start", gap: 8, paddingVertical: 7, paddingHorizontal: 10, borderRadius: 6 }}>
+    <View style={{ width: 14, paddingTop: 3 }}><If when={o().id === props.selected}><Icon name="check" size={13} tint={colors.text} /></If></View>
+    <View style={{ flex: 1, gap: 2 }}><Text style={{ fontSize: 14, fontWeight: "500", color: colors.text }}>{o().label}</Text>
+      <If when={o().detail}><Text style={{ fontSize: 12.5, lineHeight: 17, color: colors.muted }}>{o().detail}</Text></If>
+    </View>
+  </MenuItem>}</Each>;
   return (
     <Menu
       align="end"
@@ -2179,30 +3442,7 @@ function Dropdown(props: { label: string; value: string; options: DropdownOption
         </View>
       }
     >
-      <Each of={props.options}>
-        {(o) => (
-          <MenuItem
-            testID={o().testID}
-            role="menuitemradio"
-            checked={o().id === props.selected}
-            onSelect={() => o().id !== props.selected && props.onPick(o().id)}
-            hoverStyle={hovered()}
-            style={{ flexDirection: "row", alignItems: "flex-start", gap: 8, paddingVertical: 7, paddingHorizontal: 10, borderRadius: 6 }}
-          >
-            <View style={{ width: 14, paddingTop: 3 }}>
-              <If when={o().id === props.selected}>
-                <Icon name="check" size={13} tint={colors.text} />
-              </If>
-            </View>
-            <View style={{ flex: 1, gap: 2 }}>
-              <Text style={{ fontSize: 14, fontWeight: "500", color: colors.text }}>{o().label}</Text>
-              <If when={o().detail}>
-                <Text style={{ fontSize: 12.5, lineHeight: 17, color: colors.muted }}>{o().detail}</Text>
-              </If>
-            </View>
-          </MenuItem>
-        )}
-      </Each>
+      {props.scrollable ? <Scroll testID={`${props.testID}-options`} style={{ maxHeight: 360 }}>{items()}</Scroll> : items()}
     </Menu>
   );
 }
@@ -2410,6 +3650,7 @@ function NotifySettings(props: { push: Push; view: SettingsView | null; save: (p
               )}
             </Each>
           </View>
+          <NotificationTimeZone prefs={prefs} save={setPrefs} />
         </View>
       </If>
     </Group>
@@ -2426,6 +3667,15 @@ function createSettings(hub: Hub) {
   let revision = 0;
   let confirmed: SettingsView | null = null;
   const pending: { patch: Record<string, unknown> }[] = [];
+  type PolicyKind = "tools" | "autonomy";
+  type PolicyEdit = { patch: Record<string, unknown>; reset: boolean; requestKey: string };
+  type ToolEdit = PolicyEdit & { order: string[] | null };
+  type AutonomyEdit = PolicyEdit & { level: AutonomyLevel | null };
+  const policyKey = (kind: PolicyKind, agent?: string) => `${kind}:${agent ?? ""}`;
+  const policyEdits = signal(new Map<string, PolicyEdit>());
+  const policyFailures = new Map<string, string>();
+  let policyErrorOwner: string | undefined;
+  const remainingPolicyError = () => { const last = [...policyFailures].at(-1); policyErrorOwner = last?.[0]; error.set(last?.[1] ?? ""); };
   function merge(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
     const result = { ...base };
     for (const [key, value] of Object.entries(patch)) {
@@ -2437,9 +3687,9 @@ function createSettings(hub: Hub) {
     return result;
   }
   function displayed(v: SettingsView): SettingsView {
-    const current = v.current as { clis?: { agents?: Record<string, string[]> }; autonomy?: { agents?: Record<string, string> }; routines?: Record<string, { enabled?: boolean; every?: string }>; host?: { max_parallel?: number } };
+    const current = v.current as { clis?: { agents?: Record<string, string[]> }; autonomy?: { agents?: Record<string, string | null> }; routines?: Record<string, { enabled?: boolean; every?: string }>; host?: { max_parallel?: number } };
     return { ...v, effective: { ...v.effective,
-      agents: v.effective.agents.map((a) => ({ ...a, clis: current.clis?.agents?.[a.id] ?? a.clis, autonomy: current.autonomy?.agents?.[a.id] ?? a.autonomy })),
+      agents: v.effective.agents.map((a) => ({ ...a, clis: readToolPolicyView(v.effective.tool_policy) && readToolPolicy(a.tool_policy) ? a.clis : current.clis?.agents?.[a.id] ?? a.clis })),
       routines: v.effective.routines.map((r) => ({ ...r, ...current.routines?.[r.name] })),
       max_parallel: current.host?.max_parallel ?? v.effective.max_parallel,
     } };
@@ -2451,26 +3701,32 @@ function createSettings(hub: Hub) {
   }
   let savedTimer: ReturnType<typeof setTimeout> | undefined;
   cleanup(() => clearTimeout(savedTimer));
-  const load = () => {
-    error.set("");
+  const load = (keepError = false) => {
+    if (!keepError) error.set("");
     const started = revision;
     hub.settings().then((v) => { if (started === revision && !saving()) { confirmed = v; refresh(); } }, (e) => { if (started === revision && !saving()) error.set(String(e?.message ?? e)); });
   };
-  async function save(patch: Record<string, unknown>) {
+  async function save(patch: Record<string, unknown>, policyKey?: string, requestKey?: string) {
     revision++;
-    error.set("");
+    if (policyKey === undefined) { error.set(""); policyErrorOwner = undefined; }
+    else { policyFailures.delete(policyKey); if (policyErrorOwner === policyKey) remainingPolicyError(); }
     saved.set("");
     clearTimeout(savedTimer);
     saving.update((n) => n + 1);
     const item = { patch };
     pending.push(item);
     refresh();
+    let accepted = false;
     try {
-      const request = writes.then(() => hub.settings(patch));
+      const request = writes.then(() => hub.settings(patch, requestKey));
       writes = request.then(() => {}, () => {});
       confirmed = await request;
+      accepted = true;
+      if (policyKey !== undefined) { policyFailures.delete(policyKey); if (policyErrorOwner === policyKey) remainingPolicyError(); }
     } catch (e) {
-      error.set(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      if (policyKey === undefined) { policyErrorOwner = undefined; error.set(message); }
+      else if (policyEdits().get(policyKey)?.patch === patch) { policyFailures.set(policyKey, message); policyErrorOwner = policyKey; error.set(message); }
     } finally {
       pending.splice(pending.indexOf(item), 1);
       refresh();
@@ -2480,7 +3736,44 @@ function createSettings(hub: Hub) {
         savedTimer = setTimeout(() => saved.set(""), 1600);
       }
     }
+    return accepted;
   }
+  const toolEdit = (agent?: string) => policyEdits().get(policyKey("tools", agent)) as ToolEdit | undefined;
+  const autonomyEdit = (agent: string) => policyEdits().get(policyKey("autonomy", agent)) as AutonomyEdit | undefined;
+  const policySaving = (kind: PolicyKind, agent?: string) => { view(); const edit = policyEdits().get(policyKey(kind, agent)); return !!edit && pending.some((item) => item.patch === edit.patch); };
+  const toolSaving = (agent?: string) => policySaving("tools", agent);
+  async function submitPolicy(key: string, edit: PolicyEdit) {
+    const accepted = await save(edit.patch, key, edit.requestKey);
+    if (accepted) policyEdits.update((all) => { const next = new Map(all); if (next.get(key) === edit) next.delete(key); return next; });
+    return accepted;
+  }
+  function setPolicy(kind: PolicyKind, agent: string | undefined, edit: PolicyEdit) {
+    const key = policyKey(kind, agent);
+    policyEdits.update((all) => new Map(all).set(key, edit));
+    return submitPolicy(key, edit);
+  }
+  function saveTools(agent: string | undefined, order: string[] | null, reset = false) {
+    const edit = { patch: reset ? patches.toolReset(agent) : patches.toolOrder(agent, order), reset, order, requestKey: newRequestKey() };
+    return setPolicy("tools", agent, edit);
+  }
+  function saveAutonomy(agent: string, level: AutonomyLevel | null, reset = false) {
+    return setPolicy("autonomy", agent, { patch: reset ? patches.autonomyReset(agent) : patches.autonomyPolicy(agent, level), reset, level, requestKey: newRequestKey() } as AutonomyEdit);
+  }
+  const retryPolicy = (kind: PolicyKind, agent?: string) => { const key = policyKey(kind, agent), edit = policyEdits().get(key); if (edit && !policySaving(kind, agent)) return submitPolicy(key, edit); return Promise.resolve(false); };
+  const retryTools = (agent?: string) => retryPolicy("tools", agent);
+  async function discardPolicy(kind: PolicyKind, agent?: string) {
+    const key = policyKey(kind, agent), edit = policyEdits().get(key);
+    if (!edit || saving()) return;
+    const result = await AlertDialog.show({ title: "Discard unconfirmed selection?",
+      description: "This removes only this device's recovery information for this selection. It does not undo settings or tasks already applied. Confirmed settings will be reloaded.",
+      actions: [{ id: "keep", label: "Keep selection", role: "cancel" }, { id: "discard", label: "Discard selection", role: "destructive" }] });
+    if (result.action !== "discard" || saving() || policyEdits().get(key) !== edit) return;
+    hub.discardPolicyConfirmation(edit.patch, edit.requestKey);
+    policyEdits.update((all) => { const next = new Map(all); if (next.get(key) === edit) next.delete(key); return next; });
+    policyFailures.delete(key); if (policyErrorOwner === key) remainingPolicyError();
+    revision++; load(true);
+  }
+  const discardTools = (agent?: string) => discardPolicy("tools", agent);
   // the command being added in Commands (kept here: the settings page may be laid out again while typing)
   /** The command editor: `editing` is undefined when closed, "" for a new command, else the name being edited. */
   const commandDraft = { name: signal(""), text: signal(""), editing: signal<string | undefined>(undefined), note: signal("") };
@@ -2505,7 +3798,13 @@ function createSettings(hub: Hub) {
     const r = await hub.api(method, path, body);
     d.busy.set(false);
     if (!r.ok) {
-      d.note.set(r.status === 404 ? localOnly : String(r.data.error ?? "Couldn't reach the server"));
+      const message = r.status === 404 ? localOnly : String(r.data.error ?? "Couldn't reach the server");
+      if (r.data.saved_locally && r.data.view) {
+        confirmed = r.data.view as SettingsView; refresh();
+        if (method === "DELETE") { error.set(message); d.editing.set(undefined); return true; }
+        if (typeof r.data.id === "string") d.editing.set(r.data.id);
+      }
+      d.note.set(message);
       return false;
     }
     confirmed = r.data.view as SettingsView;
@@ -2513,36 +3812,218 @@ function createSettings(hub: Hub) {
     d.editing.set(undefined);
     return true;
   };
-  const writeMember = writer(memberDraft, "Members can only be edited on a local hub for now");
+  const writeMember = writer(memberDraft, "Update the hub and main machine to edit members");
   /** The project editor: `editing` is undefined when closed, "" for a new project, else the id being edited. */
-  const projectDraft = { name: signal(""), path: signal(""), instructions: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
+  const projectDraft = { generation: 0, probeReceived: 0, name: signal(""), path: signal(""), host: signal(""), repo: signal(""), requires: signal(""), instructions: signal(""), original: signal<Project | undefined>(undefined), probe: signal<(ProjectFolderCheck & { probe_ticket?: string }) | null>(null), checking: signal(false), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
   function openProject(p?: Project) {
     const d = projectDraft;
-    d.name.set(p?.name ?? ""); d.path.set(p?.path ?? ""); d.instructions.set(p?.instructions ?? ""); d.note.set("");
+    d.generation++;
+    d.name.set(p?.name ?? ""); d.path.set(p?.path ?? ""); d.host.set(p?.host ?? view()?.effective.primary_host ?? "");
+    d.repo.set(p?.custom_repo === undefined ? p?.repo ?? "" : p.custom_repo ?? "");
+    d.requires.set((p?.custom_requires ?? p?.requires ?? []).join(",")); d.original.set(p); d.probe.set(null);
+    d.instructions.set(p?.instructions ?? ""); d.note.set("");
     d.editing.set(p?.id ?? "");
   }
-  const writeProject = writer(projectDraft, "Projects can only be edited on a local hub for now");
+  const projectHost = () => projectDraft.host() || view()?.effective.primary_host || "";
+  const projectPlacementChanged = () => !projectDraft.original() || projectHost() !== projectDraft.original()!.host || projectDraft.path().trim() !== projectDraft.original()!.path;
+  const projectProbe = () => {
+    const p = projectDraft.probe();
+    return p && p.host === projectHost() && p.requested_path === projectDraft.path().trim() && Date.now() - projectDraft.probeReceived < 300_000 ? p : null;
+  };
+  async function checkProjectFolder() {
+    const d = projectDraft, host = projectHost(), path = d.path().trim(), editing = d.editing(), generation = d.generation;
+    if (!host || !path || d.checking() || d.busy()) return false;
+    d.checking.set(true); d.note.set(""); d.probe.set(null);
+    const r = await hub.api("POST", `/api/machines/${encodeURIComponent(host)}/project-folder-check`, { path });
+    d.checking.set(false);
+    if (d.generation !== generation || d.editing() !== editing || projectHost() !== host || d.path().trim() !== path) return false;
+    if (!r.ok) { d.note.set(r.status === 404 || r.status === 405 ? "Update the hub and selected machine to check project folders." : String(r.data.error ?? "Couldn't check this folder. Reconnect the selected machine and retry.")); return false; }
+    const p = r.data;
+    if (p.host !== host || p.requested_path !== path || typeof p.path !== "string" || !p.path || typeof p.repo !== "string" || !Array.isArray(p.requires) || !p.requires.every((cap) => typeof cap === "string") || typeof p.checked !== "string" || !Number.isFinite(Date.parse(p.checked))
+      || host !== view()?.effective.primary_host && (typeof p.probe_ticket !== "string" || !/^[a-f0-9-]{36}$/.test(p.probe_ticket))) {
+      d.note.set("The selected machine did not confirm this folder. Check it again before saving."); return false;
+    }
+    d.probeReceived = Date.now(); d.probe.set(p as ProjectFolderCheck & { probe_ticket?: string });
+    return true;
+  }
+  const projectValues = () => JSON.stringify([projectDraft.name(), projectDraft.path(), projectDraft.host(), projectDraft.repo(), projectDraft.requires(), projectDraft.instructions()]);
+  async function writeProject(method: string, path: string, body?: unknown) {
+    const d = projectDraft, editing = d.editing(), values = projectValues(), generation = d.generation;
+    revision++; d.busy.set(true); d.note.set("");
+    const r = await hub.api(method, path, body);
+    d.busy.set(false);
+    if ((r.ok || r.data.saved_locally) && r.data.view) { confirmed = r.data.view as SettingsView; refresh(); }
+    if (d.generation !== generation || d.editing() !== editing) return r.ok;
+    const id = typeof r.data.id === "string" ? r.data.id : editing, changed = projectValues() !== values;
+    if (r.ok || r.data.saved_locally) {
+      const saved = view()?.effective.projects?.find((p) => p.id === id), sent = body as { path?: string; host?: string } | undefined;
+      if (saved && sent?.path === d.path().trim() && (sent.host ?? saved.host) === projectHost()) d.path.set(saved.path);
+      d.original.set(saved ?? d.original());
+    }
+    if (!r.ok) {
+      if (r.status === 409 && (body as { probe_ticket?: unknown } | undefined)?.probe_ticket) d.probe.set(null);
+      const message = r.status === 404 ? "Update the hub and main machine to edit projects" : String(r.data.error ?? "Couldn't reach the server");
+      if (r.data.saved_locally && id) {
+        if (method === "DELETE") { error.set(message); d.editing.set(undefined); return true; }
+        d.editing.set(id);
+      }
+      d.note.set(message); return false;
+    }
+    if (method !== "DELETE" && changed) {
+      d.editing.set(id); d.note.set("The earlier version was saved. Your newer edits are still here; save again to apply them.");
+    } else d.editing.set(undefined);
+    return true;
+  }
+  async function saveProject() {
+    const d = projectDraft;
+    if (d.busy() || d.checking()) return;
+    const advanced = !!view()?.effective.primary_host;
+    if (advanced && projectHost() !== view()!.effective.primary_host && projectPlacementChanged() && !projectProbe()) {
+      if (!await checkProjectFolder()) return;
+    }
+    const probe = projectProbe();
+    const body = { name: d.name(), path: d.path().trim(), instructions: d.instructions(), ...(advanced ? { host: projectHost(), repo: d.repo().trim(), requires: d.requires().trim(), ...(probe?.probe_ticket ? { probe_ticket: probe.probe_ticket } : {}) } : {}) };
+    return writeProject(d.editing() === "" ? "POST" : "PUT", d.editing() === "" ? "/api/projects" : `/api/projects/${d.editing()}`, body);
+  }
   /** The routine editor: `editing` is undefined when closed, "" for a new routine, else the name being edited. */
-  const routineDraft = { name: signal(""), every: signal("daily 09:00"), agent: signal("lead"), project: signal(""), prompt: signal(""), desc: signal(""), enabled: signal(true), readonly: signal(false), kind: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
+  const routineDraft = { prefer: signal(""), weight: signal("normal"), repo: signal(""), scheduler: signal("primary"), detector: signal(""), requires: signal(""), host: signal("any"), cli: signal("auto"), priority: signal("normal"), name: signal(""), every: signal("daily 09:00"), agent: signal("lead"), project: signal(""), prompt: signal(""), desc: signal(""), enabled: signal(true), readonly: signal(false), kind: signal(""), editing: signal<string | undefined>(undefined), note: signal(""), busy: signal(false) };
   async function openRoutine(name = "") {
     const d = routineDraft;
     error.set("");
     let m: Record<string, unknown> = {};
     if (name) {
       const r = await hub.api("GET", `/api/routines/${encodeURIComponent(name)}`);
-      if (!r.ok) return error.set(r.status === 404 ? "Routines can only be edited on a local hub for now" : String(r.data.error ?? "Couldn't reach the server"));
+      if (!r.ok) return error.set(r.status === 404 ? "Update the hub and main machine to edit routines" : String(r.data.error ?? "Couldn't reach the server"));
       m = r.data;
     }
+    d.prefer.set(String(m.prefer ?? "")); d.weight.set(String(m.weight ?? "normal")); d.repo.set(String(m.repo ?? "")); d.scheduler.set(String(m.scheduler ?? (m.kind === "learn" ? "each" : "primary"))); d.detector.set(String(m.signal ?? ""));
+    d.requires.set(String(m.requires ?? "")); d.host.set(String(m.host ?? "any")); d.cli.set(String(m.cli ?? "auto")); d.priority.set(String(m.priority ?? "normal"));
     d.name.set(String(m.name ?? "")); d.every.set(String(m.every ?? "daily 09:00")); d.agent.set(String(m.agent ?? "lead")); d.project.set(String(m.project ?? ""));
     d.prompt.set(String(m.prompt ?? "")); d.desc.set(String(m.desc ?? "")); d.enabled.set(m.enabled !== false); d.readonly.set(m.readonly === true); d.kind.set(String(m.kind ?? "")); d.note.set("");
     d.editing.set(name);
   }
-  const writeRoutine = writer(routineDraft, "Routines can only be edited on a local hub for now");
+  const writeRoutine = writer(routineDraft, "Update the hub and main machine to edit routines");
   /** The section the wide settings page shows (its sidebar picks it). */
   const tab = signal<SettingsTab>("notify");
-  return { view, error, saved, saving, load, save, commandDraft, memberDraft, openMember, writeMember, projectDraft, openProject, writeProject, routineDraft, openRoutine, writeRoutine, tab };
+  return { accept: (next: SettingsView) => { revision++; confirmed = next; refresh(); }, machines: () => [...(hub.status()?.hosts ?? []), ...(hub.status()?.offline_hosts ?? [])], view, error, saved, saving, load, save, toolEdit, toolSaving, saveTools, retryTools, discardTools, autonomyEdit, saveAutonomy, policySaving, retryPolicy, discardPolicy, commandDraft, memberDraft, openMember, writeMember, projectDraft, openProject, writeProject, saveProject, checkProjectFolder, projectHost, projectProbe, projectPlacementChanged, routineDraft, openRoutine, writeRoutine, tab };
 }
 type Settings = ReturnType<typeof createSettings>;
+
+/** Operational controls share one validated endpoint locally and through the primary-machine bridge. */
+function ConfigurationSettings(props: { hub: Hub; machine?: string; initialGroup?: keyof typeof CONFIGURATION_GROUPS; onTask: (id: string) => void }) {
+  const fields = props.machine ? MACHINE_CONFIGURATION_FIELDS : CONFIGURATION_FIELDS;
+  const endpoint = props.machine ? `/api/machines/${encodeURIComponent(props.machine)}/configuration` : "/api/configuration";
+  const values = signal<Record<string, ConfigValue>>({}), baseline = signal<Record<string, ConfigValue>>({});
+  const health = signal<ProviderStatus[]>([]);
+  const learningSupported = signal(false);
+  const diskPathSupported = signal(false);
+  const learning = signal<{ host: string; blocked_reason: string | null } | null>(null);
+  const overrides = signal<string[]>([]), loaded = signal(false), busy = signal(false), note = signal(""), failed = signal(false);
+  const group = signal<keyof typeof CONFIGURATION_GROUPS>(props.machine ? "resources" : props.initialGroup ?? "execution");
+  const id = (path: string) => `configuration-${path.replace(/\./g, "-")}`;
+  const optionLabel = (f: ConfigurationField, key: string) => f.optionLabels && Object.prototype.hasOwnProperty.call(f.optionLabels, key) ? f.optionLabels[key]! : key;
+  const reported = (f: ConfigurationField) => Object.prototype.hasOwnProperty.call(baseline(), f.path);
+  const supported = (f: ConfigurationField) => reported(f) && (!props.machine || (f.group !== "onboarding" || learningSupported()) && (f.path !== "resources.disk_path" || diskPathSupported()));
+  const normalized = (f: ConfigurationField, value: ConfigValue | undefined): ConfigValue => {
+    if (f.kind === "number" && typeof value === "string") return value.trim() ? Number(value) : null;
+    if ((f.kind === "folders" || f.kind === "names" || f.kind === "patterns") && typeof value === "string") return value.split("\n").map((p) => p.trim()).filter(Boolean);
+    if ((f.kind === "model" || f.kind === "path") && typeof value === "string") return value.trim() || null;
+    return value ?? null;
+  };
+  const changes = () => Object.fromEntries(fields.filter(supported).map((f) => [f.path, normalized(f, values()[f.path])] as const)
+    .filter(([path, value]) => JSON.stringify(value) !== JSON.stringify(baseline()[path])));
+  const set = (path: string, value: ConfigValue) => { values.update((v) => ({ ...v, [path]: value })); note.set(""); };
+  const accept = (data: Record<string, unknown>, keep: Record<string, ConfigValue> = {}) => {
+    const confirmed = data.values as Record<string, ConfigValue>;
+    health.set((data.provider_status as ProviderStatus[]) ?? []);
+    learningSupported.set(data.learning_supported === true);
+    diskPathSupported.set(data.disk_path_supported === true);
+    learning.set((data.learning as { host: string; blocked_reason: string | null }) ?? null);
+    baseline.set(confirmed); values.set({ ...confirmed, ...keep });
+    overrides.set((data.overrides as string[]) ?? []); loaded.set(true);
+  };
+  async function load() {
+    busy.set(true); failed.set(false); note.set("");
+    const r = await props.hub.api("GET", endpoint);
+    if (r.ok && r.data.values) accept(r.data);
+    else { failed.set(true); note.set(r.status === 404 ? "Update the hub and main machine to use team configuration." : String(r.data.error ?? "Couldn't load configuration")); }
+    busy.set(false);
+  }
+  void load();
+  async function save(reset?: string[]) {
+    const pending = changes(), submitted = values();
+    busy.set(true); failed.set(false); note.set("");
+    const r = await props.hub.api("PUT", endpoint, reset ? { reset } : { values: pending });
+    if (r.ok && r.data.values) {
+      const keep: Record<string, ConfigValue> = reset ? Object.fromEntries(Object.entries(pending).filter(([path]) => !reset.includes(path))) : {};
+      for (const f of fields) if (JSON.stringify(normalized(f, values()[f.path])) !== JSON.stringify(normalized(f, submitted[f.path]))) keep[f.path] = values()[f.path];
+      accept(r.data, keep);
+      note.set(Object.keys(changes()).length ? "Submitted changes saved. You have additional unsaved edits." : "Saved. Settings apply on each machine's next sync; running agents keep their current limits.");
+    } else { failed.set(true); note.set(String(r.data.error ?? "Couldn't save configuration")); }
+    busy.set(false);
+  }
+  const visible = () => fields.filter((f) => f.group === group() && supported(f)
+    && (f.path !== "judge.model" || values()["judge.cli"] === "claude") && (f.path !== "judge.codex_model" || values()["judge.cli"] === "codex") && (f.path !== "judge.hermes_model" || values()["judge.cli"] === "hermes"));
+  return <View testID="configuration-page" style={{ gap: 18 }}>
+    <Text role="header" style={{ fontSize: 20, fontWeight: "600", color: colors.text }}>{props.machine ? `Configuration for ${props.machine}` : "Team configuration"}</Text>
+    <Text style={{ fontSize: 13.5, lineHeight: 20, color: colors.muted }}>{props.machine ? "Overrides for this machine only. Paths use its own filesystem and home folder. Other values use its reported defaults. Offline machines apply changes when they reconnect." : "Shared operational settings for the team. Saved overrides take precedence over configuration files. Each machine’s own run limits still take precedence."}</Text>
+    <If when={loaded()} else={<Btn testID="configuration-reload" label={busy() ? "Loading…" : "Load configuration"} disabled={busy()} onPress={() => void load()} />}>
+      <Dropdown testID="configuration-group" label="Section" value={props.machine && group() === "onboarding" ? "Learning history" : CONFIGURATION_GROUPS[group()]} selected={group()} onPick={(key) => group.set(key as keyof typeof CONFIGURATION_GROUPS)}
+        options={(props.machine ? [["resources", "Resource limits"], ["onboarding", "Learning history"]] : Object.entries(CONFIGURATION_GROUPS)).map(([key, label]) => ({ id: key!, label: label!, testID: `configuration-group-${key}` }))} />
+      <If when={fields.some((f) => f.group === group() && !reported(f))}><Text testID="configuration-unsupported" style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>Update {props.machine ? "this machine" : "the hub and main machine"} to configure: {fields.filter((f) => f.group === group() && !reported(f)).map((f) => f.label).join(", ")}. Other available settings can still be edited.</Text></If>
+      <If when={props.machine && group() === "onboarding" && !learningSupported()}><Text testID="machine-learning-unsupported" style={{ color: colors.warn, fontSize: 13 }}>Update this machine and let it sync once before editing its learning history locations.</Text></If>
+      <If when={props.machine && group() === "resources" && !diskPathSupported()}><Text testID="machine-disk-path-unsupported" style={{ color: colors.warn, fontSize: 13 }}>Update this machine and let it sync once before changing its disk monitoring location. Other resource controls remain available.</Text></If>
+      <Each of={visible()} key={(f) => f.path}>
+        {(field) => <View style={{ gap: 6 }}>
+          <If when={field().kind === "boolean"} else={field().kind === "providers" ?
+            <View style={{ gap: 10 }}>
+              <Text style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>{field().label}</Text>
+              <Each of={field().options ?? []} key={(key) => key}>{(key) => <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                <Toggle testID={`${id(field().path)}-${key()}`} label={providerLabel(key())} value={Array.isArray(values()[field().path]) && (values()[field().path] as string[]).includes(key())}
+                  onChange={(on) => { const list = Array.isArray(values()[field().path]) ? values()[field().path] as string[] : []; set(field().path, on ? [...list, key()] : list.filter((value) => value !== key())); }} />
+                <Text style={{ color: colors.text }}>{providerLabel(key())}</Text>
+              </View>}</Each>
+              <Text style={{ fontSize: 13, lineHeight: 18, color: colors.muted }}>{field().hint}</Text>
+            </View>
+            : field().kind === "choice" ?
+            <><Dropdown testID={id(field().path)} label={field().label} value={optionLabel(field(), String(values()[field().path] ?? ""))} selected={String(values()[field().path] ?? "")}
+              onPick={(v) => set(field().path, v)} options={(field().options ?? []).map((key) => ({ id: key, label: field().path === "autonomy.level" ? autonomyLabel(key) : optionLabel(field(), key), testID: `${id(field().path)}-${key}` }))} />
+              <Text style={{ fontSize: 13, lineHeight: 18, color: colors.muted }}>{field().hint}</Text></>
+            : (field().kind === "folders" || field().kind === "names" || field().kind === "patterns") ?
+              <TextArea testID={id(field().path)} label={field().label} value={Array.isArray(values()[field().path]) ? (values()[field().path] as string[]).join("\n") : String(values()[field().path] ?? "")} height={90} onChange={(v) => set(field().path, v)} hint={field().hint} />
+            : <Field testID={id(field().path)} label={field().label} value={String(values()[field().path] ?? "")} onChange={(v) => set(field().path, v)}
+                keyboardType={field().kind === "number" && field().integer ? "number-pad" : undefined} hint={field().hint} />
+          }>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+              <Toggle testID={id(field().path)} label={field().label} value={values()[field().path] !== false} onChange={(v) => set(field().path, v)} />
+              <View style={{ flex: 1, gap: 3 }}><Text style={{ fontSize: 14.5, color: colors.text }}>{field().label}</Text><Text style={{ fontSize: 13, lineHeight: 18, color: colors.muted }}>{field().hint}</Text></View>
+            </View>
+          </If>
+        </View>}
+      </Each>
+      <If when={group() === "onboarding" && health().length > 0}>
+        <View testID="provider-health" style={{ gap: 6 }}>
+          <Text role="header" style={{ color: colors.text, fontWeight: "600" }}>Tool launch checks on the main machine</Text>
+          <Each of={health()} key={(provider) => provider.id}>{(provider) => <Text testID={`provider-health-${provider().id}`} style={{ color: provider().available ? colors.muted : colors.warn, fontSize: 13, lineHeight: 18 }}>
+            {`${provider().label}${provider().host ? ` · ${provider().host}` : ""}: ${provider().available ? "CLI available; sign-in is checked when used" : provider().reason ?? "Unavailable"}`}
+          </Text>}</Each>
+        </View>
+      </If>
+      <If when={group() === "onboarding" && !props.machine}><RoleLibrary hub={props.hub} disabled={busy() || Object.keys(changes()).length > 0} onAdded={() => void load()} /></If>
+      <If when={group() === "onboarding" && !props.machine && learning()}>
+        <MachineLearning hub={props.hub} host={learning()!.host} disabled={busy() || Object.keys(changes()).length > 0} refreshToken={baseline()} onTask={props.onTask} />
+      </If>
+      <Text testID="configuration-dirty" style={{ fontSize: 13, color: colors.muted }}>{Object.keys(changes()).length ? `${Object.keys(changes()).length} unsaved changes` : "All changes saved"}</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+        <Btn testID="configuration-save" label="Save settings" kind="primary" busy={busy()} disabled={busy() || !Object.keys(changes()).length} onPress={() => void save()} />
+        <Btn testID="configuration-reload-saved" label={Object.keys(changes()).length ? "Discard edits and reload" : "Reload settings"} kind="ghost" disabled={busy()} onPress={() => void load()} />
+        <Btn testID="configuration-reset" label={props.machine ? "Reset this section to defaults" : "Reset this section's overrides"} kind="ghost" disabled={busy() || !fields.some((f) => supported(f) && f.group === group() && overrides().includes(f.path))}
+          onPress={() => void save(fields.filter((f) => supported(f) && f.group === group()).map((f) => f.path))} />
+      </View>
+    </If>
+    <If when={note()}><Text testID="configuration-note" style={{ fontSize: 13.5, lineHeight: 20, color: failed() ? colors.danger : colors.up }}>{note()}</Text></If>
+  </View>;
+}
 
 /** The sections of the wide settings page, in its sidebar's order. */
 const SETTINGS_TABS = [
@@ -2550,7 +4031,11 @@ const SETTINGS_TABS = [
   ["members", "Members", "chat"],
   ["projects", "Projects", "lists"],
   ["routines", "Routines", "play"],
+  ["archive", "Archive", "lists"],
+  ["saved", "Saved requests", "lists"],
   ["parallel", "Parallel", "layers"],
+  ["onboarding", "AI tools & onboarding", "sliders"],
+  ["configuration", "Team configuration", "sliders"],
   ["commands", "Commands", "terminal"],
   ["storage", "Storage", "photos"],
   ["version", "Version", "github"],
@@ -2559,8 +4044,344 @@ const SETTINGS_TABS = [
 ] as const;
 type SettingsTab = (typeof SETTINGS_TABS)[number][0];
 
+const ARCHIVE_LABELS: Record<ArchiveKind, string> = { routines: "Routine", members: "Member", projects: "Project", plans: "Plan" };
+
+function savedRequestLabel(entry: PendingEntry) {
+  if (entry.kind === "task") return `${"id" in entry.request ? `Reopen ${entry.request.id}` : "New task"} · ${entry.request.settings.title}`;
+  if (entry.kind === "archive") return `Restore ${ARCHIVE_LABELS[entry.preview.entry.kind].toLowerCase()} · ${entry.preview.entry.name}`;
+  if (entry.kind === "learning") return `Learning on ${entry.key} · ${entry.preview.turns} owner turns`;
+  return `${entry.request.action === "include" ? "Include" : "Exclude"} ${entry.request.target_id} · cleanup for ${entry.request.owner.id}`;
+}
+
+/** Recovered requests are passive until the owner explicitly checks or retries the original authorization. */
+function SavedRequests(props: { hub: Hub; settings: Settings; isCurrent?: () => boolean; onTask: (id: string) => void; onOwner: (owner: StopOwner) => void; onArchive: (kind: ArchiveKind, id: string) => void }) {
+  const selected = signal<PendingEntry | undefined>(undefined), busy = signal(false), note = signal(""), good = signal(false), knownId = signal("");
+  let generation = 0, disposed = false;
+  cleanup(() => { disposed = true; generation++; });
+  const active = () => { const entry = selected(); return entry && props.hub.savedEntries().some((e) => e.kind === entry.kind && e.key === entry.key && e.request.request_id === entry.request.request_id); };
+  const currentEntry = () => { const entry = selected(); return entry && (props.hub.savedEntries().find((e) => e.kind === entry.kind && e.key === entry.key && e.request.request_id === entry.request.request_id) ?? entry); };
+  const currentId = () => { const entry = currentEntry(); return knownId() || (entry?.kind === "task" || entry?.kind === "learning" ? entry.known_id ?? "" : ""); };
+  const select = (entry: PendingEntry) => {
+    if (busy()) return;
+    selected.set(entry); note.set(""); good.set(false);
+    knownId.set(entry.kind === "archive" ? entry.preview.entry.id : entry.kind === "stop" ? entry.request.owner.id : "id" in entry.request ? entry.request.id : entry.known_id ?? "");
+  };
+  function release(entry: PendingEntry, receipt?: TaskFormResult) {
+    if (entry.kind === "task") {
+      const state = props.hub.taskForms().get(entry.key);
+      if (state?.pending()?.request_id === entry.request.request_id) {
+        clearTaskRequest(state, entry.key);
+        if (receipt) { state.result.set(receipt); state.knownId.set(receipt.id); }
+      }
+    } else if (entry.kind === "archive") props.hub.archiveRestores.update((all) => { const next = new Map(all); if (next.get(entry.key)?.request.request_id === entry.request.request_id) next.delete(entry.key); return next; });
+    else if (entry.kind === "stop") props.hub.stopReviews.update((all) => { const next = new Map(all); if (next.get(entry.key)?.intent.request_id === entry.request.request_id) next.delete(entry.key); return next; });
+  }
+  async function perform(retry = false, discard = false) {
+    const entry = currentEntry(); if (!entry || disposed || !active() || busy()) return;
+    const started = generation;
+    if (entry.kind === "stop") {
+      const answer = await AlertDialog.show({ title: "Retry the same cleanup decision?", description: "This keeps your original target, decision and reason. If the decision was not saved, it may be applied now. It does not choose a newer run.", actions: [{ id: "back", label: "Back", role: "cancel" }, { id: "retry", label: "Retry same decision" }] });
+      if (answer.action !== "retry" || disposed || started !== generation || props.isCurrent?.() === false) return;
+    }
+    if (entry.kind === "learning" && (retry || discard)) {
+      const answer = await AlertDialog.show({ title: discard ? "Release the uncertain collection?" : "Retry the same learning run?",
+        description: discard ? "This leaves tasks and current learning progress unchanged. A fresh preview may include the same history. It releases only this exact uncertain collection; it does not cancel a task."
+          : "If the original run was not applied, this may collect the same reviewed history and queue its learning task on the saved machine. It keeps the original request and preview; it does not select newer history.",
+        actions: [{ id: "back", label: "Back", role: "cancel" }, { id: "continue", label: discard ? "Release collection" : "Retry same run" }] });
+      if (answer.action !== "continue" || disposed || started !== generation || props.isCurrent?.() === false || busy() || !active() || selected()?.request.request_id !== entry.request.request_id) return;
+    }
+    busy.set(true); note.set(""); good.set(false);
+    try {
+      if (!await props.hub.keepPending(entry)) { note.set(props.hub.savedError() || "Reload saved requests before continuing."); return; }
+      if (disposed || started !== generation || props.isCurrent?.() === false) return;
+      let body: unknown = { ...entry.request, ...(!retry && !discard && entry.kind !== "stop" ? { confirm_only: true } : {}) };
+      if (retry && entry.kind === "archive" && entry.request.project) {
+        const { host, path } = entry.request.project;
+        const check = await props.hub.api("POST", `/api/machines/${encodeURIComponent(host)}/project-folder-check`, { path });
+        const value = check.data;
+        if (!check.ok || value.host !== host || value.requested_path !== path || typeof value.path !== "string" || !value.path || typeof value.repo !== "string" || !Array.isArray(value.requires)
+          || value.requires.some((cap) => typeof cap !== "string") || typeof value.checked !== "string" || !Number.isFinite(Date.parse(value.checked)) || value.probe_ticket !== undefined && !validRunId(value.probe_ticket)) {
+          note.set(String(value.error ?? "The saved machine did not confirm its folder. Reconnect it before retrying this restoration.")); return;
+        }
+        body = { ...entry.request, project: { host, path, ...(value.probe_ticket ? { probe_ticket: value.probe_ticket } : {}) } };
+      }
+      const path = entry.kind === "task" ? "id" in entry.request ? "/api/tasks/reopen" : "/api/tasks/create" : entry.kind === "archive" ? "/api/archive/restore" : "/api/stops/resolve";
+      const r = entry.kind === "learning" ? await props.hub.learningRun(entry.key, body as LearningRunRequest, discard) : await props.hub.api("POST", path, body);
+      if (disposed || started !== generation || !active()) return;
+      const receipt = entry.kind === "archive" ? readArchiveRestoreResult(r.data) : entry.kind === "task" ? readTaskFormResult(r.data) : undefined;
+      const learned = entry.kind === "learning" ? learningReceipt(r.data, entry.key, entry.request, entry.preview, entry.known_id) : undefined;
+      const discarded = entry.kind === "learning" ? learningRelease(r.data, entry.key, entry.request, entry.known_id) : undefined;
+      if (r.ok && (entry.kind === "archive" ? !receipt || receipt.id !== entry.preview.entry.id || (receipt as ArchiveRestoreResult).kind !== entry.preview.entry.kind
+        : entry.kind === "task" ? !receipt || !!entry.known_id && receipt.id !== entry.known_id : entry.kind === "learning" ? !learned && !discarded : false)) { note.set("Could not verify this saved request's result. Its original authorization is kept for another check."); return; }
+      if (entry.kind === "learning") {
+        const id = learned?.id ?? discarded?.id ?? learningTaskId(r.data, entry.key, entry.request, entry.known_id);
+        if (id) { knownId.set(id); if (!await props.hub.keepPending({ ...entry, known_id: id })) { note.set(props.hub.savedError()); return; } }
+      }
+      if (entry.kind === "task" && r.data.request_id === entry.request.request_id && r.data.action === ("id" in entry.request ? "reopen" : "create") && typeof r.data.id === "string" && /^T-[\w-]*\d{4}$/.test(r.data.id)
+        && (!("id" in entry.request) || r.data.id === entry.request.id) && (!currentId() || r.data.id === currentId())) {
+        knownId.set(r.data.id);
+        if (!r.ok) await props.hub.keepPending({ ...entry, known_id: r.data.id });
+      }
+      if (!r.ok) { note.set(String(r.data.error ?? "This saved request is still unconfirmed. Inspect its current record before authorizing another request.")); return; }
+      if (!await props.hub.dropPending(entry.kind, entry.key, entry.request.request_id)) { note.set("The earlier action is confirmed, but its local recovery copy could not be cleared. Reload saved requests and check it again."); return; }
+      release(entry, entry.kind === "task" ? readTaskFormResult(r.data) : undefined); good.set(true);
+      note.set(entry.kind === "stop" ? "Earlier cleanup decision confirmed. This does not prove that the task was stopped." : discarded ? "Earlier collection release confirmed. Tasks and learning progress were left unchanged." : "Earlier request confirmed. Open the record to check its current state.");
+      void props.hub.refreshStatus();
+    } finally { busy.set(false); }
+  }
+  async function forget() {
+    const entry = selected(); if (!entry || disposed || !active() || busy()) return;
+    const started = generation;
+    const answer = await AlertDialog.show({ title: "Forget this saved request?", description: "This removes only its recovery copy from this sign-in on this device. The earlier action may still finish. No task, restoration, cleanup decision or learning progress is undone.", actions: [{ id: "keep", label: "Keep saved request", role: "cancel" }, { id: "forget", label: "Forget saved request", role: "destructive" }] });
+    if (answer.action !== "forget" || disposed || started !== generation || props.isCurrent?.() === false || busy() || selected()?.request.request_id !== entry.request.request_id) return;
+    busy.set(true);
+    if (await props.hub.dropPending(entry.kind, entry.key, entry.request.request_id)) { release(entry); selected.set(undefined); note.set(""); }
+    else { good.set(false); note.set(props.hub.savedError()); }
+    busy.set(false);
+  }
+  async function reset() {
+    if (busy() || props.hub.savedLoading()) return;
+    const answer = await AlertDialog.show({ title: "Reset local saved requests?", description: "Unconfirmed actions may already have happened or may still finish. Inspect current records first. This clears this sign-in's local recovery copies, including unreadable copies, and does not cancel or undo server work.", actions: [{ id: "keep", label: "Keep recovery copies", role: "cancel" }, { id: "reset", label: "Reset local copies", role: "destructive" }] });
+    if (answer.action === "reset" && await props.hub.resetSaved()) { selected.set(undefined); note.set(""); }
+  }
+  async function inspect() {
+    const entry = selected(), id = currentId(); if (!entry || !id || busy()) return;
+    if (entry.kind === "stop") { props.onOwner(entry.request.owner); return; }
+    const task = entry.kind === "task" || entry.kind === "learning";
+    const path = task ? `/api/tasks/get?id=${encodeURIComponent(id)}` : `/api/${entry.preview.entry.kind}/${encodeURIComponent(id)}`;
+    const mine = ++generation;
+    busy.set(true); const r = await props.hub.api("GET", path);
+    busy.set(false);
+    if (mine !== generation || props.isCurrent?.() === false || selected()?.request.request_id !== entry.request.request_id) return;
+    const found = task ? r.data.id : entry.preview.entry.kind === "routines" ? r.data.name : entry.preview.entry.kind === "plans" ? (r.data.plan as PlanInfo | undefined)?.id : r.data.id;
+    if (!r.ok || found !== id) { good.set(false); note.set(String(r.data.error ?? "This record is not currently available. A confirmed receipt remains historical.")); return; }
+    if (task) props.onTask(id);
+    else if (entry.preview.entry.kind === "projects") props.settings.openProject(r.data as unknown as Project);
+    else props.onArchive(entry.preview.entry.kind, id);
+  }
+  return <View testID="saved-requests-page" style={{ gap: 14 }}>
+    <Text role="header" style={{ fontSize: 20, fontWeight: "600", color: colors.text }}>Saved requests</Text>
+    <Text style={{ color: colors.muted, fontSize: 14, lineHeight: 20 }}>These requests keep their original authorization after an app restart. Nothing is automatically retried. Checking an earlier result does not create another task or restore a deleted record.</Text>
+    <If when={props.hub.savedError()}><View style={{ gap: 10 }}><Text testID="saved-requests-error" style={{ color: colors.danger, fontSize: 14, lineHeight: 20 }}>{props.hub.savedError()}</Text><Btn testID="saved-requests-reset" label="Reset local recovery copies…" kind="ghost" disabled={busy() || props.hub.savedLoading()} onPress={() => void reset()} /></View></If>
+    <Btn testID="saved-requests-reload" label={props.hub.savedLoading() ? "Loading…" : "Reload saved requests"} kind="ghost" disabled={busy() || props.hub.savedLoading()} onPress={() => void props.hub.reloadSaved()} />
+    <Group title={props.hub.savedError() ? "Saved requests need review" : `${props.hub.savedEntries().length} unconfirmed requests`}>
+      <Each of={props.hub.savedEntries()} key={(entry) => `${entry.kind}:${entry.key}:${entry.request.request_id}`}>{(entry, i) => <SetRow first={i() === 0} testID={`saved-request-${entry().request.request_id}`} label={savedRequestLabel(entry())} detail={entry().at} chevron onPress={() => select(entry())} />}</Each>
+      <If when={!props.hub.savedEntries().length}><SetRow first label={props.hub.savedError() ? "Recovery copies could not be loaded" : "No unconfirmed requests"} /></If>
+    </Group>
+    <If when={selected()}>{(entry) => <View testID="saved-request-detail" style={{ gap: 12, padding: 16, borderRadius: radius.inset, backgroundColor: colors.surface }}>
+      <Text role="header" style={{ fontSize: 17, fontWeight: "600", color: colors.text }}>{savedRequestLabel(entry())}</Text>
+      <If when={entry().kind === "task"}>{() => { const task = entry() as Extract<PendingEntry, { kind: "task" }>; return <>
+        <Text style={{ color: colors.text, fontSize: 14, lineHeight: 20, userSelect: "text" }}>{task.request.instructions}</Text>
+        <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 19 }}>{`Member: ${task.request.settings.agent} · AI tool: ${task.request.settings.cli}\nMachine: ${task.request.settings.host} · Required: ${task.request.settings.requires || "None"}\nProject: ${task.request.settings.project || "None"} · Priority: ${task.request.settings.priority}\nPreferred: ${task.request.settings.prefer || "None"} · Resource use: ${task.request.settings.weight}${task.request.settings.project_guard ? `\nProject folder: ${task.request.settings.project_guard.path}\nProject requirements: ${task.request.settings.project_guard.requires.join(", ") || "None"}` : task.preview?.repo && task.request.settings.project === "__current__" ? `\nSaved folder: ${task.preview.repo}` : ""}`}</Text>
+        <If when={task.preview?.learning_host || task.preview?.learning_host_error}><Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>{task.preview?.learning_host ? `Learning source: ${task.preview.learning_host}. Its private history stays on that machine.` : `Learning source cannot be verified: ${task.preview?.learning_host_error}`}</Text></If>
+      </>; }}</If>
+      <If when={entry().kind === "archive"}>{() => { const archive = entry() as Extract<PendingEntry, { kind: "archive" }>, value = archive.preview; return <>
+        <Text style={{ color: colors.muted, fontSize: 14, lineHeight: 20 }}>{`Original ID: ${value.entry.id}${archive.request.project ? `\nMachine: ${archive.request.project.host}\nFolder: ${archive.request.project.path}` : ""}`}</Text>
+        <Text style={{ color: colors.text, fontSize: 14, lineHeight: 20, userSelect: "text" }}>{value.routine ? `${value.routine.every} · ${value.routine.agent || "Local learning"}\n${value.routine.prompt}\nRestores paused.` : value.member ? `${value.member.about}\n${value.member.instructions}\nIncludes ${value.entry.files} profile and memory files.` : value.project ? `Repository override: ${value.project.repo || "Automatic"}\nAdditional requirements: ${value.project.requires.join(", ") || "None"}\n${value.project.instructions}` : value.plan ? `${value.plan.goal}\n${value.plan.status} · ${value.plan.steps} steps · ${value.plan.agent}\nRestores history only; no work starts.` : ""}</Text>
+        <Each of={value.warnings}>{(warning) => <Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>{warning()}</Text>}</Each>
+      </>; }}</If>
+      <If when={entry().kind === "stop"}>{() => { const stop = entry() as Extract<PendingEntry, { kind: "stop" }>; return <><Text style={{ color: colors.text, fontSize: 14, lineHeight: 20 }}>{stop.request.reason}</Text>
+        <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 19, userSelect: "text" }}>{stop.preview ? stop.preview.current.records.map((record) => [record.title, record.state, record.host, record.run_id ? `Run ${record.run_id}` : ""].filter(Boolean).join(" · ")).join("\n") : "The original run details are unavailable in this copy. The server verifies the saved review before applying it."}</Text>
+        <Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>Retrying may apply this earlier decision if it was not saved. It does not select a newer run. An already-dispatched stop cannot be recalled.</Text></>; }}</If>
+      <If when={entry().kind === "learning"}>{() => { const learning = entry() as Extract<PendingEntry, { kind: "learning" }>; return <>
+        <Text style={{ color: colors.text, fontSize: 14, lineHeight: 20 }}>{`${learning.key} · ${learning.preview.turns} owner turns · ${learning.preview.sessions} provider sessions\nSelected sources: ${learning.preview.sources.map(providerLabel).join(", ") || "None"}`}</Text>
+        <Text style={{ color: colors.warn, fontSize: 13, lineHeight: 19 }}>{learning.preview.truncated ? "The prepared digest exceeded its limit; earlier collected content was omitted. Counts describe the full prepared collection." : "No digest truncation reported."} Checking the saved run does not read history or queue a task.</Text>
+      </>; }}</If>
+      <If when={active()}>
+        <If when={entry().kind !== "stop"}><Btn testID="saved-request-check" label={entry().kind === "learning" ? "Check saved run" : "Check earlier result"} kind="primary" busy={busy()} disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void perform()} /></If>
+        <Btn testID="saved-request-retry" label={entry().kind === "stop" ? "Retry same decision…" : entry().kind === "learning" ? "Retry same learning run…" : entry().kind === "archive" && (entry() as Extract<PendingEntry, { kind: "archive" }>).request.project ? "Check folder and retry same restore" : "Retry same request"} disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void perform(true)} />
+        <If when={entry().kind === "learning"}><Btn testID="saved-request-release" label="Release uncertain collection…" disabled={busy() || props.hub.savedLoading() || !!props.hub.savedError()} onPress={() => void perform(false, true)} /></If>
+        <Btn testID="saved-request-forget" label="Forget local copy…" kind="ghost" disabled={busy() || props.hub.savedLoading()} onPress={() => void forget()} />
+      </If>
+      <If when={currentId()}><Btn testID="saved-request-inspect" label="Inspect current record" kind="secondary" disabled={busy()} onPress={() => void inspect()} /></If>
+    </View>}</If>
+    <If when={note()}><Text testID="saved-requests-note" style={{ color: good() ? colors.up : colors.danger, fontSize: 14, lineHeight: 20 }}>{note()}</Text></If>
+    <ProjectEditor settings={props.settings} />
+  </View>;
+}
+
+/** Archives are previewed on the main machine; a restore never replaces an existing record. */
+function ArchiveBrowser(props: { hub: Hub; settings: Settings; isCurrent?: () => boolean; onOpen: (kind: ArchiveKind, id: string) => void }) {
+  const items = signal<ArchiveItem[]>([]), total = signal(0), nextOffset = signal(0), filter = signal<ArchiveKind | "">(""), query = signal("");
+  const listBusy = signal(false), error = signal(""), warnings = signal<string[]>([]);
+  const opened = signal(false), key = signal(""), loaded = signal<ArchivePreview | undefined>(undefined), result = signal<ArchiveRestoreResult | undefined>(undefined);
+  const busy = signal(false), note = signal(""), noteOk = signal(false), stale = signal(false);
+  const host = signal(""), path = signal(""), checking = signal(false);
+  const checked = signal<(ProjectFolderCheck & { probe_ticket?: string; received: number }) | undefined>(undefined);
+  const pending = () => props.hub.archiveRestores().get(key());
+  const preview = () => pending()?.preview ?? loaded();
+  let listGeneration = 0, previewGeneration = 0, probeGeneration = 0, appliedFilter = "";
+  cleanup(() => { listGeneration++; previewGeneration++; probeGeneration++; });
+  const invalidateFolder = () => { probeGeneration++; checked.set(undefined); checking.set(false); };
+  const probe = () => {
+    const value = checked();
+    return value && value.host === host() && value.requested_path === path().trim() && Date.now() - value.received < 300_000 ? value : undefined;
+  };
+  async function load(reset = true) {
+    const generation = ++listGeneration, kind = filter(), search = query().trim(), selectedFilter = JSON.stringify([kind, search]);
+    const offset = reset || selectedFilter !== appliedFilter ? 0 : nextOffset();
+    listBusy.set(true); error.set("");
+    const r = await props.hub.api("POST", "/api/archive", { ...(kind ? { kind } : {}), query: search, offset, limit: 25 });
+    if (generation !== listGeneration) return;
+    listBusy.set(false);
+    const list = readArchiveList(r.data);
+    if (!r.ok || !list || list.offset !== offset || list.limit !== 25 || !list.items.length && offset < list.total || kind && list.items.some((item) => item.kind !== kind)) {
+      error.set(r.status === 404 ? "Update the hub and main machine to browse and restore archives." : String(r.data.error ?? "Couldn't load the archive. Your saved records are unchanged.")); return;
+    }
+    appliedFilter = selectedFilter;
+    items.set(offset === 0 ? list.items : [...items(), ...list.items.filter((item) => !items().some((old) => old.key === item.key))]); nextOffset.set(offset + list.items.length); total.set(list.total); warnings.set(list.warnings);
+  }
+  async function choose(selected: string, keepDraft = false) {
+    if (busy()) return;
+    const generation = ++previewGeneration;
+    key.set(selected); opened.set(true); loaded.set(undefined); result.set(undefined); note.set(""); noteOk.set(false); stale.set(false); invalidateFolder();
+    const saved = pending();
+    if (saved) { host.set(saved.request.project?.host ?? ""); path.set(saved.request.project?.path ?? ""); note.set("An earlier restoration still needs confirmation. Check the saved restore before starting another request."); return; }
+    busy.set(true);
+    const selectedItem = items().find((item) => item.key === selected);
+    const r = await props.hub.api("POST", "/api/archive/preview", { key: selected });
+    if (generation !== previewGeneration || key() !== selected) return;
+    busy.set(false);
+    const value = readArchivePreview(r.data);
+    if (r.ok && value?.entry.key === selected && (!selectedItem || value.entry.kind === selectedItem.kind && value.entry.id === selectedItem.id)) {
+      loaded.set(value);
+      if (!keepDraft) { host.set(value.project?.host ?? ""); path.set(value.project?.path ?? ""); }
+    } else note.set(r.status === 404 ? "This archive is unavailable, or the main machine needs an update. Refresh the list." : String(r.data.error ?? "Couldn't preview this archive."));
+  }
+  const close = () => { if (!busy() && !checking()) { previewGeneration++; opened.set(false); } };
+  async function refreshPreview() {
+    if (busy() || checking()) return;
+    const saved = pending();
+    if (saved) {
+      const answer = await AlertDialog.show({ title: "Start a fresh archive preview?", description: "The earlier restore may still finish. Existing records will be kept. Check the saved restore first if you want to confirm its result.", actions: [{ id: "keep", label: "Keep pending restore", role: "cancel" }, { id: "refresh", label: "Refresh preview" }] });
+      if (answer.action !== "refresh") return;
+      if (!await props.hub.dropPending("archive", key(), saved.request.request_id)) { noteOk.set(false); note.set(props.hub.savedError()); return; }
+      props.hub.archiveRestores.update((all) => { const next = new Map(all); if (next.get(key())?.request.request_id === saved.request.request_id) next.delete(key()); return next; });
+    }
+    await choose(key(), true);
+  }
+  async function checkFolder() {
+    const selected = key(), generation = ++probeGeneration, target = host(), folder = path().trim();
+    if (!target || !folder || busy()) return false;
+    checking.set(true); checked.set(undefined); note.set(""); noteOk.set(false);
+    const r = await props.hub.api("POST", `/api/machines/${encodeURIComponent(target)}/project-folder-check`, { path: folder });
+    if (generation !== probeGeneration || key() !== selected || host() !== target || path().trim() !== folder) return false;
+    checking.set(false);
+    const value = r.data;
+    if (!r.ok || value.host !== target || value.requested_path !== folder || typeof value.path !== "string" || !value.path || typeof value.repo !== "string" || !Array.isArray(value.requires) || value.requires.some((cap) => typeof cap !== "string")
+      || typeof value.checked !== "string" || !Number.isFinite(Date.parse(value.checked)) || target !== props.settings.view()?.effective.primary_host && !validRunId(value.probe_ticket)) {
+      note.set(String(value.error ?? "The selected machine did not confirm this folder. Reconnect it and check again.")); return false;
+    }
+    checked.set({ ...(value as ProjectFolderCheck & { probe_ticket?: string }), received: Date.now() }); return true;
+  }
+  async function send(request: ArchiveRestoreRequest, value: ArchivePreview) {
+    if (busy() || checking()) return;
+    const existing = props.hub.archiveRestores().get(request.key);
+    if (existing && existing.request.request_id !== request.request_id) { note.set("Confirm the pending restoration before starting another request."); return; }
+    busy.set(true); note.set(""); noteOk.set(false);
+    try {
+      if (!await props.hub.keepPending({ kind: "archive", key: request.key, at: props.hub.savedAt("archive", request.key), request, preview: value })) { note.set(props.hub.savedError() || "Wait for saved requests to finish loading before submitting."); return; }
+      props.hub.archiveRestores.update((all) => new Map(all).set(request.key, { request: { ...request, confirm_only: undefined }, preview: value }));
+      const r = await props.hub.api("POST", "/api/archive/restore", request);
+      const latest = props.hub.archiveRestores().get(request.key);
+      if (latest?.request.request_id !== request.request_id || key() !== request.key) return;
+      const restored = readArchiveRestoreResult(r.data), valid = restored?.key === request.key && restored.digest === request.digest && restored.request_id === request.request_id && restored.id === value.entry.id && restored.kind === value.entry.kind;
+      if (r.ok && valid) {
+        result.set(restored); loaded.set(value);
+        if (!await props.hub.dropPending("archive", request.key, request.request_id)) { note.set("Restoration confirmed, but its local recovery copy could not be cleared. Reload saved requests and check it again."); return; }
+        props.hub.archiveRestores.update((all) => { const next = new Map(all); if (next.get(request.key)?.request.request_id === request.request_id) next.delete(request.key); return next; });
+        note.set(restored.replayed ? "Earlier restoration confirmed. Open the record to check its current state." : "Restoration confirmed.");
+        noteOk.set(true);
+        props.settings.load(); void props.hub.refreshStatus(); return;
+      }
+      if (r.data.saved_locally && valid) result.set(restored);
+      note.set(String(r.data.error ?? "Couldn't confirm this restoration. Check the saved restore before trying again."));
+      if (!(r.status === 0 || r.status === 202 || r.status >= 500 || r.data.saved_locally || r.data.pending || r.data.uncertain) && !request.confirm_only) {
+        if (!await props.hub.dropPending("archive", request.key, request.request_id)) { note.set(`${note()} The saved request is kept until local storage recovers.`); return; }
+        props.hub.archiveRestores.update((all) => { const next = new Map(all); if (next.get(request.key)?.request.request_id === request.request_id) next.delete(request.key); return next; });
+        stale.set(true); invalidateFolder();
+      }
+    } finally { busy.set(false); }
+  }
+  async function restore() {
+    const value = preview();
+    if (!value || !value.can_restore || pending() || busy() || checking() || stale() || result()) return;
+    if (value.entry.kind === "projects" && !probe() && !await checkFolder()) return;
+    const request: ArchiveRestoreRequest = { key: value.entry.key, digest: value.digest, request_id: crypto.randomUUID(), ...(value.project ? { project: { host: host(), path: path().trim(), ...(probe()?.probe_ticket ? { probe_ticket: probe()!.probe_ticket } : {}) } } : {}) };
+    await send(request, value);
+  }
+  async function openRestored() {
+    const saved = result() ?? preview()?.entry; if (!saved) return;
+    const selected = key(), mine = ++previewGeneration;
+    busy.set(true);
+    const r = await props.hub.api("GET", `/api/${saved.kind}/${encodeURIComponent(saved.id)}`);
+    if (mine !== previewGeneration || key() !== selected || props.isCurrent?.() === false) { busy.set(false); return; }
+    busy.set(false);
+    const identity = saved.kind === "routines" ? r.data.name : saved.kind === "plans" ? (r.data.plan as PlanInfo | undefined)?.id : r.data.id;
+    if (!r.ok || identity !== saved.id) { noteOk.set(false); note.set(String(r.data.error ?? "This record is not currently available. Its earlier restore may still need confirmation.")); return; }
+    close();
+    if (saved.kind === "projects") props.settings.openProject(r.data as unknown as Project);
+    else props.onOpen(saved.kind, saved.id);
+  }
+  void load();
+  return <View testID="archive-page" style={{ gap: 14 }}>
+    <Text role="header" style={{ fontSize: 19, fontWeight: "600", color: colors.text }}>Archive</Text>
+    <Text style={{ fontSize: 14, lineHeight: 20, color: colors.muted }}>Preview deleted routines, members, projects and plans before restoring them. Routines return paused; plans return as history.</Text>
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <Dropdown testID="archive-kind" label="Type" value={filter() ? `${ARCHIVE_LABELS[filter() as ArchiveKind]}s` : "All types"} selected={filter()} onPick={(v) => { filter.set(v as ArchiveKind | ""); void load(); }} options={[{ id: "", label: "All types", testID: "archive-kind-all" }, ...ARCHIVE_KINDS.map((kind) => ({ id: kind, label: `${ARCHIVE_LABELS[kind]}s`, testID: `archive-kind-${kind}` }))]} />
+      <Btn testID="archive-refresh" label="Refresh archive" kind="ghost" disabled={listBusy()} onPress={() => void load()} />
+    </View>
+    <Field testID="archive-search" label="Search archive" value={query()} onChange={(v) => query.set(v)} hint="Search names and original IDs." />
+    <Btn testID="archive-search-submit" label="Search" disabled={listBusy() || query().length > 200} onPress={() => void load()} />
+    <If when={error()}><Text testID="archive-error" style={{ fontSize: 13, color: colors.danger }}>{error()}</Text></If>
+    <Each of={warnings()} key={(warning) => warning}>{(warning) => <Text style={{ fontSize: 13, color: colors.warn }}>{warning()}</Text>}</Each>
+    <Group title={error() || listBusy() && !items().length ? "Archived records" : `${total()} archived record${total() === 1 ? "" : "s"}`}>
+      <Each of={items()} key={(item) => item.key}>{(item, i) => <SetRow testID={`archive-item-${item().key}`} first={i() === 0} label={item().name} detail={`${ARCHIVE_LABELS[item().kind]} · ${item().id} · ${item().archived_at}`} value={props.hub.archiveRestores().has(item().key) ? "Needs confirmation" : undefined} chevron onPress={() => void choose(item().key)} />}</Each>
+      <If when={!items().length}><SetRow first label={listBusy() ? "Loading…" : error() ? "Archive unavailable" : "No archived records match"} /></If>
+    </Group>
+    <If when={nextOffset() < total()}><Btn testID="archive-more" label="Load more" disabled={listBusy()} busy={listBusy()} onPress={() => void load(false)} /></If>
+    <Dialog testID="archive-preview" open={opened()} onOpenChange={({ open }) => { if (!open) close(); }} animation="fade" backdropClass="bg-scrim" style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}>
+      <View style={{ width: "100%", maxWidth: 680, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", height: 56, paddingLeft: 20, paddingRight: 10, borderBottomWidth: .5, borderBottomColor: surfaceEdge() }}><Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>Archived record</Text><Btn testID="archive-close" label="Close" kind="ghost" disabled={busy() || checking()} onPress={close} /></View>
+        <Scroll style={{ flexShrink: 1 }}><View style={{ padding: 20, gap: 14 }}>
+          <If when={preview()} else={<Text style={{ fontSize: 14, color: colors.muted }}>{busy() ? "Loading preview…" : "Refresh to load this archive."}</Text>}>
+            {(value) => <>
+              <Text testID="archive-name" style={{ fontSize: 18, fontWeight: "600", color: colors.text }}>{value().entry.name}</Text>
+              <Text style={{ fontSize: 13, color: colors.faint }}>{`${ARCHIVE_LABELS[value().entry.kind]} · ${value().entry.id} · ${value().entry.archived_at}`}</Text>
+              <Each of={[...value().conflicts, ...value().warnings]} key={(warning) => warning}>{(warning) => <Text testID="archive-warning" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{warning()}</Text>}</Each>
+              <If when={value().routine}>{(r) => <><Text style={{ fontSize: 14, color: colors.muted }}>{`${r().every} · ${r().agent || "Local learning"}${r().project ? ` · ${r().project}` : ""}`}</Text><Text style={{ fontSize: 14, lineHeight: 20, color: colors.text, userSelect: "text" }}>{r().prompt}</Text><Text style={{ fontSize: 13, color: colors.warn }}>Restores paused. Enable it in Routines when you are ready.</Text></>}</If>
+              <If when={value().member}>{(m) => <><Text style={{ fontSize: 14, color: colors.muted }}>{[m().name, m().title, m().about].filter(Boolean).join(" · ")}</Text><View selectable><Rich text={m().instructions} /></View><Text style={{ fontSize: 13, color: colors.muted }}>{`Includes ${value().entry.files} archived files, including the saved profile and memory.`}</Text></>}</If>
+              <If when={value().plan}>{(p) => <><Text style={{ fontSize: 14, color: colors.muted }}>{`${p().status} · ${p().steps} steps · ${p().agent}${p().project ? ` · ${p().project}` : ""}`}</Text><Text style={{ fontSize: 14, lineHeight: 20, color: colors.text, userSelect: "text" }}>{p().goal}</Text><Text style={{ fontSize: 13, color: colors.muted }}>Restores history only. No work starts automatically.</Text></>}</If>
+              <If when={value().project}>{(p) => <>
+                <View disabled={!!pending() || busy() || !!result()} style={{ gap: 12 }}>
+                  <Dropdown testID="archive-project-host" label="Machine" value={host()} selected={host()} onPick={(v) => { host.set(v); invalidateFolder(); }} options={[...new Set([host(), props.settings.view()?.effective.primary_host ?? "", ...props.settings.machines().map((m) => m.host)].filter(Boolean))].map((id) => ({ id, label: id, detail: props.settings.machines().find((m) => m.host === id)?.online === false ? "Offline" : id === props.settings.view()?.effective.primary_host ? "Main machine" : "Worker", testID: `archive-project-host-${id}` }))} />
+                  <Field testID="archive-project-path" label="Folder" value={path()} onChange={(v) => { path.set(v); invalidateFolder(); }} hint="Choose a folder on this machine. A new check is required before restoration." />
+                </View>
+                <Btn testID="archive-project-check" label={`Check folder on ${host()}`} disabled={busy() || checking() || !!result() && !pending() || !host() || !path().trim()} busy={checking()} onPress={() => void checkFolder()} />
+                <If when={probe()}><Text testID="archive-project-checked" style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{`Confirmed folder: ${probe()!.path}\nDetected repo: ${probe()!.repo || "None"}\nDetected requirements: ${probe()!.requires.join(", ") || "None"}`}</Text></If>
+                <Text style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{`Saved repo override: ${p().repo || "Automatic"}\nAdditional requirements: ${p().requires.join(", ") || "None"}`}</Text>
+                <View selectable><Rich text={p().instructions} /></View>
+              </>}</If>
+              <If when={!pending() && !result()}><Btn testID="archive-restore" label={value().entry.kind === "routines" ? "Restore paused" : "Restore"} kind="primary" disabled={!value().can_restore || busy() || checking() || stale()} busy={busy()} onPress={() => void restore()} /></If>
+            </>}
+          </If>
+          <If when={pending()}>{(saved) => <View style={{ gap: 8 }}>
+            <Btn testID="archive-confirm" label="Check saved restore" kind="primary" disabled={busy() || checking()} busy={busy()} onPress={() => void send({ ...saved().request, confirm_only: true, ...(saved().request.project ? { project: { host: saved().request.project!.host, path: saved().request.project!.path } } : {}) }, saved().preview)} />
+            <Btn testID="archive-retry" label="Retry same restore" disabled={busy() || checking() || !!saved().request.project && !probe()} onPress={() => void send({ ...saved().request, ...(saved().request.project ? { project: { ...saved().request.project!, ...(probe()?.probe_ticket ? { probe_ticket: probe()!.probe_ticket } : {}) } } : {}) }, saved().preview)} />
+          </View>}</If>
+          <If when={note()}><Text testID="archive-note" style={{ fontSize: 13, lineHeight: 19, color: noteOk() ? colors.up : colors.danger }}>{note()}</Text></If>
+          <Each of={result()?.warnings ?? []} key={(warning) => warning}>{(warning) => <Text style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{warning()}</Text>}</Each>
+          <If when={result() || pending() || preview()?.conflicts.length}><Btn testID="archive-open" label={result() && !pending() ? "Open restored record" : "Inspect current record"} kind="secondary" disabled={busy() || checking()} onPress={() => void openRestored()} /></If>
+          <Btn testID="archive-preview-refresh" label="Refresh preview" kind="ghost" disabled={busy() || checking()} onPress={() => void refreshPreview()} />
+        </View></Scroll>
+      </View>
+    </Dialog>
+    <ProjectEditor settings={props.settings} />
+  </View>;
+}
+
 /** The wide (desktop, tablet, wide browser) settings page. */
-function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: boolean; onRules: () => void; onConnection: () => void; onDisconnect: () => void }) {
+function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: boolean; isCurrent: () => boolean; onTask: (id: string) => void; onArchiveOpen: (kind: ArchiveKind, id: string) => void; onRules: () => void; onConnection: () => void; onDisconnect: () => void }) {
   const { view, error, saved, save } = props.settings;
   props.settings.load();
   const eff = () => view()?.effective;
@@ -2607,11 +4428,14 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
           {(e) => (
             <View style={{ gap: 28 }}>
               <If when={on("members")}>
+              <Group title="Default task tool order" hint="Applies to new tasks on the machine claiming them. Explicit orders use the first usable tool; Automatic lets planning choose. Chat, judges and automatic repair keep their own tool choices.">
+                <View style={{ padding: 16 }}><TaskToolPolicy settings={props.settings} /></View>
+              </Group>
               <Group title="Members" hint="Each role on the team. Instructions say how they work; the model decides who does the work; autonomy decides how much needs your approval first.">
                 <Each of={e().agents} key={(a) => a.id}>
                   {(a, i) => (
-                    <View testID={`member-${a().id}`} style={{ flexDirection: props.wide ? "row" : "column", alignItems: props.wide ? "center" : "stretch", gap: 12, paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: i() === 0 ? 0 : 0.5, borderTopColor: surfaceEdge() }}>
-                      <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 12 }}>
+                    <View testID={`member-${a().id}`} style={{ gap: 12, paddingHorizontal: 16, paddingVertical: 14, borderTopWidth: i() === 0 ? 0 : 0.5, borderTopColor: surfaceEdge() }}>
+                      <View style={{ minWidth: 0, flexDirection: "row", alignItems: "center", gap: 12 }}>
                         <Avatar from={a().id} />
                         <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
                           <Text style={{ fontSize: 15.5, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{a().title ?? a().id}</Text>
@@ -2620,23 +4444,9 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
                           </If>
                         </View>
                       </View>
-                      <View style={{ flexDirection: "row", gap: 8, paddingLeft: props.wide ? 0 : 52 }}>
-                        <Dropdown
-                          testID={`cli-${a().id}`}
-                          label="Model"
-                          value={cliLabel(a().clis)}
-                          options={view()!.options.clis.map((c) => ({ id: cliKey(c), label: cliLabel(c), detail: cliDetail(c), testID: `cli-${a().id}-${cliKey(c)}` }))}
-                          selected={cliKey(a().clis)}
-                          onPick={(k) => { const c = view()!.options.clis.find((x) => cliKey(x) === k); if (c) save(patches.clis(a().id, c)); }}
-                        />
-                        <Dropdown
-                          testID={`autonomy-${a().id}`}
-                          label="Autonomy"
-                          value={autonomyLabel(a().autonomy)}
-                          options={view()!.options.autonomy.map((l) => ({ id: l, label: autonomyLabel(l), detail: AUTONOMY_DETAIL[l], testID: `autonomy-${a().id}-${l}` }))}
-                          selected={a().autonomy}
-                          onPick={(l) => save(patches.autonomy(a().id, l))}
-                        />
+                      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 8 }}>
+                        <TaskToolPolicy settings={props.settings} agent={a().id} />
+                        <MemberAutonomyPolicy settings={props.settings} agent={a().id} />
                         <Btn label="Edit" kind="ghost" onPress={() => void props.settings.openMember(a().id)} testID={`member-edit-${a().id}`} />
                       </View>
                     </View>
@@ -2645,6 +4455,7 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
                 <SetRow label="New member" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openMember()} testID="member-new" />
               </Group>
               <MemberEditor settings={props.settings} />
+              <RoleLibrary hub={props.hub} onAdded={props.settings.accept} disabled={props.settings.saving() > 0} />
               </If>
 
               <If when={on("routines")}>
@@ -2687,7 +4498,7 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
               </If>
 
               <If when={on("parallel")}>
-              <Group title="Parallel">
+              <Group title="Parallel" hint="Fleet default. A machine’s own run settings take precedence.">
                 <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 16, paddingVertical: 14 }}>
                   <Text style={{ flex: 1, fontSize: 15.5, color: colors.text }}>Tasks each machine runs at once</Text>
                   <ParallelInput value={e().max_parallel ?? 2} onChange={(value) => save(patches.maxParallel(value))} />
@@ -2698,6 +4509,10 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
           )}
         </If>
         </If>
+        <If when={on("onboarding")}><ConfigurationSettings hub={props.hub} initialGroup="onboarding" onTask={props.onTask} /></If>
+        <If when={on("archive")}><ArchiveBrowser hub={props.hub} settings={props.settings} isCurrent={() => props.isCurrent() && on("archive")} onOpen={props.onArchiveOpen} /></If>
+        <If when={on("saved")}><SavedRequests hub={props.hub} settings={props.settings} isCurrent={() => props.isCurrent() && on("saved")} onTask={taskLink} onOwner={(owner) => owner.kind === "plan" ? planLink(owner.id) : taskLink(owner.id)} onArchive={props.onArchiveOpen} /></If>
+        <If when={on("configuration")}><ConfigurationSettings hub={props.hub} onTask={props.onTask} /></If>
         <If when={on("commands")}>
         <Group title="Commands" hint="Type / in the composer to use one. Built-in commands perform an action; the ones you add send a message to the team.">
           <CommandRows settings={props.settings} />
@@ -2714,7 +4529,7 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
         </Group>
         </If>
         <If when={on("rules")}>
-        <Group title="Memory" hint="The rules the team works by, your preferences, member profiles and decision precedents. Read-only.">
+        <Group title="Memory" hint="The rules the team works by, your preferences, member profiles and decision precedents. Edit rules, preferences and member memory here.">
           <SetRow first label="View rules and memory" chevron onPress={props.onRules} testID="settings-rules" />
         </Group>
         </If>
@@ -2740,8 +4555,8 @@ function TeamSettings(props: { hub: Hub; push: Push; settings: Settings; wide: b
 // ---------------------------------------------------------------- settings on phones (iOS / Android Settings)
 
 /** What the notification settings show and change, for both layouts. */
-function notifyModel(push: Push, view: () => SettingsView | null, save: (patch: Record<string, unknown>) => void) {
-  const tz = "Asia/Singapore";
+function notifyModel(push: Push, view: () => SettingsView | null, save: (patch: Record<string, unknown>) => unknown) {
+  const tz = deviceTimeZone();
   const prefs = () => notifyPrefsOf(view(), tz);
   const setPrefs = (change: Partial<NotifyPrefs>) => save(notifyPatch({ ...prefs(), ...change }));
   const state = () => {
@@ -2760,6 +4575,36 @@ function notifyModel(push: Push, view: () => SettingsView | null, save: (patch: 
     return i.subscribed ? "On" : "Off";
   };
   return { prefs, setPrefs, state, short };
+}
+
+/** One shared preference keeps app and web-push quiet hours in the same named zone. */
+function NotificationTimeZone(props: { prefs: () => NotifyPrefs; save: (change: Partial<NotifyPrefs>) => unknown }) {
+  const draft = signal<string | null>(null), busy = signal(false), error = signal(""), note = signal("");
+  const value = () => draft() ?? props.prefs().tz;
+  async function submit() {
+    if (busy()) return;
+    const submitted = value(), tz = notificationTimeZone(submitted);
+    error.set(""); note.set("");
+    if (!tz) return error.set("Enter a valid IANA time zone, for example America/Toronto or UTC.");
+    busy.set(true);
+    const accepted = await props.save({ tz });
+    busy.set(false);
+    if (accepted === false) error.set("Couldn't save the time zone. Your entry is kept; check the settings message and retry.");
+    else {
+      if (draft() === submitted) draft.set(null);
+      note.set(value().trim() === props.prefs().tz ? "Time zone saved." : "Submitted time zone saved. Your additional unsaved entry is kept.");
+    }
+  }
+  return <View style={{ gap: 10 }}>
+    <Field testID="notify-timezone" label="Quiet hours time zone" value={value()} onChange={(value) => { draft.set(value); error.set(""); note.set(""); }} onSubmit={() => void submit()} maxLength={100}
+      hint="Use an IANA name such as America/Toronto or UTC. Daylight saving changes apply automatically. This preference is shared across your devices." />
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      <Btn testID="notify-timezone-save" label="Save time zone" kind="ghost" busy={busy()} disabled={busy() || value().trim() === props.prefs().tz} onPress={() => void submit()} />
+      <Btn testID="notify-timezone-device" label="Use this device's time zone" kind="ghost" disabled={busy()} onPress={() => { draft.set(deviceTimeZone()); void submit(); }} />
+    </View>
+    <If when={error()}><Text testID="notify-timezone-error" style={{ color: colors.danger, fontSize: 13 }}>{error()}</Text></If>
+    <If when={note()}><Text testID="notify-timezone-note" style={{ color: colors.up, fontSize: 13 }}>{note()}</Text></If>
+  </View>;
 }
 
 /** A grouped, inset section: a muted title above, rows on one rounded surface, a hint below. */
@@ -2866,7 +4711,7 @@ function CommandEditor(props: { settings: Settings }) {
   const { view, save } = props.settings;
   const { name, text, editing, note } = props.settings.commandDraft;
   const isNew = () => editing() === "";
-  const close = () => editing.set(undefined);
+  const close = () => { if (!props.settings.saving()) editing.set(undefined); };
   const others = () => savedCommands(view()).filter((c) => c.name !== editing());
   const clean = () => name().trim().replace(/^\//, "").replace(/\s+/g, "-");
   const ok = () => !!clean() && !!text().trim();
@@ -2879,13 +4724,15 @@ function CommandEditor(props: { settings: Settings }) {
     const list = savedCommands(view());
     const i = list.findIndex((c) => c.name === editing());
     const next = i < 0 ? [...list, { name: n, text: t }] : list.map((c, j) => (j === i ? { name: n, text: t } : c));
-    close();
-    await save({ commands: next });
+    if (await save({ commands: next })) {
+      if (clean() === n && text().trim() === t) close();
+      else { editing.set(n); note.set("Submitted version saved. You have additional unsaved edits."); }
+    } else note.set(props.settings.error() || "Couldn't save this command. Your draft is kept.");
   };
   const remove = async () => {
     const n = editing();
-    close();
-    await save({ commands: savedCommands(view()).filter((c) => c.name !== n) });
+    if (await save({ commands: savedCommands(view()).filter((c) => c.name !== n) })) close();
+    else note.set(props.settings.error() || "Couldn't delete this command");
   };
   return (
     <Dialog
@@ -2917,11 +4764,11 @@ function CommandEditor(props: { settings: Settings }) {
         </View>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 20, paddingBottom: 20 }}>
           <If when={!isNew()}>
-            <Btn label="Delete" kind="danger" icon="trash" onPress={() => void remove()} testID="command-delete" />
+            <Btn label="Delete" kind="danger" icon="trash" disabled={!!props.settings.saving()} onPress={() => void remove()} testID="command-delete" />
           </If>
           <View style={{ flex: 1 }} />
           <Btn label="Cancel" kind="ghost" onPress={close} testID="command-cancel" />
-          <Btn label={isNew() ? "Add" : "Save"} kind="primary" disabled={!ok()} onPress={() => void submit()} testID="command-save" />
+          <Btn label={isNew() ? "Add" : "Save"} kind="primary" disabled={!ok() || !!props.settings.saving()} onPress={() => void submit()} testID="command-save" />
         </View>
       </View>
     </Dialog>
@@ -2966,7 +4813,8 @@ function TextArea(props: { label: string; value: string; onChange: (v: string) =
 
 /** New / edit / delete one routine, in a dialog: what it does, who does it, and when. */
 function RoutineEditor(props: { settings: Settings; onGone?: () => void }) {
-  const { name, every, agent, project, prompt, desc, enabled, readonly, kind, editing, note, busy } = props.settings.routineDraft;
+  const { name, every, agent, project, prompt, desc, enabled, readonly, kind, editing, note, busy, requires, host, cli, priority, prefer, weight, repo, scheduler, detector } = props.settings.routineDraft;
+  const advanced = signal(false);
   const eff = () => props.settings.view()?.effective;
   const isNew = () => editing() === "";
   const learn = () => kind() === "learn";
@@ -2975,14 +4823,14 @@ function RoutineEditor(props: { settings: Settings; onGone?: () => void }) {
   const ok = () => !!clean() && !!every().trim() && (learn() || (!!prompt().trim() && !!agent())) && !busy();
   const clear = () => note.set("");
   const submit = () => {
-    const body = { name: clean(), every: every(), agent: agent(), project: project(), prompt: prompt(), desc: desc(), enabled: enabled(), readonly: readonly() };
+    const body = { name: clean(), every: every(), agent: agent(), project: project(), prompt: prompt(), desc: desc(), enabled: enabled(), readonly: readonly(), requires: requires(), host: host(), cli: cli(), priority: priority(), prefer: prefer(), weight: weight(), repo: repo(), scheduler: scheduler(), signal: detector() };
     void (isNew() ? props.settings.writeRoutine("POST", "/api/routines", body) : props.settings.writeRoutine("PUT", `/api/routines/${encodeURIComponent(editing()!)}`, body));
   };
   const remove = async () => {
     const id = editing()!;
     const r = await AlertDialog.show({
       title: `Delete ${id}?`,
-      description: "It stops creating tasks. Anything it already started carries on. A copy moves to archive/routines/ in your data folder, where you can restore it by hand.",
+      description: "It stops creating tasks. Anything it already started carries on. A copy stays in Archive, where you can restore it paused.",
       actions: [
         { id: "cancel", label: "Cancel", role: "cancel" },
         { id: "delete", label: "Delete", role: "destructive" },
@@ -3008,7 +4856,7 @@ function RoutineEditor(props: { settings: Settings; onGone?: () => void }) {
           <View style={{ gap: 16, padding: 20 }}>
             <Field label="Name" value={name()} onChange={(v) => { name.set(v); clear(); }} placeholder="e.g. weekly-deps" testID="routine-name" autoFocus={isNew()} />
             <Field label="Schedule" value={every()} onChange={(v) => { every.set(v); clear(); }} placeholder="e.g. daily 09:00" testID="routine-every" hint="30m, hourly, daily 09:00, weekdays 09:00 or weekly MON 09:00, in this machine's time. Frequent routines use more quota." />
-            <If when={!learn()} else={<Text style={{ fontSize: 13.5, lineHeight: 19, color: colors.muted }}>This routine learns from each machine's local Claude and Codex sessions, so it has no member or instructions to set.</Text>}>
+            <If when={!learn()} else={<Text style={{ fontSize: 13.5, lineHeight: 19, color: colors.muted }}>This routine learns from each machine's selected local conversation sources, so it has no member or instructions to set.</Text>}>
               <>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
                   <Dropdown
@@ -3028,8 +4876,33 @@ function RoutineEditor(props: { settings: Settings; onGone?: () => void }) {
                     onPick={(id) => { project.set(id); clear(); }}
                   />
                 </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                  <Dropdown testID="routine-os" label="OS" value={requires().split(",").map((r) => r.trim()).find((r) => r.startsWith("os:"))?.replace("os:", "") || "Any OS"}
+                    selected={requires().split(",").map((r) => r.trim()).find((r) => r.startsWith("os:")) ?? ""}
+                    onPick={(v) => requires.set([...requires().split(",").map((r) => r.trim()).filter((r) => r && !r.startsWith("os:")), v].filter(Boolean).join(","))}
+                    options={[{ id: "", label: "Any OS", testID: "routine-os-any" }, ...["macos", "linux", "windows"].map((o) => ({ id: `os:${o}`, label: o === "macos" ? "macOS" : o === "linux" ? "Linux" : "Windows", testID: `routine-os-${o}` }))]} />
+                  <Dropdown testID="routine-cli" label="CLI" value={cli()} selected={cli()} onPick={(v) => cli.set(v)} options={["auto", ...PROVIDER_IDS].map((id) => ({ id, label: id, detail: id !== "auto" && !(eff()?.enabled_clis ?? DEFAULT_PROVIDERS).includes(id) ? "Disabled in AI tools & onboarding" : undefined }))} />
+                  <Dropdown testID="routine-priority" label="Priority" value={priority()} selected={priority()} onPick={(v) => priority.set(v)} options={["urgent", "high", "normal", "low"].map((id) => ({ id, label: id }))} />
+                </View>
+                <If when={cli() !== "auto" && !(eff()?.enabled_clis ?? DEFAULT_PROVIDERS).includes(cli())}><Text testID="routine-cli-disabled" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>{`${providerLabel(cli())} is disabled for execution. Choose another tool or enable it in Settings → AI tools & onboarding.`}</Text></If>
+                <Dropdown testID="routine-host" label="Machine" value={host() === "any" ? "Any matching machine" : host()} selected={host()} onPick={(v) => host.set(v)}
+                  options={[{ id: "any", label: "Any matching machine" }, ...props.settings.machines().map((h) => ({ id: h.host, label: h.host, detail: h.online === false ? "Offline" : h.enabled === false ? "Paused for new tasks" : "Online" }))]} />
+                <Text style={{ fontSize: 13, color: colors.faint }}>A selected project's machine takes precedence.</Text>
+                <Field testID="routine-requires" label="Required capabilities" value={requires()} onChange={(v) => requires.set(v)} hint="Leave empty for any OS. Use os:macos, os:linux or os:windows only when the work needs that OS; separate additional capabilities with commas. Applies to future runs." />
                 <TextArea label="What should it do?" testID="routine-prompt" height={140} value={prompt()} onChange={(v) => { prompt.set(v); clear(); }} placeholder="e.g. Check for outdated dependencies and report what's worth updating." />
               </>
+            </If>
+            <Btn testID="routine-advanced" label={advanced() ? "Hide advanced run settings" : "Advanced run settings"} kind="ghost" onPress={() => advanced.set(!advanced())} />
+            <If when={advanced()}>
+              <Dropdown testID="routine-scheduler" label="Schedule from" value={scheduler() === "primary" ? "Main machine" : scheduler() === "each" ? "Every machine" : scheduler()} selected={scheduler()} onPick={(v) => scheduler.set(v)}
+                options={[{ id: "primary", label: "Main machine", testID: "routine-scheduler-primary" }, { id: "each", label: "Every machine", detail: "Each machine creates its own local run", testID: "routine-scheduler-each" }, ...props.settings.machines().map((h) => ({ id: h.host, label: h.host, detail: h.online === false ? "Offline" : "Online", testID: `routine-scheduler-${h.host}` }))]} />
+              <Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>The scheduling machine creates the task at the chosen time. Every machine creates a separate local task unless a project or run machine overrides its location.</Text>
+              <If when={!learn()}>
+                <Field testID="routine-prefer" label="Preferred capabilities" value={prefer()} onChange={(v) => prefer.set(v)} hint="A soft preference, e.g. os:macos or gpu. Other machines can still run the task." />
+                <Dropdown testID="routine-weight" label="Resource use" value={weight()} selected={weight()} onPick={(v) => weight.set(v)} options={[{ id: "normal", label: "Normal", testID: "routine-weight-normal" }, { id: "heavy", label: "Heavy", detail: "Waits for spare resources", testID: "routine-weight-heavy" }]} />
+                <Field testID="routine-repo" label="Working folder (without a project)" value={repo()} onChange={(v) => repo.set(v)} hint="Must exist on the run machine. A selected project supplies its saved folder instead." />
+                <TextArea testID="routine-signal" label="Change detector command (optional)" height={80} value={detector()} onChange={(v) => detector.set(v)} hint="Runs in Noop's data folder on the scheduling machine. An agent runs only when the command's output changes or the command fails. Leave empty to run every scheduled time." />
+              </If>
             </If>
             <Field label="Description (optional)" value={desc()} onChange={(v) => { desc.set(v); clear(); }} placeholder="Shown in the routines list" testID="routine-desc" />
             <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
@@ -3073,7 +4946,7 @@ function ProjectRows(props: { settings: Settings }) {
           <SetRow
             first={i() === 0}
             label={p().name}
-            detail={p().exists ? [p().repo, p().path].filter(Boolean).join(" · ") : `Folder not found: ${p().path}`}
+            detail={p().exists === false ? `Folder not found: ${p().path}` : [p().exists === null ? p().host : "", p().repo, p().path, p().exists === null ? p().checked ? `Last checked ${ago(p().checked!)}` : "Folder not yet verified" : ""].filter(Boolean).join(" · ")}
             chevron
             onPress={() => props.settings.openProject(p())}
             testID={`project-${p().id}`}
@@ -3088,19 +4961,19 @@ function ProjectRows(props: { settings: Settings }) {
 
 /** Connect / edit / remove one project, in a dialog: its name, its folder and how to work in it. */
 function ProjectEditor(props: { settings: Settings }) {
-  const { name, path, instructions, editing, note, busy } = props.settings.projectDraft;
+  const { name, path, host, repo, requires, original, instructions, editing, note, busy, checking } = props.settings.projectDraft;
   const isNew = () => editing() === "";
   const close = () => editing.set(undefined);
-  const ok = () => !!name().trim() && !!path().trim() && !busy();
-  const submit = () => {
-    const body = { name: name(), path: path(), instructions: instructions() };
-    void (isNew() ? props.settings.writeProject("POST", "/api/projects", body) : props.settings.writeProject("PUT", `/api/projects/${editing()}`, body));
-  };
+  const advanced = () => !!props.settings.view()?.effective.primary_host;
+  const ok = () => !!name().trim() && !!path().trim() && !busy() && !checking();
+  const submit = () => void props.settings.saveProject();
+  const machines = () => [...new Set([props.settings.view()?.effective.primary_host ?? "", ...props.settings.machines().map((m) => m.host), props.settings.projectHost()].filter(Boolean))];
+  const detected = () => props.settings.projectProbe() ?? (!props.settings.projectPlacementChanged() ? { requires: original()?.detected_requires ?? [], repo: original()?.detected_repo ?? "", checked: original()?.checked } : null);
   const remove = async () => {
     const id = editing()!;
     const r = await AlertDialog.show({
       title: `Remove ${name() || id}?`,
-      description: "The team stops working on it. Its folder isn't touched; your instructions move to archive/projects/ in your data folder.",
+      description: "The team stops working on it. Its folder isn't touched; the project record and instructions stay in Archive.",
       actions: [
         { id: "cancel", label: "Cancel", role: "cancel" },
         { id: "remove", label: "Remove", role: "destructive" },
@@ -3125,7 +4998,24 @@ function ProjectEditor(props: { settings: Settings }) {
         <Scroll style={{ flexShrink: 1 }}>
           <View style={{ gap: 16, padding: 20 }}>
             <Field label="Name" value={name()} onChange={(v) => { name.set(v); note.set(""); }} placeholder="e.g. Website" testID="project-name" autoFocus={isNew()} />
-            <Field label="Folder" value={path()} onChange={(v) => { path.set(v); note.set(""); }} placeholder="e.g. ~/code/website" testID="project-path" hint="A folder on the machine running Noop. It doesn't have to use git; if it's on GitHub, Noop finds the repo." />
+            <If when={advanced()}>
+              <Dropdown testID="project-host" label="Machine" value={props.settings.projectHost()} selected={props.settings.projectHost()} onPick={(v) => { host.set(v); note.set(""); }}
+                options={machines().map((id) => ({ id, label: id, detail: id === props.settings.view()?.effective.primary_host ? "Main machine" : props.settings.machines().find((m) => m.host === id)?.online === false ? "Offline" : "Worker", testID: `project-host-${id}` }))} />
+            </If>
+            <Field label="Folder" value={path()} onChange={(v) => { path.set(v); note.set(""); }} placeholder="e.g. ~/code/website" testID="project-path" hint={advanced() ? "A folder on the selected machine. That machine expands ~ and detects its GitHub repo and build tools." : "A folder on the machine running Noop. It doesn't have to use git; if it's on GitHub, Noop finds the repo."} />
+            <If when={advanced()} else={<Text style={{ fontSize: 13, lineHeight: 18, color: colors.faint }}>Update the main machine for project machine selection and requirements.</Text>}>
+              <View style={{ gap: 8 }}>
+                <Btn testID="project-check" label={`Check folder on ${props.settings.projectHost()}`} kind="secondary" disabled={!path().trim() || busy() || checking()} busy={checking()} onPress={() => void props.settings.checkProjectFolder()} />
+                <If when={detected()}>
+                  <Text testID="project-detected" style={{ fontSize: 13, lineHeight: 19, color: colors.muted }}>{[`Detected repo: ${detected()!.repo || "None"}`, `Detected requirements: ${detected()!.requires.length ? detected()!.requires.join(", ") : "None"}`, detected()!.checked ? `Checked ${ago(detected()!.checked!)}` : ""].filter(Boolean).join("\n")}</Text>
+                </If>
+                <If when={props.settings.machines().some((m) => m.host === props.settings.projectHost() && m.online === false)}>
+                  <Text testID="project-offline" style={{ fontSize: 13, lineHeight: 19, color: colors.warn }}>Connect this machine to check a new or moved folder. You can still edit a saved project's settings.</Text>
+                </If>
+              </View>
+              <Field label="GitHub repo override (optional)" testID="project-repo" value={repo()} onChange={(v) => { repo.set(v); note.set(""); }} placeholder="owner/repository" hint="Leave empty to use the repo detected in the folder." />
+              <Field label="Additional requirements" testID="project-requires" value={requires()} onChange={(v) => { requires.set(v); note.set(""); }} placeholder="e.g. docker,gpu" hint="Detected build-tool requirements are always included. These add your own requirements for new tasks; existing tasks keep their run settings." />
+            </If>
             <TextArea
               label="Instructions (optional)"
               testID="project-instructions"
@@ -3141,15 +5031,81 @@ function ProjectEditor(props: { settings: Settings }) {
         </Scroll>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 20, paddingVertical: 16, borderTopWidth: 0.5, borderTopColor: surfaceEdge() }}>
           <If when={!isNew()}>
-            <Btn label="Remove" kind="danger" icon="trash" onPress={() => void remove()} testID="project-delete" />
+            <Btn label="Remove" kind="danger" icon="trash" disabled={busy() || checking()} onPress={() => void remove()} testID="project-delete" />
           </If>
           <View style={{ flex: 1 }} />
           <Btn label="Cancel" kind="ghost" onPress={close} testID="project-cancel" />
-          <Btn label={isNew() ? "Connect" : "Save"} kind="primary" disabled={!ok()} busy={busy()} onPress={submit} testID="project-save" />
+          <Btn label={isNew() ? "Connect" : "Save"} kind="primary" disabled={!ok()} busy={busy() || checking()} onPress={submit} testID="project-save" />
         </View>
       </View>
     </Dialog>
   );
+}
+
+type BuiltinRole = { id: string; about: string; installed: boolean; profile: string; routines: { name: string; every: string; enabled: false }[] };
+
+/** Built-in profiles can be previewed and added without replacing a member's own instructions. */
+function RoleLibrary(props: { hub: Hub; disabled?: boolean; onAdded?: (view: SettingsView) => void }) {
+  const open = signal(false), busy = signal(false), note = signal("");
+  const roles = signal<Pick<BuiltinRole, "id" | "about" | "installed">[]>([]), selected = signal("");
+  const preview = signal<BuiltinRole | null>(null), retry = signal(false);
+  const close = () => { if (!busy()) open.set(false); };
+  async function choose(id: string) {
+    selected.set(id); preview.set(null); note.set(""); retry.set(false); busy.set(true);
+    const r = await props.hub.api("GET", `/api/roles/${encodeURIComponent(id)}`);
+    if (r.ok && typeof r.data.profile === "string") preview.set(r.data as BuiltinRole);
+    else note.set(String(r.data.error ?? "Couldn't load this specialist"));
+    busy.set(false);
+  }
+  async function browse() {
+    open.set(true); busy.set(true); note.set(""); preview.set(null); retry.set(false);
+    const r = await props.hub.api("GET", "/api/roles");
+    if (r.ok && Array.isArray(r.data.roles)) {
+      const list = r.data.roles as Pick<BuiltinRole, "id" | "about" | "installed">[]; roles.set(list);
+      busy.set(false);
+      const first = list.find((role) => role.id === "apprentice" && !role.installed) ?? list.find((role) => !role.installed) ?? list[0];
+      if (first) return choose(first.id);
+      note.set("No built-in specialists are available on the main machine.");
+    } else note.set(r.status === 404 ? "Update the hub and main machine to add built-in specialists." : String(r.data.error ?? "Couldn't load built-in specialists"));
+    busy.set(false);
+  }
+  async function add() {
+    if (!preview() || busy()) return;
+    busy.set(true); note.set("");
+    const r = await props.hub.api("POST", `/api/roles/${encodeURIComponent(selected())}`, {});
+    if ((r.ok || r.data.saved_locally) && r.data.view) props.onAdded?.(r.data.view as SettingsView);
+    if (r.ok) open.set(false);
+    else { retry.set(r.data.saved_locally === true); note.set(String(r.data.error ?? "Couldn't add this specialist")); }
+    busy.set(false);
+  }
+  return <>
+    <Btn testID="role-library-open" label="Add built-in specialist" kind="ghost" disabled={props.disabled} onPress={() => void browse()} />
+    <Dialog testID="role-library" open={open()} animation="fade" onOpenChange={({ open }) => !open && close()} backdropClass="bg-scrim"
+      style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 16, pointerEvents: "box-none" }}>
+      <View style={{ width: "100%", maxWidth: 620, maxHeight: "100%", borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, overflow: "hidden" }}>
+        <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: 20, paddingRight: 10, height: 56, borderBottomWidth: 0.5, borderBottomColor: surfaceEdge() }}>
+          <Text style={{ flex: 1, fontSize: 17, fontWeight: "600", color: colors.text }}>Built-in specialists</Text>
+          <ToolButton icon="close" label="Close" onPress={close} />
+        </View>
+        <Scroll style={{ flexShrink: 1 }}><View style={{ gap: 14, padding: 20 }}>
+          <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>Preview the supplied instructions before adding a member. Existing instructions and routines are preserved. Newly added routines start off; enable and configure them in Routines.</Text>
+          <If when={roles().length > 0 && !busy()}><Dropdown testID="role-choice" label="Specialist" value={roles().find((role) => role.id === selected())?.about ?? selected()} selected={selected()}
+            options={roles().map((role) => ({ id: role.id, label: role.about, detail: role.installed ? "Already on the team" : undefined, testID: `role-choice-${role.id}` }))} onPick={(id) => void choose(id)} /></If>
+          <If when={preview()}>{(role) => <>
+            <If when={role().installed}><Text style={{ color: colors.muted, fontSize: 13 }}>Already on the team. This preview shows the built-in instructions. Restore and sync adds missing routines and retries synchronization; your current instructions and existing routines stay as they are.</Text></If>
+            <View testID="role-profile" selectable><Rich text={role().profile} /></View>
+            <If when={role().routines.length > 0}><Text testID="role-routines" style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{`Supplied routines (off when added): ${role().routines.map((routine) => `${routine.name} · ${everyLabel(routine.every)}`).join("; ")}`}</Text></If>
+          </>}</If>
+          <If when={busy()}><Text style={{ color: colors.muted }}>Loading…</Text></If>
+          <If when={note()}><Text testID="role-note" style={{ color: colors.danger, fontSize: 13, lineHeight: 18 }}>{note()}</Text></If>
+        </View></Scroll>
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 10, padding: 16, borderTopWidth: 0.5, borderTopColor: surfaceEdge() }}>
+          <Btn testID="role-library-close" label="Close" kind="ghost" disabled={busy()} onPress={close} />
+          <Btn testID="role-add" label={retry() ? "Retry sync" : preview()?.installed ? "Restore and sync" : "Add specialist"} kind="primary" busy={busy()} disabled={busy() || !preview()} onPress={() => void add()} />
+        </View>
+      </View>
+    </Dialog>
+  </>;
 }
 
 /** New / edit / delete one member, in a dialog: who they are and how they work. The instructions go into every prompt they run with. */
@@ -3166,7 +5122,7 @@ function MemberEditor(props: { settings: Settings; onGone?: () => void }) {
     const id = editing()!;
     const r = await AlertDialog.show({
       title: `Delete ${title() || id}?`,
-      description: "They leave the team and stop getting work. Their profile and memory move to archive/agents/ in your data folder, where you can restore them by hand.",
+      description: "They leave the team and stop getting work. Their profile and memory stay in Archive, where you can restore them later.",
       actions: [
         { id: "cancel", label: "Cancel", role: "cancel" },
         { id: "delete", label: "Delete", role: "destructive" },
@@ -3424,12 +5380,19 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
       <Section title="Notifications" hint="Decisions that need you are pushed to this device; you can pick an option right from the notification.">
         <SetRow first label="Notifications" value={notify.short()} chevron onPress={() => props.onOpen({ name: "notify" })} testID="settings-notify" />
       </Section>
-      <Section title="Memory" hint="The rules the team works by, your preferences, member profiles and decision precedents. Read-only.">
+      <Section title="Memory" hint="The rules the team works by, your preferences, member profiles and decision precedents. Edit rules, preferences and member memory here.">
         <SetRow first label="Rules and memory" chevron onPress={() => props.onOpen({ name: "rules" })} testID="settings-rules" />
+      </Section>
+      <Section title="Archive" hint="Preview and restore deleted routines, members, projects and plans.">
+        <SetRow first label="Archive" chevron onPress={() => props.onOpen({ name: "archive" })} testID="settings-archive" />
+        <SetRow label="Saved requests" value={props.hub.savedEntries().length ? String(props.hub.savedEntries().length) : undefined} chevron onPress={() => props.onOpen({ name: "saved" })} testID="settings-saved" />
       </Section>
       <If when={eff()} else={<Text style={{ paddingHorizontal: 32, fontSize: 14, color: colors.faint }}>{error() ? "Couldn't load settings" : "Loading…"}</Text>}>
         {(e) => (
           <View style={{ gap: 28 }}>
+            <Section title="Default task tool order" hint="Applies to new tasks on the machine claiming them. Explicit orders use the first usable tool; Automatic lets planning choose. Chat, judges and automatic repair keep their own tool choices.">
+              <View style={{ padding: 16 }}><TaskToolPolicy settings={props.settings} /></View>
+            </Section>
             <Section title="Members" hint="Open a member to edit their instructions, model and autonomy.">
               <Each of={e().agents} key={(a) => a.id}>
                 {(a, i) => (
@@ -3438,7 +5401,7 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
                     inset={58}
                     leading={<Avatar from={a().id} />}
                     label={a().title ?? a().id}
-                    detail={`${cliLabel(a().clis)} · ${autonomyLabel(a().autonomy)}`}
+                    detail={`${memberToolsLabel(a())} · ${autonomyLabel(a().autonomy)}`}
                     chevron
                     onPress={() => props.onOpen({ name: "member", id: a().id })}
                     testID={`member-${a().id}`}
@@ -3448,6 +5411,7 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
               <SetRow label="New member" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openMember()} testID="member-new" />
             </Section>
             <MemberEditor settings={props.settings} />
+              <RoleLibrary hub={props.hub} onAdded={props.settings.accept} disabled={props.settings.saving() > 0} />
             <Section title="Projects" hint="The folders the team works in. In chat, name a project and the work happens in its folder.">
               <ProjectRows settings={props.settings} />
             </Section>
@@ -3468,7 +5432,7 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
               <SetRow first={!e().routines.length} label="New routine" tone="accent" leading={<Icon name="plus" size={16} tint={colors.info} />} onPress={() => void props.settings.openRoutine()} testID="routine-new" />
             </Section>
             <RoutineEditor settings={props.settings} />
-            <Section title="Parallel" hint="Tasks each machine runs at once, 1 to 32.">
+            <Section title="Parallel" hint="Fleet default, 1 to 32. A machine’s own run settings take precedence.">
               <SetRow
                 first
                 label="At once"
@@ -3480,6 +5444,12 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
           </View>
         )}
       </If>
+      <Section title="AI tools and learning">
+        <SetRow first label="AI tools & onboarding" chevron onPress={() => props.onOpen({ name: "configuration", section: "onboarding" })} testID="settings-onboarding" />
+      </Section>
+      <Section title="Team defaults" hint="Owner attribution, approvals, models, tool blocks, scheduling and resources.">
+        <SetRow first label="Team configuration" chevron onPress={() => props.onOpen({ name: "configuration" })} testID="settings-configuration" />
+      </Section>
       <Section title="Commands" hint="Type / in the composer to use one. Built-in commands perform an action; the ones you add send a message to the team.">
         <CommandRows settings={props.settings} />
       </Section>
@@ -3557,6 +5527,7 @@ function PhoneNotify(props: { push: Push; settings: Settings }) {
             selected={quietKey(notify.prefs().quiet_hours)}
             onPick={(id) => notify.setPrefs({ quiet_hours: QUIET_PRESETS.find((q) => quietKey(q.value) === id)!.value })}
           />
+          <View style={{ padding: 16 }}><NotificationTimeZone prefs={notify.prefs} save={notify.setPrefs} /></View>
         </Section>
       </If>
     </Grouped>
@@ -3576,21 +5547,11 @@ function PhoneMember(props: { id: string; settings: Settings; onGone: () => void
               <SetRow first label="Role and instructions" chevron onPress={() => void props.settings.openMember(props.id)} testID={`member-edit-${props.id}`} />
             </Section>
             <MemberEditor settings={props.settings} onGone={props.onGone} />
-            <Section title="Model" hint="Which to use first; the next one takes over on failure or when quota runs out.">
-              <Choices
-                label="Model"
-                choices={view()!.options.clis.map((c) => ({ id: cliKey(c), label: cliLabel(c), testID: `cli-${props.id}-${cliKey(c)}` }))}
-                selected={cliKey(a().clis)}
-                onPick={(id) => save(patches.clis(props.id, view()!.options.clis.find((c) => cliKey(c) === id)!))}
-              />
+            <Section title="Task tools">
+              <TaskToolPolicy settings={props.settings} agent={props.id} phone />
             </Section>
             <Section title="Autonomy" hint="How much needs your approval first.">
-              <Choices
-                label="Autonomy"
-                choices={view()!.options.autonomy.map((l) => ({ id: l, label: autonomyLabel(l), testID: `autonomy-${props.id}-${l}` }))}
-                selected={a().autonomy}
-                onPick={(l) => save(patches.autonomy(props.id, l))}
-              />
+              <MemberAutonomyPolicy settings={props.settings} agent={props.id} phone />
             </Section>
           </>
         )}
@@ -3634,12 +5595,18 @@ function PhoneRoutine(props: { name: string; settings: Settings; onGone: () => v
   );
 }
 
-// ---------------------------------------------------------------- the team's rules and memory (read-only)
+// ---------------------------------------------------------------- the team's rules and memory
 
 /** Memory: policies, the owner's memory, each agent's profile and memory, closed decisions. */
 function RulesList(props: { hub: Hub; onOpen: (path: string) => void }) {
   const groups = signal<RuleGroup[] | null>(null);
   const error = signal("");
+  const adding = signal(false), folder = signal("policies"), name = signal("");
+  const create = () => {
+    const path = `${folder()}/${name().trim()}.md`;
+    if (!/^[a-zA-Z0-9][\w-]{0,79}$/.test(name().trim()) || !editableDocument(path)) { error.set("Use letters, numbers and hyphens for the document name."); return; }
+    props.onOpen(path);
+  };
   void (async () => {
     const lists: Record<string, DataFile[]> = {};
     for (const pre of RULE_PREFIXES) {
@@ -3651,7 +5618,17 @@ function RulesList(props: { hub: Hub; onOpen: (path: string) => void }) {
   })();
   return (
     <Grouped testID="rules">
-      <Text style={{ paddingHorizontal: 32, fontSize: 13, lineHeight: 18, color: colors.muted }}>The rules and memory the team works by. Read-only here; the team maintains them as it works.</Text>
+      <Text style={{ paddingHorizontal: 32, fontSize: 13, lineHeight: 18, color: colors.muted }}>The rules and memory the team works by. You can edit rules, preferences and member memory. Member profiles are managed in Members; closed decisions are historical records.</Text>
+      <View style={{ paddingHorizontal: 32, gap: 12 }}>
+        <Btn testID="document-add" label="Add rule or preference" kind="ghost" onPress={() => adding.set(!adding())} />
+        <If when={adding()}>
+          <Dropdown testID="document-folder" label="Document type" value={folder() === "policies" ? "Team rule" : "My preference"} selected={folder()} onPick={(v) => folder.set(v)}
+            options={[{ id: "policies", label: "Team rule", testID: "document-folder-policies" }, { id: "memory", label: "My preference", testID: "document-folder-memory" }]} />
+          <Field testID="document-name" label="Name" value={name()} onChange={(v) => { name.set(v); error.set(""); }} hint="Letters, numbers and hyphens, for example review-checklist." />
+          <Btn testID="document-create" label="Open editor" kind="primary" onPress={create} />
+        </If>
+        <If when={error()}><Text style={{ color: colors.danger }}>{error()}</Text></If>
+      </View>
       <If when={groups()} else={<Text style={{ paddingHorizontal: 32, fontSize: 14, color: error() ? colors.danger : colors.faint }}>{error() || "Loading…"}</Text>}>
         {(gs) => (
           <Each of={gs()} key={(g) => g.key}>
@@ -3673,23 +5650,56 @@ function RulesList(props: { hub: Hub; onOpen: (path: string) => void }) {
   );
 }
 
-/** One rules or memory file, rendered as markdown. Read-only. */
+/** Knowledge is edited against the primary's latest full content; its metadata stays untouched. */
 function RuleDoc(props: { hub: Hub; path: string; wide: boolean }) {
-  const text = signal<string | null>(null);
-  const error = signal("");
+  const text = signal<string | null>(null), original = signal<string | null>(null), draft = signal("");
+  const error = signal(""), note = signal(""), editing = signal(false), busy = signal(false);
+  const editable = editableDocument(props.path);
+  async function edit() {
+    busy.set(true); error.set(""); note.set("");
+    const r = await props.hub.api("POST", "/api/documents", { path: props.path });
+    if (r.ok && (r.data.content === null || typeof r.data.content === "string")) {
+      original.set(r.data.content as string | null); text.set(documentBody(String(r.data.content ?? ""))); draft.set(documentBody(String(r.data.content ?? ""))); editing.set(true);
+    } else error.set(String(r.data.error ?? "Update the hub and main machine to edit knowledge documents."));
+    busy.set(false);
+  }
+  async function save() {
+    const submitted = draft();
+    busy.set(true); error.set(""); note.set("");
+    const r = await props.hub.api("PUT", "/api/documents", { path: props.path, base: original(), content: submitted });
+    if (r.ok && typeof r.data.content === "string") {
+      original.set(r.data.content); text.set(documentBody(r.data.content));
+      if (draft() === submitted) { editing.set(false); note.set("Saved. The team will use this document on its next sync."); }
+      else note.set("Submitted version saved. You have additional unsaved edits.");
+    } else error.set(String(r.data.error ?? "Couldn't save this document. Your draft is kept."));
+    busy.set(false);
+  }
   void props.hub.api("GET", `/api/files/read?path=${encodeURIComponent(props.path)}`).then((r) => {
-    if (r.ok && typeof r.data.content === "string") text.set(stripFrontMatter(r.data.content));
+    if (r.ok && typeof r.data.content === "string") text.set(documentBody(r.data.content));
+    else if (r.status === 404 && editable) void edit();
     else error.set(r.status === 404 ? "This file no longer exists." : r.status ? `Couldn't load (${r.status})` : "can't reach the server");
   });
   return (
     <Scroll testID="rule-doc" style={{ flex: 1, backgroundColor: colors.background }}>
       <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 12, paddingHorizontal: props.wide ? 32 : 16, paddingTop: 20, paddingBottom: Math.max(32, safeArea().bottom + 16) }}>
         <Text style={{ fontFamily: MONO, fontSize: 12.5, color: colors.faint }}>{props.path}</Text>
-        <If when={text() !== null} else={<Text style={{ fontSize: 14, color: error() ? colors.danger : colors.faint }}>{error() || "Loading…"}</Text>}>
-          <If when={(text() ?? "").trim()} else={<Text style={{ fontSize: 14, color: colors.faint }}>(empty file)</Text>}>
-            <View selectable><Rich text={text() ?? ""} /></View>
+        <If when={editing()} else={<>
+          <If when={editable}><Btn testID="document-edit" label="Edit document" kind="ghost" disabled={busy()} onPress={() => void edit()} /></If>
+          <If when={text() !== null} else={<Text style={{ fontSize: 14, color: colors.faint }}>{busy() ? "Loading…" : ""}</Text>}>
+            <If when={(text() ?? "").trim()} else={<Text style={{ fontSize: 14, color: colors.faint }}>(empty file)</Text>}>
+              <View selectable><Rich text={text() ?? ""} /></View>
+            </If>
           </If>
+        </>}>
+          <TextArea testID="document-content" label="Markdown" value={draft()} onChange={(v) => draft.set(v)} height={360} hint="Edit the document text. Existing metadata is preserved. Maximum 64 KB." />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
+            <Btn testID="document-save" label="Save document" kind="primary" busy={busy()} disabled={busy()} onPress={() => void save()} />
+            <Btn testID="document-reload" label="Discard draft and load latest" kind="ghost" disabled={busy()} onPress={() => void edit()} />
+            <Btn testID="document-cancel" label="Cancel editing" kind="ghost" disabled={busy()} onPress={() => { editing.set(false); error.set(""); }} />
+          </View>
         </If>
+        <If when={error()}><Text testID="document-error" style={{ color: colors.danger }}>{error()}</Text></If>
+        <If when={note()}><Text testID="document-note" style={{ color: colors.up }}>{note()}</Text></If>
       </View>
     </Scroll>
   );
@@ -3825,11 +5835,14 @@ function HelpSheet(props: { open: boolean; onClose: () => void }) {
 type Route =
   | { name: "channel" }
   | { name: "team" }
+  | { name: "archive" }
+  | { name: "saved" }
   | { name: "task"; id: string }
   | { name: "plans" }
   | { name: "plan"; id: string }
   | { name: "host"; host: string }
   | { name: "notify" }
+  | { name: "configuration"; section?: keyof typeof CONFIGURATION_GROUPS }
   | { name: "member"; id: string }
   | { name: "routine"; routine: string }
   | { name: "rules" }
@@ -3976,7 +5989,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const holds = new Map<string, ReturnType<typeof setTimeout>>();
   function send(text: string, ref: string | null, id = `local:${++seq}`, files: Attachment[] = []) {
     const ts = new Date().toISOString();
-    outbox.update((o) => [...o.filter((x) => x.id !== id), { id, ts, text, ref, files, state: "held" }]);
+    const messageKey = newRequestKey();
+    outbox.update((o) => [...o.filter((x) => x.id !== id), { id, messageKey, ts, text, ref, files, state: "held" }]);
     jumpToEnd();
     holds.set(id, setTimeout(() => { holds.delete(id); void deliver(id); }, UNDO_MS));
   }
@@ -3994,7 +6008,33 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // An update restarts the app: what looks sent leaves first, and what is being typed comes back.
   async function restartToUpdate() {
     await Promise.allSettled(deliverHeld());
-    if (draft()) await Storage.setItem(KEYS.draft, draft());
+    while (outbox().length || attachments().length || replyTo()) {
+      drawer.set(false);
+      nav.popToRoot();
+      jumpToEnd();
+      const failed = new Set(outbox().filter((message) => message.state === "failed").map((message) => message.id));
+      const canDismiss = failed.size === outbox().length && failed.size > 0 && !attachments().length && !replyTo();
+      const result = await AlertDialog.show({
+        title: "Review messages before updating",
+        description: canDismiss
+          ? "Some messages failed or their delivery is unconfirmed. Retry or inspect them in chat. Dismissing removes only the local retry messages; any tasks or plans already saved still exist."
+          : "Messages are still awaiting confirmation, or your draft contains images or a reply. Finish sending, retry failed messages, or remove the images and cancel the reply before updating. Your messages and draft have been kept.",
+        actions: [{ id: "review", label: "Back to chat", role: "cancel" },
+          ...(canDismiss ? [{ id: "dismiss", label: "Dismiss failed messages and update", role: "destructive" as const }] : [])],
+      });
+      if (result.action !== "dismiss") return;
+      if (outbox().some((message) => message.state !== "failed") || attachments().length || replyTo()) continue;
+      outbox.update((messages) => messages.filter((message) => message.state !== "failed" || !failed.has(message.id)));
+    }
+    const savedDraft = draft();
+    if (savedDraft) await Storage.setItem(KEYS.draft, savedDraft);
+    if (outbox().length || attachments().length || replyTo() || draft() !== savedDraft) {
+      drawer.set(false);
+      nav.popToRoot();
+      jumpToEnd();
+      await AlertDialog.show({ title: "Messages changed before updating", description: "Your messages and draft have been kept. Review them in chat, then try updating again.", actions: [{ id: "review", label: "Back to chat", role: "cancel" }] });
+      return;
+    }
     await updates.install();
     await Storage.removeItem(KEYS.draft); // the install failed: this run still holds the draft
   }
@@ -4009,10 +6049,11 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     clearTimeout(holds.get(o.id));
     holds.delete(o.id);
     outbox.update((list) => list.filter((x) => x.id !== o.id));
-    if (!/^[DLP]-[A-Z]?\d{4} \S+$/.test(o.text) || o.ref || o.files.length) {
-      draft.set(o.text);
-      replyNote.set(null);
-      replyTo.set(o.ref);
+    if (!/^(?:[DP]-[A-Z]?\d{4}|L-\d{4,}) \S+$/.test(o.text) || o.ref || o.files.length) {
+      const current = untracked(draft), hasDraft = !!current.trim() || untracked(attachments).length > 0;
+      const restored = hasDraft && o.ref && o.ref !== untracked(replyTo) ? `${o.ref}\n${o.text}` : o.text;
+      draft.set([restored, current].filter(Boolean).join("\n\n"));
+      if (!hasDraft) { replyNote.set(null); replyTo.set(o.ref); }
       attachments.update((a) => [...o.files, ...a]);
       composer?.focus();
     }
@@ -4020,14 +6061,15 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   }
   async function deliver(id: string) {
     const o = outbox().find((x) => x.id === id);
-    if (!o) return;
+    if (!o || o.state === "sending") return;
     const { text, ref, files } = o;
     outbox.update((l) => l.map((x) => (x.id === id ? { ...x, state: "sending" } : x)));
     try {
-      await hub.send(text, ref, files);
+      await hub.send(text, ref, files, false, o.messageKey);
       outbox.update((o) => o.filter((x) => x.id !== id));
-    } catch {
-      outbox.update((o) => o.map((x) => (x.id === id ? { ...x, state: "failed" } : x)));
+    } catch (error) {
+      const failure = error as Error & { saved_locally?: boolean; id?: string };
+      outbox.update((o) => o.map((x) => (x.id === id ? { ...x, state: "failed", error: failure.message ?? "Couldn't send the message", saved_locally: failure.saved_locally, savedId: failure.id } : x)));
     }
   }
   // Commands: a draft of "/<query>" lists the built-in and saved commands; Return runs the first one.
@@ -4092,7 +6134,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
         const bytes = await fs.readFile(path);
         attach(new Blob([bytes as Uint8Array<ArrayBuffer>]), name);
       } catch {
-        attachNote.set(`Can't read ${name}`);
+        attachNote.set(`Can't read ${name}. Try Attach or paste the image.${platform.os === "macos" ? " Check Noop’s Files and Folders access in System Settings if this keeps happening." : " Check that Noop can access this folder."}`);
       }
     }
   }
@@ -4502,7 +6544,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                     }
                     if (row.event.kind === "owner") {
                       const out = () => outbox().find((o) => o.id === row.event.id);
-                      return <OwnerBubble hub={hub} event={row.event} out={out()} onRetry={() => void deliver(row.event.id)} onRecall={() => undo(row.event.id)} onRef={pick} />;
+                      return <OwnerBubble hub={hub} event={row.event} out={out()} onRetry={() => void deliver(row.event.id)} onRecall={() => undo(row.event.id)} onRef={pick} onInspect={(id) => id.startsWith("PL-") ? show({ name: "plans" }, { name: "plan", id }) : openTask(id)} />;
                     }
                     return (
                       <Message
@@ -4748,12 +6790,15 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     switch (r.name) {
       case "channel": return "Main chat";
       case "team": return wide() ? "Team settings" : "Settings";
+      case "archive": return "Archive";
+      case "saved": return "Saved requests";
       case "task": return `Task ${r.id}`;
       case "tasks": return "All tasks";
       case "plans": return "Plans";
       case "plan": return `Plan ${r.id}`;
       case "host": return `Machine ${r.host}`;
       case "notify": return "Notifications";
+      case "configuration": return r.section === "onboarding" ? "AI tools & onboarding" : "Team configuration";
       case "member": return settings.view()?.effective.agents.find((a) => a.id === r.id)?.title ?? r.id;
       case "routine": return r.routine;
       case "rules": return "Memory";
@@ -4825,8 +6870,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const content = (r: Route) => {
     switch (r.name) {
       case "channel": return channelPage();
-      case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} />;
-      case "tasks": return <TaskHistory hub={hub} wide={wide()} onTask={openTask} />;
+      case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} isCurrent={() => top() === r} />;
+      case "tasks": return <TaskHistory hub={hub} wide={wide()} isCurrent={() => top() === r} onTask={openTask} />;
       case "plans": return <PlansPage hub={hub} settings={settings} wide={wide()} onPlan={(id) => nav.push({ name: "plan", id })} />;
       case "plan": return <PlanPage hub={hub} settings={settings} id={r.id} wide={wide()} onTask={openTask} onGone={() => nav.pop()} />;
       case "host": return <MachineDetail hub={hub} host={r.host} wide={wide()} onTask={openTask} />;
@@ -4836,9 +6881,12 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
             when={wide()}
             else={<PhoneSettings hub={hub} push={push} settings={settings} onOpen={(x) => nav.push(x)} onDisconnect={props.onDisconnect} />}
           >
-            <TeamSettings hub={hub} push={push} settings={settings} wide={wide()} onRules={() => openRules(true)} onConnection={props.onConnection} onDisconnect={props.onDisconnect} />
+            <TeamSettings hub={hub} push={push} settings={settings} wide={wide()} isCurrent={() => top() === r} onTask={openTask} onArchiveOpen={(kind, id) => { if (kind === "members") nav.push({ name: "member", id }); else if (kind === "routines") nav.push({ name: "routine", routine: id }); else if (kind === "plans") nav.push({ name: "plan", id }); }} onRules={() => openRules(true)} onConnection={props.onConnection} onDisconnect={props.onDisconnect} />
           </If>
         );
+      case "configuration": return <Grouped><View style={{ paddingHorizontal: 20 }}><ConfigurationSettings hub={hub} initialGroup={r.section} onTask={openTask} /></View></Grouped>;
+      case "archive": return <Grouped><View style={{ paddingHorizontal: 20 }}><ArchiveBrowser hub={hub} settings={settings} isCurrent={() => top() === r} onOpen={(kind, id) => { if (kind === "members") nav.push({ name: "member", id }); else if (kind === "routines") nav.push({ name: "routine", routine: id }); else if (kind === "plans") nav.push({ name: "plan", id }); }} /></View></Grouped>;
+      case "saved": return <Grouped><View style={{ paddingHorizontal: 20 }}><SavedRequests hub={hub} settings={settings} isCurrent={() => top() === r} onTask={openTask} onOwner={(owner) => owner.kind === "plan" ? nav.push({ name: "plan", id: owner.id }) : openTask(owner.id)} onArchive={(kind, id) => { if (kind === "members") nav.push({ name: "member", id }); else if (kind === "routines") nav.push({ name: "routine", routine: id }); else if (kind === "plans") nav.push({ name: "plan", id }); }} /></View></Grouped>;
       case "notify": return <PhoneNotify push={push} settings={settings} />;
       case "member": return <PhoneMember id={r.id} settings={settings} onGone={() => nav.pop()} />;
       case "routine": return <PhoneRoutine name={r.routine} settings={settings} onGone={() => nav.pop()} />;
@@ -4893,7 +6941,14 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
             }
             style={{ backgroundColor: colors.background }}
           >
-            {content(route)}
+            <View style={{ flex: 1 }}>
+              <If when={(hub.savedEntries().length || hub.savedError()) && route.name !== "saved" && !(route.name === "team" && settings.tab() === "saved")}>
+                <View testID="saved-requests-banner" role="button" accessibilityLabel="Review saved requests" onPress={() => nav.push({ name: "saved" })} style={{ paddingHorizontal: 16, paddingVertical: 10, backgroundColor: tints.warn }}>
+                  <Text style={{ color: colors.text, fontSize: 13, lineHeight: 18 }}>{hub.savedError() ? "Saved requests need attention. Review recovery options." : `${hub.savedEntries().length} saved request${hub.savedEntries().length === 1 ? " needs" : "s need"} confirmation. Review saved requests.`}</Text>
+                </View>
+              </If>
+              {content(route)}
+            </View>
           </NavPage>
         )}
       </NavStack>
@@ -5195,7 +7250,7 @@ function Connected(props: { config: Config; openRef: string | null; onExpired: (
     if (hub.conn() === "unauthorized") props.onExpired();
   });
   return (
-    <Chat
+    <If when={hub.savedReady()} else={<View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 12 }}><Spinner size={20} tint={colors.muted} /><Text style={{ color: colors.muted }}>Loading saved requests…</Text></View>}><Chat
       hub={hub}
       openRef={props.openRef}
       onConnection={props.onExpired}
@@ -5208,7 +7263,7 @@ function Connected(props: { config: Config; openRef: string | null; onExpired: (
         await hub.logout();
         props.onLogout();
       }}
-    />
+    /></If>
   );
 }
 

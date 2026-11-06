@@ -5,13 +5,15 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { sep } from "node:path";
 import { P, list, newTask, nextId, now, readDoc } from "./core";
 import { RequestError } from "./members";
+import { assertStopRecordSize, captureTaskStops, hasPendingStops, pendingStopsError, pendingStopsView, type PendingStops } from "./stop-intents";
+import { archiveDestination } from "./archive-path";
 
 export type StepStatus = "pending" | "running" | "done" | "stopped" | "skipped";
 export type Step = { id: string; title: string; details: string; agent: string; checkpoint: boolean; status: StepStatus; attempt: number; task?: string; result?: string };
 export type PlanStatus = "drafting" | "review" | "running" | "paused" | "done" | "cancelled";
 export type Plan = {
   id: string; goal: string; project?: string; agent: string; status: PlanStatus; branch: string; created: string;
-  notes: string[]; steps: Step[]; next_step: number; draft_task?: string; reason?: string;
+  notes: string[]; steps: Step[]; next_step: number; draft_task?: string; reason?: string; pending_stops?: PendingStops;
 };
 
 const MAX_STEPS = 20;
@@ -19,8 +21,10 @@ const TASK_DIRS = ["inbox", "active", "waiting", "blocked", "proposed", "done", 
 const file = (id: string) => P("plans", `${id}.json`);
 
 export function savePlan(p: Plan) { // via rename: a crash can't leave half a file
+  const text = JSON.stringify(p, null, 2) + "\n";
+  if (p.pending_stops) assertStopRecordSize(text);
   mkdirSync(P("plans"), { recursive: true });
-  writeFileSync(`${file(p.id)}.tmp`, JSON.stringify(p, null, 2) + "\n");
+  writeFileSync(`${file(p.id)}.tmp`, text);
   renameSync(`${file(p.id)}.tmp`, file(p.id));
 }
 export function readPlan(id: string): Plan {
@@ -37,6 +41,8 @@ export const openPlans = () => listPlans().filter((p) => p.status !== "done" && 
 export const summary = (p: Plan) => ({
   id: p.id, goal: p.goal, status: p.status, project: p.project, reason: p.reason,
   done: p.steps.filter((s) => s.status === "done" || s.status === "skipped").length, total: p.steps.length,
+  ...(pendingStopsView(p.pending_stops) ? { stops: pendingStopsView(p.pending_stops) } : {}),
+  ...(pendingStopsError(p.pending_stops) ? { stops_error: pendingStopsError(p.pending_stops) } : {}),
 });
 
 const agentOr = (agent: unknown, fallback: string) => {
@@ -160,11 +166,14 @@ export function editSteps(id: string, input: unknown): Plan {
 /** More to do, at any time: the planner proposes the remaining steps and the owner approves them again. A running step carries on meanwhile. */
 export function continuePlan(id: string, input: unknown): Plan {
   const p = readPlan(id);
-  refuse(p, "review", "running", "paused", "done");
+  if (hasPendingStops(p.pending_stops)) throw new RequestError(409, "Finish this plan's pending task cleanup before continuing it");
+  refuse(p, "review", "running", "paused", "done", "cancelled");
+  validatePlanDependencies(p);
   const text = String((input as { instructions?: unknown } | null)?.instructions ?? "").trim();
   if (!text) throw new RequestError(400, "Say what should happen next");
   if (text.length > 4000) throw new RequestError(400, "Instructions can be up to 4,000 characters");
   p.notes.push(text);
+  p.pending_stops = undefined;
   startDraft(p);
   savePlan(p);
   return p;
@@ -172,8 +181,10 @@ export function continuePlan(id: string, input: unknown): Plan {
 /** Returns the tasks that should be cancelled with it. Finished work stays in the project. */
 export function cancelPlan(id: string): { plan: Plan; tasks: string[] } {
   const p = readPlan(id);
+  if (p.status === "cancelled" && p.pending_stops) return { plan: p, tasks: [] };
   refuse(p, "drafting", "review", "running", "paused");
   const tasks = [p.status === "drafting" ? p.draft_task : undefined, ...p.steps.filter((s) => s.status === "running").map((s) => s.task)].filter((t): t is string => !!t);
+  p.pending_stops = captureTaskStops(tasks, { kind: "plan", id }, false, p.pending_stops);
   for (const s of p.steps) if (s.status === "running") s.status = "stopped";
   p.status = "cancelled"; p.reason = undefined;
   savePlan(p);
@@ -181,9 +192,29 @@ export function cancelPlan(id: string): { plan: Plan; tasks: string[] } {
 }
 export function archivePlan(id: string) {
   const p = readPlan(id);
+  if (hasPendingStops(p.pending_stops)) throw new RequestError(409, "Finish this plan's pending task cleanup before removing it");
   refuse(p, "done", "cancelled");
-  mkdirSync(P("archive", "plans"), { recursive: true });
-  renameSync(file(id), P("archive", "plans", `${id}-${now().replace(/\W/g, "")}.json`));
+  renameSync(file(id), archiveDestination("plans", id, ".json"));
+}
+
+export function validatePlanDependencies(plan: Plan) {
+  if (typeof plan.agent !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(plan.agent) || !existsSync(P("agents", plan.agent, "profile.md"))) throw new RequestError(409, `Restore member ${plan.agent} before continuing this plan`);
+  if (plan.project && (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(plan.project) || !existsSync(P("projects", `${plan.project}.md`)))) throw new RequestError(409, `Restore project ${plan.project} before continuing this plan`);
+}
+export function validateArchivedPlan(value: unknown, id: string): Plan {
+  const plan = value as Plan | null;
+  if (!plan || typeof plan !== "object" || Array.isArray(plan) || plan.id !== id || !/^PL-[A-Z]?\d+$/.test(id) || !["done", "cancelled"].includes(plan.status)
+    || typeof plan.agent !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(plan.agent) || plan.project !== undefined && (typeof plan.project !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(plan.project))
+    || typeof plan.goal !== "string" || !plan.goal.trim() || plan.goal.length > 4000 || plan.goal.includes("\0") || typeof plan.branch !== "string" || plan.branch.length > 200 || /[\r\n\0]/.test(plan.branch)
+    || typeof plan.created !== "string" || !Number.isFinite(Date.parse(plan.created)) || !Array.isArray(plan.notes) || plan.notes.length > 100 || plan.notes.some((note) => typeof note !== "string" || note.length > 4000)
+    || !Number.isInteger(plan.next_step) || plan.next_step < 0 || !Array.isArray(plan.steps) || plan.steps.length > MAX_STEPS || hasPendingStops(plan.pending_stops)) throw new RequestError(400, "Only valid terminal plan history can be restored");
+  const ids = new Set<string>();
+  for (const step of plan.steps) {
+    if (!step || typeof step !== "object" || typeof step.id !== "string" || !/^s\d+$/.test(step.id) || ids.has(step.id) || typeof step.agent !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(step.agent) || typeof step.title !== "string" || !step.title.trim() || step.title.length > 200 || typeof step.details !== "string" || step.details.length > 20_000
+      || !["pending", "done", "stopped", "skipped"].includes(step.status) || typeof step.checkpoint !== "boolean" || !Number.isInteger(step.attempt) || step.attempt < 1 || step.attempt > 1000) throw new RequestError(400, "The archived plan has invalid or running steps");
+    ids.add(step.id);
+  }
+  return plan;
 }
 
 const taskAt = (id: string) => TASK_DIRS.find((d) => existsSync(P("tasks", d, `${id}.md`)));

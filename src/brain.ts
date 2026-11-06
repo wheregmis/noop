@@ -9,8 +9,10 @@
 // reply goes back as a normal feed event.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { DATA, HOME_DIR, P, _commitPush, _pull, journal, locked, now, readDoc, writeDoc } from "./core";
+import { DATA, HOME_DIR, P, _commitPush, _pull, journal, locked, now, projectRequires as projectCaps, readDoc, repoRequires, writeDoc } from "./core";
 import { type Ev, type FileRow, type ToolStore, type WriteOp, isWrite, listDecisions, listRoutines, listPlansView, listProjects, listTasks, editMemoryEntry, runTool, toolsFor, writeOp } from "../cloud/src/tools";
+import { hasPendingStops, taskHasStopIntent } from "../cloud/src/stop-intents";
+import { learningTaskBinding, learningTaskHostError } from "../cloud/src/learning";
 
 // ---------------------------------------------------------------- the local tool store (the data repo on this machine)
 
@@ -22,7 +24,8 @@ export function localStore(o: { acts: Acts; status: () => any; feed: () => { ts:
   const row = (abs: string): FileRow => ({ path: relative(root, abs).replaceAll("\\", "/"), text: readFileSync(abs, "utf8"), updated: statSync(abs).mtime.toISOString() });
   const walk = (dir: string): string[] => {
     if (!existsSync(dir)) return [];
-    return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(dir, e.name)) : e.name.endsWith(".md") || e.name.endsWith(".toml") || /\/plans\/?$/.test(dir) && e.name.endsWith(".json") ? [join(dir, e.name)] : []);
+    return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(dir, e.name)) : e.name.endsWith(".md") || e.name.endsWith(".toml") || /\/plans\/?$/.test(dir) && e.name.endsWith(".json")
+      || /^fleet\/stop-reviews\/(?:task-T-[\w-]*\d{4}|plan-PL-[A-Z]?\d+)\/[a-f0-9-]{36}\.json$/i.test(relative(root, join(dir, e.name)).replaceAll("\\", "/")) ? [join(dir, e.name)] : []);
   };
   const safe = (p: string) => !p.includes("..") && !p.startsWith("/");
   return {
@@ -42,38 +45,69 @@ export function localStore(o: { acts: Acts; status: () => any; feed: () => { ts:
 /** A task is one conversation: the owner's message on a finished task puts it back in the queue, same id, its runs as context. */
 export function reopenTask(file: string, text: string) {
   const { meta, body } = readDoc(file);
-  writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, claimed_by: undefined, status: undefined, finished: undefined, wake_at: undefined, decision: undefined, attempt: undefined, resumed: "yes" },
+  if (hasPendingStops(meta.pending_stops) || taskHasStopIntent(meta)) throw new Error(`Task ${meta.id} is still stopping its related runs. Finish that cleanup before reopening it.`);
+  const placementError = learningTaskHostError(meta, body, meta.host || "any");
+  if (placementError) throw new Error(placementError);
+  writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, ...learningTaskBinding(meta, body), claimed_by: undefined, status: undefined, finished: undefined, wake_at: undefined, decision: undefined, attempt: undefined, pending_stops: undefined, resumed: "yes" },
     `${body}\n\n## Owner follow-up ${now()}\n> ${text.replace(/\n/g, "\n> ")}\n\nReopened by the owner's message above: the earlier runs are your context, act on it now.\n`);
   unlinkSync(file);
 }
 
 /** Writes that only touch task metadata or memory files: done right here (git-synced data repo). */
 export function dataActs(host: string, io = { pull: _pull, push: _commitPush }): Acts {
-  const pull = () => io.pull(), push = (m: string) => io.push(m);
+  const mutate = (summary: string, change: () => Record<string, unknown>) => locked(async () => {
+    let refreshed = false;
+    try { refreshed = await io.pull(); } catch { /* Leave the current mirror untouched when refresh fails. */ }
+    if (!refreshed) return { ok: false, status: 503, error: "Could not load the latest team data. Reconnect the main machine and try again." };
+    const value = change();
+    if (value.ok === false) return value;
+    try { if (await io.push(summary)) return value; } catch { /* The local mutation is retained for sync recovery. */ }
+    return { ...value, ok: false, status: 503, saved_locally: true, error: "Saved on the main machine, but sync could not be confirmed. Reload the task or memory before retrying." };
+  });
   const findTask = (id: string, dirs: string[]) => dirs.map((d) => P("tasks", d, `${id}.md`)).find(existsSync);
   return {
-    set_priority: (op) => locked(async () => {
-      await pull();
+    set_priority: (op) => mutate(`[${host}] priority ${op.id} ${op.priority}`, () => {
       const f = findTask(op.id, ["inbox", "active", "waiting", "blocked"]);
       if (!f) return { ok: false, error: `${op.id} is not open` };
       const { meta, body } = readDoc(f);
       writeDoc(f, { ...meta, priority: op.priority }, body);
       journal(host, `↕️ ${op.id} priority → ${op.priority} (owner chat)`);
-      await push(`[${host}] priority ${op.id} ${op.priority}`);
       return { ok: true, id: op.id, priority: op.priority };
     }),
-    reassign_task: (op) => locked(async () => {
-      await pull();
+    reassign_task: (op) => mutate(`[${host}] reassign ${op.id} ${op.agent}`, () => {
       const f = findTask(op.id, ["inbox", "waiting", "blocked"]);
       if (!f) return { ok: false, error: `${op.id} is not queued, waiting or blocked` };
       const { meta, body } = readDoc(f);
       writeDoc(f, { ...meta, agent: op.agent }, `${body}\n\n## Reassigned ${now()}\nThe owner gave this task to ${op.agent} (was ${meta.agent ?? "?"}).\n`);
       journal(host, `🔀 ${op.id} reassigned ${meta.agent ?? "?"} → ${op.agent} (owner chat)`);
-      await push(`[${host}] reassign ${op.id} ${op.agent}`);
       return { ok: true, id: op.id, agent: op.agent };
     }),
-    remember: (op) => locked(async () => {
-      await pull();
+    configure_task: (op) => mutate(`[${host}] configure ${op.id}`, () => {
+      const f = findTask(op.id, ["inbox"]);
+      if (!f) return { ok: false, error: `${op.id} is no longer queued; reload the task` };
+      const { meta, body } = readDoc(f);
+      const { tool, id, ...placement } = op;
+      let location: Record<string, string> = {}, projectRequires = "";
+      const selectedProject = op.project === undefined ? meta.project : op.project;
+      if (selectedProject || op.project !== undefined) {
+        if (selectedProject) {
+          const file = P("projects", `${selectedProject}.md`);
+          if (!existsSync(file)) return { ok: false, error: "The selected project no longer exists" };
+          const project = readDoc(file).meta;
+          if (project.host !== op.host) return { ok: false, error: "The project's machine changed; reload and choose its current machine" };
+          location = { project: selectedProject, host: project.host, repo: project.path };
+          projectRequires = projectCaps(project).join(",");
+        } else location = { project: "", repo: "" };
+      }
+      const placementError = learningTaskHostError(meta, body, location.host ?? op.host);
+      if (placementError) return { ok: false, status: 409, error: placementError, id };
+      const repo = location.repo ?? meta.repo;
+      const requires = [...new Set([op.requires, projectRequires, ...repoRequires(repo, "", location.host ?? op.host)].join(",").split(",").map((r) => r.trim()).filter(Boolean))].join(",");
+      writeDoc(f, { ...meta, ...learningTaskBinding(meta, body), ...placement, ...location, requires, parked: undefined, planned: now() }, body);
+      journal(host, `✏️ ${id} configured by owner: ${op.host} · ${op.requires || "any OS"} · ${op.agent} · ${op.cli}`);
+      return { ok: true, id };
+    }),
+    remember: (op) => mutate(`[${host}] memory ${op.file}`, () => {
       const f = P(...op.file.split("/"));
       mkdirSync(join(f, ".."), { recursive: true });
       const line = `- ${op.text.replace(/\s*\n\s*/g, " ")} _(owner, ${now().slice(0, 10)}, via chat)_\n`;
@@ -81,18 +115,15 @@ export function dataActs(host: string, io = { pull: _pull, push: _commitPush }):
       if (prev.includes(op.text.trim())) return { ok: true, file: op.file, note: "already there" };
       writeFileSync(f, prev && !prev.endsWith("\n") ? `${prev}\n${line}` : prev + line);
       journal(host, `🧠 remembered in ${op.file}: ${op.text.slice(0, 80)}`);
-      await push(`[${host}] memory ${op.file}`);
       return { ok: true, file: op.file };
     }),
-    edit_memory: (op) => locked(async () => {
-      await pull();
+    edit_memory: (op) => mutate(`[${host}] memory ${op.file}`, () => {
       const f = P(...op.file.split("/"));
       if (!existsSync(f)) return { ok: false, error: `${op.file} not found` };
       const edit = editMemoryEntry(readFileSync(f, "utf8"), op.match, op.text);
       if (typeof edit === "string") return { ok: false, error: edit };
       writeFileSync(f, edit.text);
       journal(host, `🧠 ${op.text ? "edited" : "deleted"} in ${op.file}: ${edit.entry.replace(/\s*\n\s*/g, " ").slice(0, 300)}`);
-      await push(`[${host}] memory ${op.file}`);
       return { ok: true, file: op.file, [op.text ? "replaced" : "deleted"]: edit.entry };
     }),
   };
@@ -103,6 +134,23 @@ export function dataActs(host: string, io = { pull: _pull, push: _commitPush }):
 export interface Model {
   /** One conversation: send a user turn, get the assistant's text. close() when done. */
   open(system: string): Promise<{ send(text: string): Promise<string>; close(): void }>;
+}
+
+/** A provider-neutral conversation over the selected routing CLI. Each turn carries its prior tool results. */
+export class RoutingModel implements Model {
+  constructor(private query: (prompt: string) => Promise<unknown>) {}
+  async open(system: string) {
+    const history = [system];
+    return {
+      send: async (text: string) => {
+        history.push(`User: ${text}`);
+        const result = await this.query(history.join("\n\n"));
+        if (!result) throw new Error("No selected AI tool answered");
+        const answer = JSON.stringify(result); history.push(`Assistant: ${answer}`); return answer;
+      },
+      close: () => {},
+    };
+  }
 }
 
 const BRAIN_DIR = join(HOME_DIR, "brain"); // empty cwd: no project CLAUDE.md, no repo context for the CLI to load
@@ -304,6 +352,12 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
       for (const c of writes) {
         const r = await runTool(st, c.tool, c.args);
         res.calls.push({ ...c, ok: r.ok, ...(r.ok ? { result: r.data } : { error: r.error }) });
+        if (!r.ok) {
+          const correction = `The change was not confirmed: ${r.error}`;
+          const affected = r.data?.id ?? c.args?.id;
+          post(correction, typeof affected === "string" && /^T-/.test(affected) ? affected : ref);
+          res.reply = [res.reply, correction].filter(Boolean).join("\n\n");
+        }
       }
       break;
     }

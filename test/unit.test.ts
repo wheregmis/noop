@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { due } from "../src/cli";
-import { matches, signature, type Cfg } from "../src/core";
+import { HOME_DIR, matches, signature, type Cfg } from "../src/core";
 import { parseResult, runAgent } from "../src/runner";
 
 test("routine schedule", () => {
@@ -114,16 +115,32 @@ test("repo language → host requirements (only when the repo is on disk)", asyn
   expect(matches({ repo: "/nonexistent/repo/xyz", requires: "cli:cargo" }, mac)).toBe(false); // stored at creation
 });
 
-test("quota/auth failover: same CLI's other account, then the other CLI, else nothing", async () => {
-  const { failoverAccount } = await import("../src/accounts");
-  const all = () => true;
-  const a = { cli: "claude", name: "zz-test-a", dir: "" };
-  const two = { accounts: [{ cli: "claude", name: "zz-test-a" }, { cli: "claude", name: "zz-test-b" }] } as any;
-  expect(failoverAccount(two, a, ["claude"], all)?.name).toBe("zz-test-b");
-  const solo = { accounts: [{ cli: "claude", name: "zz-test-a" }, { cli: "codex", name: "zz-test-c" }] } as any;
-  expect(failoverAccount(solo, a, ["claude"], all)?.cli).toBe("codex"); // claude-only (owner/hard) work still falls back
-  expect(failoverAccount(solo, a, ["claude"], (c) => c === "claude")).toBeNull(); // codex not installed → requeue
-  expect(failoverAccount(solo, { cli: "codex", name: "zz-test-c", dir: "" }, ["codex", "claude"], all)?.cli).toBe("claude");
+test("quota/auth failover respects fresh provider and selected account order", async () => {
+  const { accounts, failoverAccount, setAccountNames } = await import("../src/accounts");
+  const folder = join(HOME_DIR, "accounts"), files = ["config.json", "state.json", "state.before-sources.json"].map((name) => join(folder, name));
+  const before = files.map((file) => existsSync(file) ? readFileSync(file, "utf8") : null);
+  mkdirSync(folder, { recursive: true });
+  try {
+    setAccountNames("claude", ["zz-test-a", "zz-test-b"]); setAccountNames("codex", ["zz-test-c"]);
+    const all = () => true;
+    const two = { accounts: [{ cli: "claude", name: "zz-test-a" }, { cli: "claude", name: "zz-test-b" }] } as any;
+    const a = accounts(two, "claude")[0]!;
+    expect(failoverAccount(two, a, ["claude"], all)?.name).toBe("zz-test-b");
+    expect(failoverAccount(two, a, ["codex", "claude"], all)).toMatchObject({ cli: "codex", name: "zz-test-c" }); // the failed provider cannot jump ahead of the current first choice
+    setAccountNames("codex", ["zz-test-d", "zz-test-c"]);
+    expect(failoverAccount(two, a, ["codex", "claude"], all)?.name).toBe("zz-test-d");
+    expect(failoverAccount(two, accounts(two, "codex")[0]!, ["codex", "claude"], all)?.name).toBe("zz-test-c");
+    expect(failoverAccount(two, a, ["codex", "claude"], (cli) => cli === "claude")?.name).toBe("zz-test-b");
+    expect(failoverAccount({ ...two, clis: { enabled: ["claude"] } }, a, ["codex", "claude"], all)?.name).toBe("zz-test-b");
+    expect(failoverAccount({ ...two, clis: { enabled: [] } }, a, ["codex", "claude"], all)).toBeNull();
+    setAccountNames("codex", ["zz-test-c"]);
+    setAccountNames("claude", ["zz-test-a"]);
+    const solo = { accounts: [{ cli: "claude", name: "zz-test-a" }, { cli: "codex", name: "zz-test-c" }] } as any;
+    expect(failoverAccount(solo, a, ["claude"], all)).toBeNull(); // an unselected tool is never a fallback
+    expect(failoverAccount(solo, a, ["claude", "codex"], all)?.cli).toBe("codex");
+    expect(failoverAccount(solo, a, ["claude"], (c) => c === "claude")).toBeNull(); // codex not installed → requeue
+    expect(failoverAccount(solo, accounts(solo, "codex")[0]!, ["codex", "claude"], all)?.cli).toBe("claude");
+  } finally { files.forEach((file, index) => { if (before[index] === null) rmSync(file, { force: true }); else writeFileSync(file, before[index]!, { mode: 0o600 }); }); }
 });
 
 test("restart throttle: at most one voluntary restart per hour unless forced", async () => {

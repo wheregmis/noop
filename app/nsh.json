@@ -24,6 +24,8 @@
       "pushEnable",
       "pushDisable",
       "setSession",
+      "pendingRead",
+      "pendingWrite",
       "setBadge",
       "clearNotifications",
       "vibrate",
@@ -37,7 +39,11 @@
     "notifications": true,
     "fs": {
       "read": [
-        "${homeDir}"
+        "${homeDir}",
+        "${dataDir}/pending-intents"
+      ],
+      "write": [
+        "${dataDir}/pending-intents"
       ]
     },
     "openUrl": {

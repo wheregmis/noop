@@ -134,7 +134,7 @@ test("initialize, tools/list, resources", async () => {
   expect((await rpc(mcp, "notifications/initialized", {}, init.sid, null)).status).toBe(202);
   const names = (await rpc(mcp, "tools/list", {}, init.sid)).body.result.tools.map((t: any) => t.name);
   expect(names).toEqual(["get_status", "list_tasks", "get_task", "list_decisions", "get_feed", "wait_for_events", "list_projects", "list_plans", "list_agents", "list_routines", "read_memory",
-    "search_journal", "search", "fetch", "send_message", "create_task", "create_plan", "continue_plan", "approve_plan", "amend_task", "cancel_task", "set_priority", "reassign_task", "remember", "edit_memory", "answer_decision"]);
+    "search_journal", "search", "fetch", "send_message", "create_task", "create_plan", "continue_plan", "approve_plan", "amend_task", "cancel_task", "set_priority", "reassign_task", "configure_task", "remember", "edit_memory", "answer_decision"]);
   expect(names.some((n: string) => /merge|release|setting/.test(n))).toBe(false);
   const res = (await rpc(mcp, "resources/list")).body.result.resources.map((r: any) => r.uri);
   expect(res).toContain("noop://tasks/T-0184");
@@ -374,4 +374,16 @@ test("task history: every task in pages, newest first, and any one of them on it
   expect(taskHistory(st, { query: "T-0204" }).tasks.map((t) => t.id)).toEqual(["T-0204"]);
   expect(taskInfo(st, "T-0204")).toMatchObject({ state: "done", request: "fix it", runs: [{ status: "done", summary: "fixed" }] });
   expect(taskInfo(st, "T-9999")).toBeNull();
+});
+
+
+test("cloud placement edits validate against the mirror and queue one operation for the primary", async () => {
+  const { mcp, file, queued } = hub();
+  file("agents/lead/profile.md", "# Lead\n");
+  file("tasks/inbox/T-0927.md", "---\nid: T-0927\nagent: lead\nrequires: os:linux\nparked: yesterday\n---\nReview.\n");
+  const args = { id: "T-0927", requires: "os:macos", host: "any", cli: "auto", agent: "lead", priority: "normal" };
+  expect((await tool(mcp, "configure_task", args)).data.queued).toBe(true);
+  expect(queued).toEqual([{ tool: "configure_task", ...args }]);
+  expect((await tool(mcp, "configure_task", { ...args, id: "T-0184" })).isError).toBe(true);
+  expect(queued).toHaveLength(1);
 });

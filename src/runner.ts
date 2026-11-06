@@ -5,9 +5,12 @@ import { join } from "node:path";
 import {
   type Cfg, P, ROOT, agentActivity, agentName, precedents, readAll, readIf, recentJournal, signature,
 } from "./core";
+import { enabledProviders, providerAvailable } from "./providers";
+import { accountEnv, pickAccount, markAccountSuccess } from "./accounts";
 import { claudeDisallowed } from "./gates";
 import { planSection } from "./plans";
 import { listProjects } from "./projects";
+import { activeClaim, bindTaskProcess, stopAgentProcess, taskRunCurrent, type TaskRun } from "./task-runs";
 
 export type Result = {
   status: "done" | "needs_decision" | "failed" | "delegated" | "waiting";
@@ -98,7 +101,7 @@ function projectsSection(meta: Record<string, string>): string {
 ${all.map((p) => `- ${p.name}: ${p.path}${p.repo ? ` (${p.repo})` : ""}, on ${p.host}`).join("\n")}
 ${mine ? `
 # This task's project: ${mine.name}
-${mine.exists ? "" : `Its folder ${mine.path} is missing on this machine. Don't work anywhere else instead: return "failed" and say so.\n`}${mine.instructions ? `The owner's instructions for this project:\n${mine.instructions}\n` : ""}` : ""}`;
+${mine.exists === false ? `Its folder ${mine.path} is missing on this machine. Don't work anywhere else instead: return "failed" and say so.\n` : mine.exists === null ? `Its folder is on ${mine.host}; it has not been checked on this machine. Run this project's work on ${mine.host}.\n` : ""}${mine.instructions ? `The owner's instructions for this project:\n${mine.instructions}\n` : ""}` : ""}`;
 }
 
 function rosterLine(): string {
@@ -129,6 +132,7 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
     if (deny.length) cmd.push("--disallowedTools", ...deny);
     return cmd;
   }
+  if (cli === "hermes") return ["hermes", "chat", "--query-file", "-", "--quiet", "--source", "noop", ...(c.model ? ["--model", c.model] : [])];
   if (cli === "codex") {
     // non-interactive: workspace-write sandbox with network, never ask for approval
     const cmd = ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
@@ -141,25 +145,47 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
 }
 
 const pidFile = (tid: string) => P("logs", "pids", `${tid}.pid`);
-function notePid(tid: string, pid: number) {
+function processBirth(pid: number): string {
+  try {
+    const cmd = process.platform === "win32" ? ["powershell.exe", "-NoProfile", "-Command", `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`]
+      : ["/bin/ps", "-o", "lstart=", "-p", String(pid)];
+    return Bun.spawnSync(cmd, { stdout: "pipe", stderr: "ignore" }).stdout.toString().trim();
+  } catch { return ""; }
+}
+function notePid(tid: string, pid: number, run: TaskRun) {
   mkdirSync(P("logs", "pids"), { recursive: true });
-  writeFileSync(pidFile(tid), String(pid));
+  const birth = processBirth(pid);
+  writeFileSync(pidFile(tid), JSON.stringify({ pid, run_id: run.run_id, birth, group: process.platform !== "win32" }));
 }
 /**
  * A daemon that died hard can leave its agent running. Before the task runs again, stop that agent, or two would edit one
  * folder at once. Only a process that is still an agent: its pid may have been reused since. Returns whether one was stopped.
  */
-export async function stopOrphanedAgent(tid: string): Promise<boolean> {
+export async function stopOrphanedAgent(tid: string, expectedRunId?: string): Promise<boolean> {
   if (!existsSync(pidFile(tid))) return false;
-  const pid = Number(readFileSync(pidFile(tid), "utf8"));
-  rmSync(pidFile(tid), { force: true });
+  const raw = readFileSync(pidFile(tid), "utf8");
+  let record: { pid: number; run_id: string; birth: string; group: boolean } | null = null;
+  try { const parsed = JSON.parse(raw); if (parsed && typeof parsed === "object") record = parsed; } catch { /* Older daemons recorded only the pid. */ }
+  if (record && expectedRunId !== record.run_id || !record && expectedRunId) throw new Error(`The saved process identity for ${tid} does not match its active run; recovery was halted`);
+  const pid = record?.pid ?? Number(raw);
   const isAgent = () => {
-    try { return /\b(claude|codex)\b/.test(Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(pid)]).stdout.toString()); } catch { return false; } // /bin/ps: launchd's PATH is short
+    try { return /\b(claude|codex|hermes)\b/.test(Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(pid)]).stdout.toString()); } catch { return false; } // /bin/ps: launchd's PATH is short
   };
-  if (!pid || !isAgent()) return false;
-  try { process.kill(pid, "SIGTERM"); } catch { return false; }
-  for (let i = 0; i < 20 && isAgent(); i++) await Bun.sleep(250);
-  if (isAgent()) try { process.kill(pid, "SIGKILL"); } catch { /* it just went */ }
+  if (record) {
+    const birth = processBirth(pid);
+    if (!birth) throw new Error(`The interrupted process tree for ${tid} cannot be verified after its parent exited; recovery was halted`);
+    if (!record.birth) throw new Error(`The saved process identity for ${tid} cannot be verified; recovery was halted`);
+    if (!pid || birth !== record.birth) throw new Error(`The saved process identity for ${tid} cannot be verified; recovery was halted`);
+    const gone = () => !processBirth(pid);
+    const proc = { pid, kill: (sig?: number | NodeJS.Signals) => process.kill(pid, sig), get exitCode() { return gone() ? 0 : null; }, exited: Promise.resolve(0) };
+    if (!await stopAgentProcess(proc)) throw new Error(`Could not confirm the old agent for ${tid} stopped; startup recovery was halted`);
+    rmSync(pidFile(tid), { force: true });
+    return true;
+  }
+  if (!Number.isInteger(pid) || pid <= 0 || !isAgent()) throw new Error(`The legacy process identity for ${tid} cannot be verified; recovery was halted`);
+  if (!await stopAgentProcess({ pid, kill: (sig) => process.kill(pid, sig), exitCode: null, exited: Promise.resolve(0) }))
+    throw new Error(`Could not confirm the old agent for ${tid} stopped; startup recovery was halted`);
+  rmSync(pidFile(tid), { force: true });
   return true;
 }
 
@@ -177,19 +203,25 @@ function toolStep(name: string, input: any): string {
 export const STALLED = "\n[stalled]";
 
 export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cfg, logFile: string, gateOverride = false,
-  extraEnv: Record<string, string> = {}): Promise<string> {
+  extraEnv: Record<string, string> = {}, run?: TaskRun): Promise<string> {
+  if (run && !taskRunCurrent(run)) return "";
   const cmd = cliCommand(cli, cfg, gateOverride);
   const timeoutMs = (cfg.clis?.timeout_minutes ?? 60) * 60_000;
   const stallMs = (cfg.clis?.stall_minutes ?? 20) * 60_000;
   const dir = cwd.replace(/^~/, homedir());
   const proc = Bun.spawn(cmd, {
+    detached: process.platform !== "win32",
     cwd: existsSync(dir) ? dir : ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe",
     // Claude -p stops background subagents 10 min after the last turn; our own run limit bounds the run instead
     env: { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0", ...extraEnv, HUB_DATA: ROOT },
   });
-  const tid = logFile.split("/").pop()!.match(/^([A-Z]-[\w]*?\d{4})-\d{10,}/)?.[1];
-  if (tid) { agentProcs.set(tid, proc); notePid(tid, proc.pid); }
-  void proc.exited.then(() => { if (tid && agentProcs.get(tid) === proc) { agentProcs.delete(tid); rmSync(pidFile(tid), { force: true }); } });
+  const tid = run?.id;
+  if (run) bindTaskProcess(run, proc);
+  if (tid && run) {
+    agentProcs.set(tid, proc);
+    try { notePid(tid, proc.pid, run); }
+    catch (error) { await stopAgentProcess(proc); agentProcs.delete(tid); throw error; }
+  }
 
   // what the agent is doing: every chunk of output is a sign of life; Claude's stream also names each step
   const json = cmd.includes("stream-json");
@@ -238,17 +270,23 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
 
   let stalled = false, timedOut = false;
   // hitting the run limit is not a tooling fault: report it like a stall so the task continues where it got to
-  const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
+  const timer = setTimeout(() => { timedOut = true; void stopAgentProcess(proc).catch(() => false); }, timeoutMs);
   // a run that has gone quiet: no output at all, and nothing slow in flight (a sub-agent may work quietly for long)
   const watch = setInterval(() => {
     const slow = [...inFlight.values()].some((n) => /^(Task|Agent)$/.test(n));
-    if (!slow && Date.now() - act.at > stallMs) { stalled = true; proc.kill(); }
+    if (!slow && Date.now() - act.at > stallMs) { stalled = true; void stopAgentProcess(proc).catch(() => false); }
   }, 30_000);
-  const [raw, err] = await Promise.all([read(proc.stdout, json), read(proc.stderr, false)]);
-  const code = await proc.exited;
-  clearTimeout(timer);
-  clearInterval(watch);
-  if (tid) agentActivity.delete(tid);
+  let raw: string, err: string, code: number;
+  const output = Promise.all([read(proc.stdout, json), read(proc.stderr, false)]);
+  if (run) run.drained = output.then(async () => { await proc.exited; });
+  try { [raw, err] = await output; code = await proc.exited; }
+  finally {
+    clearTimeout(timer); clearInterval(watch);
+    if (tid && agentProcs.get(tid) === proc) {
+      agentProcs.delete(tid); agentActivity.delete(tid);
+      if (run && !activeClaim(run)) rmSync(pidFile(tid), { force: true });
+    }
+  }
   mkdirSync(P("logs", "runs"), { recursive: true });
   writeFileSync(logFile, `$ ${cmd.join(" ")}\n(exit ${code})\n\n${raw}\n\n[stderr]\n${err}`);
   const out = json ? (resultText ?? assistantText) : raw;
@@ -270,17 +308,20 @@ export function parseResult(out: string): Result {
 
 /** The models that route each owner message, fastest first: a choice made within seconds, not a judgement.
  * `[router] cli/model` in config.toml puts one first; the others are fallbacks when its CLI is missing or fails. */
-const ROUTERS = [{ cli: "claude", model: "claude-haiku-5-5" }, { cli: "codex", model: "gpt-6-luna" }];
+const ROUTERS = [{ cli: "claude", model: "claude-haiku-5-5" }, { cli: "codex", model: "gpt-6-luna" }, { cli: "hermes", model: "" }];
 
 /** One quick structured call for routing (the fastest model available); null when none answered. */
 export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
-  const own = cfg.router?.cli ? [{ cli: String(cfg.router.cli), model: String(cfg.router.model ?? "") }] : [];
+  const own = cfg.router?.cli ? [{ cli: String(cfg.router.cli), model: String(cfg.router.model ?? ROUTERS.find((provider) => provider.cli === cfg.router.cli)?.model ?? "") }] : [];
   for (const r of [...own, ...ROUTERS.filter((x) => x.cli !== own[0]?.cli)]) {
-    if (!Bun.which(r.cli)) continue;
+    if (!enabledProviders(cfg).includes(r.cli) || !providerAvailable(r.cli)) continue;
+    const account = pickAccount(cfg, [r.cli]);
+    if (!account) continue;
     const cmd = r.cli === "claude"
       ? ["claude", "-p", "--output-format", "text", "--tools", "", "--strict-mcp-config", ...(r.model ? ["--model", r.model] : [])]
+      : r.cli === "hermes" ? ["hermes", "chat", "--query-file", "-", "--quiet", "--source", "noop", "--toolsets", "no_mcp", ...(r.model || cfg.clis?.hermes?.model ? ["--model", r.model || cfg.clis.hermes.model] : [])]
       : ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(r.model ? ["-m", r.model] : []), "-c", 'model_reasoning_effort="low"', "-"];
-    const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(cmd, { cwd: ROOT, env: { ...process.env, ...accountEnv(account) }, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.router?.timeout_seconds ?? 45) * 1000);
     const out = await new Response(proc.stdout).text();
     await proc.exited;
@@ -288,18 +329,30 @@ export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promi
     mkdirSync(P("logs", "runs"), { recursive: true });
     writeFileSync(logFile, `${r.cli} ${r.model}\n${out}`);
     const m = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].pop() ?? out.match(/(\{[\s\S]*\})/);
-    try { return JSON.parse(m![1]); } catch {}
+    try { const answer = JSON.parse(m![1]); if (proc.exitCode === 0) markAccountSuccess(account); return answer; } catch {}
   }
   return null;
 }
 
+/** Provider-specific judge models stay independent when the owner switches CLIs. */
+export function judgeCommand(cfg: Cfg, selected?: string): string[] {
+  const enabled = enabledProviders(cfg);
+  const cli = selected ?? (enabled.includes(cfg.judge?.cli ?? "claude") ? cfg.judge?.cli ?? "claude" : enabled[0]);
+  if (!cli) return [];
+  if (cli === "hermes") return ["hermes", "chat", "--query-file", "-", "--quiet", "--source", "noop", "--toolsets", "no_mcp", ...(cfg.judge?.hermes_model ? ["--model", cfg.judge.hermes_model] : [])];
+  return cli === "claude" ? ["claude", "-p", "--output-format", "text", "--model", cfg.judge?.model ?? "claude-opus-5-5", "--tools", ""]
+    : ["codex", "exec", "--skip-git-repo-check", ...(cfg.judge?.codex_model ? ["-m", cfg.judge.codex_model] : []), "-"];
+}
+
 /** One-shot structured call (used by the judge). */
 export async function ask(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
-  const cli = cfg.judge?.cli ?? "claude";
-  const cmd = cli === "claude"
-    ? ["claude", "-p", "--output-format", "text", "--model", cfg.judge?.model ?? "claude-opus-5-5", "--tools", ""]
-    : ["codex", "exec", "--skip-git-repo-check", "-"];
-  const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
+  const enabled = enabledProviders(cfg), preferred = cfg.judge?.cli ?? "claude";
+  const selected = [preferred, ...enabled.filter((id) => id !== preferred)].find((id) => enabled.includes(id) && providerAvailable(id) && pickAccount(cfg, [id]));
+  if (!selected) return null;
+  const account = pickAccount(cfg, [selected]);
+  if (!account) return null;
+  const cmd = judgeCommand(cfg, selected);
+  const proc = Bun.spawn(cmd, { cwd: ROOT, env: { ...process.env, ...accountEnv(account) }, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.judge?.timeout_minutes ?? 10) * 60_000); // runs inside locked()
   const out = await new Response(proc.stdout).text();
   await proc.exited;
@@ -307,5 +360,5 @@ export async function ask(prompt: string, cfg: Cfg, logFile: string): Promise<an
   mkdirSync(P("logs", "runs"), { recursive: true });
   writeFileSync(logFile, out);
   const m = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].pop() ?? out.match(/(\{[\s\S]*\})/);
-  try { return JSON.parse(m![1]); } catch { return null; }
+  try { const answer = JSON.parse(m![1]); if (proc.exitCode === 0) markAccountSuccess(account); return answer; } catch { return null; }
 }

@@ -1,8 +1,13 @@
 // noop core — shared files as the world (stigmergy; synced via the owner's Worker, src/sync.ts), task queue, agent runner, journal, memory.
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import * as sync from "./sync";
+import { enabledProviders, providerAvailable, providerHealth, type ProviderHealth } from "./providers";
+import { MACHINE_LEARNING_FIELDS, MACHINE_RESOURCE_FIELDS, configAt, autonomyLevel, validAutonomyLevel, type AutonomyPolicy, type ConfigValue } from "../cloud/src/configuration";
+import { hasPendingStops, taskHasStopIntent } from "../cloud/src/stop-intents";
+import { PROVIDER_IDS, type ToolPolicy } from "../cloud/src/providers";
+import { learningTaskBinding, learningTaskHostError } from "../cloud/src/learning";
 
 /** Framework code (this repo, self-updating). */
 export const CODE = resolve(import.meta.dir, "..");
@@ -22,6 +27,62 @@ sync.setSyncData(DATA, process.env.HUB_DATA && !process.env.NOOP_HOME ? dirname(
 
 // ------------------------------------------------------------------ config
 export type Cfg = Record<string, any>;
+const policySources = new WeakMap<Cfg, { shared: Cfg; local: Cfg; ui: Cfg }>();
+const object = (value: unknown): value is Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value);
+const invalidToolPolicy = Symbol("invalid tool policy");
+function toolSetting(cfg: Cfg, agent?: string): unknown {
+  if (cfg.clis === undefined) return undefined;
+  if (!object(cfg.clis)) return invalidToolPolicy;
+  if (!agent) return cfg.clis.preference;
+  if (cfg.clis.agents === undefined) return undefined;
+  return object(cfg.clis.agents) ? cfg.clis.agents[agent] : invalidToolPolicy;
+}
+const validToolOrder = (value: unknown): value is string[] => Array.isArray(value) && value.length <= PROVIDER_IDS.length
+  && value.every((id) => typeof id === "string" && PROVIDER_IDS.includes(id)) && new Set(value).size === value.length;
+const invalidToolOrder = (value: unknown) => value !== undefined && value !== null && !validToolOrder(value);
+
+/** Only tool-policy defaults are exposed; bootstrap values never enter the settings response. */
+export function toolPolicy(cfg: Cfg, agent?: string): ToolPolicy {
+  const sources = policySources.get(cfg);
+  const local = sources ? toolSetting(sources.local, agent) : undefined;
+  const shared = sources ? toolSetting(sources.shared, agent) : toolSetting(cfg, agent);
+  const file = local !== undefined ? local : shared;
+  const fileSource = local !== undefined ? "local_file" : shared !== undefined ? "shared_file" : "default";
+  const saved = sources ? toolSetting(sources.ui, agent) : undefined;
+  const value = toolSetting(cfg, agent);
+  return { configured: invalidToolOrder(value) ? [] : value as string[] | null | undefined ?? null,
+    effective: agent ? allowedClis({ agent }, cfg) : (invalidToolOrder(value) ? [] : value as string[] | null | undefined ?? enabledProviders(cfg)).filter((id) => enabledProviders(cfg).includes(id)),
+    source: saved !== undefined ? "ui" : fileSource,
+    file_default: invalidToolOrder(file) ? [] : file as string[] | null | undefined ?? null, file_source: fileSource,
+    ...(invalidToolOrder(value) ? { invalid: true } : {}), ...(invalidToolOrder(file) ? { file_invalid: true } : {}) };
+}
+
+const invalidAutonomyPolicy = Symbol("invalid autonomy policy");
+function autonomySetting(cfg: Cfg, agent: string): unknown {
+  if (cfg.autonomy === undefined) return undefined;
+  if (!object(cfg.autonomy)) return invalidAutonomyPolicy;
+  if (!Object.hasOwn(cfg.autonomy, "agents")) return undefined;
+  const members = cfg.autonomy.agents;
+  if (!object(members)) return invalidAutonomyPolicy;
+  return Object.hasOwn(members, agent) ? members[agent] === undefined ? invalidAutonomyPolicy : members[agent] : undefined;
+}
+
+export function autonomyPolicy(cfg: Cfg, agent: string): AutonomyPolicy {
+  const sources = policySources.get(cfg);
+  const local = sources ? autonomySetting(sources.local, agent) : undefined;
+  const shared = sources ? autonomySetting(sources.shared, agent) : autonomySetting(cfg, agent);
+  const file = sources ? autonomySetting(merge(sources.shared, sources.local), agent) : shared;
+  const fileSource = file === undefined ? "default" : local !== undefined ? "local_file" : "shared_file";
+  const localReplacement = sources && sources.ui.autonomy !== undefined && !object(sources.ui.autonomy) && sources.local.autonomy !== undefined;
+  const saved = sources && !localReplacement ? autonomySetting(sources.ui, agent) : undefined;
+  const value = autonomySetting(cfg, agent);
+  const invalid = value !== undefined && value !== null && !validAutonomyLevel(value);
+  const fileInvalid = file !== undefined && file !== null && !validAutonomyLevel(file);
+  return { configured: invalid ? "onboarding" : value as AutonomyPolicy["configured"] | undefined ?? null,
+    effective: autonomyLevel(cfg, agent), source: localReplacement ? "local_file" : saved !== undefined ? "ui" : fileSource,
+    file_default: fileInvalid ? "onboarding" : file as AutonomyPolicy["file_default"] | undefined ?? null, file_source: fileSource,
+    ...(invalid ? { invalid: true } : {}), ...(fileInvalid ? { file_invalid: true } : {}) };
+}
 
 function merge(a: any, b: any): any {
   const out = { ...a };
@@ -30,14 +91,33 @@ function merge(a: any, b: any): any {
   return out;
 }
 
-export function loadConfig(): Cfg {
+export function loadConfig(applyConfiguration = true, applyMachineResources = true): Cfg {
   const read = (f: string) => (existsSync(P(f)) ? Bun.TOML.parse(readFileSync(P(f), "utf8")) : {});
   // noop.toml = machine-local bootstrap (Worker url + machine token), outside DATA because DATA itself comes from the Worker
-  // settings.json = changes made from the UI (shared via the data repo), applied over config.toml; config.local.toml wins last
+  // Shared UI choices apply over the files: operational overrides first, then per-machine run settings.
   const ui = existsSync(P("settings.json")) ? JSON.parse(readFileSync(P("settings.json"), "utf8")) : {};
-  const cfg: Cfg = merge(merge(merge(sync.readHubToml(), read("config.toml")), ui), read("config.local.toml"));
+  const shared = merge(sync.readHubToml(), read("config.toml")), local = read("config.local.toml");
+  const files: Cfg = merge(merge(shared, ui), local);
+  const cfg: Cfg = applyConfiguration ? merge(files, ui.configuration ?? {}) : files;
+  // These explicit UI choices beat machine files; resetting a leaf reveals the original file policy.
+  if (object(ui.clis)) for (const key of ["preference", "agents"]) if (Object.hasOwn(ui.clis, key))
+    cfg.clis = merge(object(cfg.clis) ? cfg.clis : {}, { [key]: ui.clis[key] });
+  if (object(ui.autonomy) && Object.hasOwn(ui.autonomy, "agents"))
+    cfg.autonomy = merge(object(cfg.autonomy) ? cfg.autonomy : {}, { agents: ui.autonomy.agents });
+  policySources.set(cfg, { shared, local, ui });
   // routine tweaks from the UI: { routines: { <name>: { enabled, every } } }
   for (const r of cfg.routine ?? []) Object.assign(r, ui.routines?.[r.name] ?? {});
+  cfg.resource_defaults = Object.fromEntries(MACHINE_RESOURCE_FIELDS.map((field) => [field.path, configAt(files, field.path) ?? field.default]));
+  cfg.learning_defaults = Object.fromEntries(MACHINE_LEARNING_FIELDS.map((field) => [field.path, configAt(files, field.path) ?? field.default]));
+  const machineSettings = cfg.machines?.[hostName(cfg)];
+  if (machineSettings) {
+    const { resources, learn, ...runSettings } = machineSettings;
+    cfg.host = { ...cfg.host, ...runSettings };
+    if (applyConfiguration && applyMachineResources) {
+      cfg.resources = merge(cfg.resources ?? {}, resources ?? {});
+      cfg.learn = merge(cfg.learn ?? {}, learn ?? {});
+    }
+  }
   cfg.notify ??= {};
   // the owner's own Cloudflare hub (hub cloud deploy) is the fixed address for clients and workers
   if (cfg.cloud?.url) { cfg.server ??= {}; cfg.server.url ??= cfg.cloud.url; cfg.server.public_url ??= cfg.cloud.url; }
@@ -133,6 +213,15 @@ export function nextId(prefix: string, dir: string): string {
     }
   };
   if (existsSync(dir)) walk(dir);
+  // Explicit forms reserve IDs before publication, so a failed request's Inspect link never aliases different work.
+  if (prefix === "T" && resolve(dir) === P("tasks")) {
+    const reserved = P("fleet", "task-ids"); let ready = true;
+    for (const path of [P("fleet"), reserved]) {
+      let stat; try { stat = lstatSync(path); } catch (error: any) { if (error.code === "ENOENT") { ready = false; break; } throw error; }
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Task ID reservations must use real directories");
+    }
+    if (ready) walk(reserved);
+  }
   // the local mirror can lag other hosts: never hand out an id whose file already exists in any state folder
   const taken = (id: string) => existsSync(dir) && readdirSync(dir, { withFileTypes: true })
     .some((e) => e.isDirectory() ? existsSync(join(dir, e.name, `${id}.md`)) : e.name === `${id}.md`);
@@ -166,68 +255,91 @@ export type TaskOpts = {
 /** Capabilities of this machine: os:<linux|macos|windows>, host:<name>, plus config [host].caps (e.g. gpu, docker, home). */
 export function hostCaps(cfg: Cfg): string[] {
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-  const clis = ["claude", "codex", "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
+  const clis = [...providerHealth(cfg).filter((provider) => provider.available && accountCanRun(provider.id, cfg)).map((provider) => provider.id), ...["gh", "cargo", "bun", "node"].filter((c) => Bun.which(c))].map((c) => `cli:${c}`);
   return [`os:${os}`, `host:${hostName(cfg)}`, `arch:${process.arch}`, ...clis, ...(cfg.host?.caps ?? [])];
 }
 
 /** One requirement; "a|b" means either cap will do (e.g. cli:bun|cli:node). */
 export const capOk = (req: string, caps: string[]) => req.split("|").some((r) => caps.includes(r.trim()));
 
-/** Toolchain a repo needs, read from its manifest files. Empty when the repo dir is not on this machine. */
-export function repoRequires(repo?: string): string[] {
+/** Toolchain from current manifests, or a saved project snapshot when its folder is on another machine. */
+export function repoRequires(repo?: string, fallback = "", host?: string): string[] {
   if (!repo) return [];
+  if (host && host !== "any" && host !== hostName(loadConfig())) return fallback.split(",").map((r) => r.trim()).filter(Boolean);
   const dir = resolve(repo.replace(/^~/, homedir()));
-  if (!existsSync(dir)) return [];
+  if (!existsSync(dir)) return fallback.split(",").map((r) => r.trim()).filter(Boolean);
   const out: string[] = [];
   if (existsSync(join(dir, "Cargo.toml"))) out.push("cli:cargo");
   if (existsSync(join(dir, "package.json"))) out.push("cli:bun|cli:node");
   return out;
 }
 
+/** Keep explicit project caps separate from the toolchain snapshot supplied by its own machine. */
+export function projectRequires(project: Record<string, string>): string[] {
+  const custom = project.custom_requires ?? project.requires ?? "";
+  const detected = project.detected_requires ?? project.requires ?? "";
+  return [...new Set([custom, ...repoRequires(project.path, detected, project.host)].join(",").split(",").map((r) => r.trim()).filter(Boolean))];
+}
+
 /** A task matches if every comma-separated requirement is in the host's caps (plus what its local repo needs). */
-export function matches(meta: Record<string, string>, caps: string[]): boolean {
-  const reqs = [meta.requires, meta.host && meta.host !== "any" ? `host:${meta.host}` : "", ...repoRequires(meta.repo)]
+export function matches(meta: Record<string, string>, caps: string[], body = ""): boolean {
+  const binding = learningTaskBinding(meta, body);
+  if (learningTaskHostError(meta, body, meta.host || "any") || binding.learning_host && !caps.includes(`host:${binding.learning_host}`)) return false;
+  const reqs = [meta.requires, meta.host && meta.host !== "any" ? `host:${meta.host}` : "", ...repoRequires(meta.repo, "", meta.host)]
     .join(",").split(",").map((s) => s.trim()).filter(Boolean);
   return reqs.every((r) => capOk(r, caps));
 }
 
 /** Hook set by the CLI so core stays free of policy imports. */
-export let approvalGate: (source: string) => boolean = () => false;
-export const setApprovalGate = (fn: (source: string) => boolean) => { approvalGate = fn; };
+export let approvalGate: (source: string, agent?: string) => boolean = () => false;
+export const setApprovalGate = (fn: (source: string, agent?: string) => boolean) => { approvalGate = fn; };
 
+/** Build the complete task before publishing it, so forms can validate its size and save their receipt first. */
+export function taskDocument(id: string, title: string, body = "", o: TaskOpts = {}) {
+  // a project decides where the work happens: its folder, on the machine that has it
+  const project = o.project && existsSync(P("projects", `${o.project}.md`)) ? readDoc(P("projects", `${o.project}.md`)).meta : null;
+  if (project) { o = { ...o, repo: project.path, host: project.host, requires: [o.requires, ...projectRequires(project)].filter(Boolean).join(","), extra: { ...o.extra, project: o.project! } }; }
+  return { meta: {
+    id, title, agent: o.agent ?? "lead", cli: o.cli ?? "auto", host: o.host ?? "any",
+    // stored at creation so hosts without the repo checked out still know what it needs
+    requires: [...new Set([...(o.requires ?? "").split(","), ...repoRequires(o.repo, "", o.host)].map((x) => x.trim()).filter(Boolean))].join(","), prefer: o.prefer ?? "", weight: o.weight ?? "normal", repo: o.repo ?? "", priority: o.priority ?? "normal", source: o.source ?? "owner",
+    created: now(), ...(o.extra ?? {}),
+  }, body: body || title };
+}
 export function newTask(title: string, body = "", o: TaskOpts = {}): string {
   const id = nextId("T", P("tasks"));
   // work the owner asked for (directly or via a delegated parent) never needs re-approval
-  const folder = o.extra?.origin !== "owner" && approvalGate(o.source ?? "owner") ? "proposed" : "inbox";
-  // a project decides where the work happens: its folder, on the machine that has it
-  const project = o.project && existsSync(P("projects", `${o.project}.md`)) ? readDoc(P("projects", `${o.project}.md`)).meta : null;
-  if (project) { o = { ...o, repo: project.path, host: project.host, extra: { ...o.extra, project: o.project! } }; }
-  writeDoc(P("tasks", folder, `${id}.md`), {
-    id, title, agent: o.agent ?? "lead", cli: o.cli ?? "auto", host: o.host ?? "any",
-    // stored at creation so hosts without the repo checked out still know what it needs
-    requires: [...new Set([...(o.requires ?? "").split(","), ...repoRequires(o.repo)].map((x) => x.trim()).filter(Boolean))].join(","), prefer: o.prefer ?? "", weight: o.weight ?? "normal", repo: o.repo ?? "", priority: o.priority ?? "normal", source: o.source ?? "owner",
-    created: now(), ...(o.extra ?? {}),
-  }, body || title);
+  const folder = o.extra?.origin !== "owner" && approvalGate(o.source ?? "owner", o.agent ?? "lead") ? "proposed" : "inbox";
+  const doc = taskDocument(id, title, body, o);
+  writeDoc(P("tasks", folder, `${id}.md`), doc.meta, doc.body);
   return id;
 }
 
 export const which = (bin: string) => Bun.which(bin) !== null;
 
-/** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
- *  Unplanned tasks may use either, Claude first. */
+/** Explicit task/member/team choices keep their order; the planner ranks only automatic defaults. */
 export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
-  if (meta.cli && meta.cli !== "auto") return [meta.cli];
-  const per = cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined;
-  if (per) return per;
-  return ["claude", "codex"];
+  const enabled = enabledProviders(cfg);
+  const member = toolSetting(cfg, meta.agent || "lead"), team = toolSetting(cfg);
+  if (invalidToolOrder(member) || Array.isArray(member) && !member.length) return [];
+  const pinned = meta.cli && meta.cli !== "auto";
+  const requested: string[] = pinned ? [meta.cli] : validToolOrder(member) ? member : validToolOrder(team) ? team : invalidToolOrder(team) ? [] : enabled;
+  const allowed = requested.filter((cli) => enabled.includes(cli));
+  return !pinned && member == null && team == null && meta.planned_cli && allowed.includes(meta.planned_cli)
+    ? [meta.planned_cli, ...allowed.filter((cli) => cli !== meta.planned_cli)] : allowed;
 }
 
+/** Account policy is installed by the local account module after core initialization. */
+let accountAvailability: (cli: string, cfg: Cfg) => boolean = () => true;
+export const setAccountAvailability = (available: (cli: string, cfg: Cfg) => boolean) => { accountAvailability = available; };
+export const accountCanRun = (cli: string, cfg: Cfg) => accountAvailability(cli, cfg);
+
 export function chooseCli(meta: Record<string, string>, cfg: Cfg): string | null {
-  return allowedClis(meta, cfg).find(which) ?? null;
+  return allowedClis(meta, cfg).find((cli) => providerAvailable(cli) && accountCanRun(cli, cfg)) ?? null;
 }
 
 // ------------------------------------------------------------------ fleet presence (heartbeats)
-export type HostBeat = { host: string; caps: string[]; seen: string; busy: number; version: string; stats?: any;
+export type HostBeat = { host: string; caps: string[]; enabled?: boolean; max_parallel?: number | null; custom_caps?: string[]; resource_defaults?: Record<string, ConfigValue>; disk_path_supported?: boolean; learning_defaults?: Record<string, ConfigValue>; providers?: ProviderHealth[]; seen: string; busy: number; version: string; stats?: any;
   /** The noop code this host runs: its commit and that commit's page. */ rev?: string; rev_url?: string;
   /** How this host is doing with the owner's latest "update every machine". */ update?: UpdateState;
   /** Per running task: when its agent last showed a sign of life and what it was doing. */ activity?: Record<string, Activity> };
@@ -281,24 +393,28 @@ export function heartbeat(cfg: Cfg, busy: number, stats?: unknown) {
   const host = hostName(cfg);
   const f = P("fleet", "hosts", `${host}.json`);
   mkdirSync(dirname(f), { recursive: true });
-  writeFileSync(f, JSON.stringify({ host, caps: hostCaps(cfg), seen: now(), busy, version: "1", stats, ...runningRev(), update: updateState(), activity: agentActivity.size ? Object.fromEntries(agentActivity) : undefined } satisfies HostBeat, null, 2));
+  writeFileSync(f, JSON.stringify({ host, caps: hostCaps(cfg), seen: now(), busy, version: "1", enabled: cfg.host?.enabled !== false, max_parallel: cfg.host?.max_parallel ?? null, custom_caps: cfg.host?.caps ?? [], resource_defaults: cfg.resource_defaults, disk_path_supported: true, learning_defaults: cfg.learning_defaults, providers: providerHealth(cfg), stats, ...runningRev(), update: updateState(), activity: agentActivity.size ? Object.fromEntries(agentActivity) : undefined } satisfies HostBeat, null, 2));
 }
+
+export const knownHosts = (): HostBeat[] => list(P("fleet", "hosts"), /\.json$/).map((p) => JSON.parse(readFileSync(p, "utf8")) as HostBeat);
 
 export function onlineHosts(cfg: Cfg): HostBeat[] {
   const staleMs = (cfg.fleet?.offline_after_minutes ?? 5) * 60_000;
-  return list(P("fleet", "hosts"), /\.json$/).map((p) => JSON.parse(readFileSync(p, "utf8")) as HostBeat)
-    .filter((h) => Date.now() - Date.parse(h.seen) < staleMs);
+  return knownHosts().filter((h) => Date.now() - Date.parse(h.seen) < staleMs);
 }
+
+/** Connected machines accepting work; paused machines keep heartbeating and finish their current tasks. */
+export const schedulableHosts = (cfg: Cfg) => onlineHosts(cfg).filter((h) => cfg.machines?.[h.host]?.enabled ?? h.enabled ?? true);
 
 const reqList = (s?: string) => (s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
 /** Should this host leave the task for a preferred, currently-online host? */
 function yieldToPreferred(meta: Record<string, string>, caps: string[], cfg: Cfg): boolean {
   const prefer = reqList(meta.prefer);
-  if (!prefer.length || prefer.every((r) => caps.includes(r))) return false;
+  if (!prefer.length || prefer.every((r) => capOk(r, caps))) return false;
   const waitMs = (cfg.fleet?.prefer_wait_minutes ?? 10) * 60_000;
   if (Date.now() - Date.parse(meta.created) > waitMs) return false; // waited long enough
-  return onlineHosts(cfg).some((h) => h.host !== hostName(cfg) && prefer.every((r) => h.caps.includes(r)));
+  return schedulableHosts(cfg).some((h) => h.host !== hostName(cfg) && matches(meta, h.caps) && allowedClis(meta, cfg).some((cli) => h.caps.includes(`cli:${cli}`)) && prefer.every((r) => capOk(r, h.caps)));
 }
 
 /** Heavy work goes to the least-loaded capable online host. */
@@ -306,17 +422,18 @@ function yieldHeavy(meta: Record<string, string>, cfg: Cfg, myLoad: number, heav
   if (meta.weight !== "heavy") return false;
   if (!heavyOk) return true;
   const me = hostName(cfg);
-  return onlineHosts(cfg).some((h) => h.host !== me && matches(meta, h.caps) && h.stats
+  return schedulableHosts(cfg).some((h) => h.host !== me && matches(meta, h.caps) && allowedClis(meta, cfg).some((cli) => h.caps.includes(`cli:${cli}`)) && h.stats
     && h.stats.loadRatio + 0.2 < myLoad && h.busy === 0);
 }
 
 export function pickTask(cfg: Cfg, myLoad = 0, heavyOk = true): string | null {
+  if (cfg.host?.enabled === false) return null;
   const caps = hostCaps(cfg);
   const rank: Record<string, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
   const cands = list(P("tasks", "inbox"), /^T-.*\.md$/)
-    .map((p) => ({ p, m: readDoc(p).meta }))
+    .map((p) => { const doc = readDoc(p); return { p, m: doc.meta, body: doc.body }; })
     // the planner decides where a task runs first; unplanned tasks wait for it (at most plan_wait_minutes)
-    .filter(({ m }) => (m.planned || Date.now() - Date.parse(m.created ?? "") > (cfg.fleet?.plan_wait_minutes ?? 3) * 60_000) && matches(m, caps) && chooseCli(m, cfg) && !yieldToPreferred(m, caps, cfg) && !yieldHeavy(m, cfg, myLoad, heavyOk))
+    .filter(({ m, body }) => !taskHasStopIntent(m) && !hasPendingStops(m.pending_stops) && (m.planned || Date.now() - Date.parse(m.created ?? "") > (cfg.fleet?.plan_wait_minutes ?? 3) * 60_000) && matches(m, caps, body) && chooseCli(m, cfg) && !yieldToPreferred(m, caps, cfg) && !yieldHeavy(m, cfg, myLoad, heavyOk))
     .sort((a, b) => (rank[a.m.priority] ?? 2) - (rank[b.m.priority] ?? 2) || a.p.localeCompare(b.p));
   return cands[0]?.p ?? null;
 }
@@ -326,8 +443,9 @@ export const claim = (path: string, host: string) => locked(() => _claim(path, h
 async function _claim(path: string, host: string): Promise<string | null> {
   if (!existsSync(path)) return null;
   const { meta, body } = readDoc(path);
+  if (learningTaskHostError(meta, body, meta.host || "any") || learningTaskHostError(meta, body, host)) return null;
   const dest = P("tasks", "active", `${meta.id}.md`);
-  writeDoc(dest, { ...meta, claimed_by: host, started: now(), host_caps: hostCaps(loadConfig()).join(",") }, body);
+  writeDoc(dest, { ...meta, ...learningTaskBinding(meta, body), claimed_by: host, run_host: host, run_id: crypto.randomUUID(), started: now(), host_caps: hostCaps(loadConfig()).join(",") }, body);
   unlinkSync(path);
   if (await _commitPush(`[${host}] claim ${meta.id}: ${meta.title}`)) return dest;
   // undo only our claim (other pending local results stay queued); after a lost race the pull already applied the winner

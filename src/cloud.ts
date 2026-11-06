@@ -7,30 +7,65 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { type Jwk, newVapidKeys } from "../cloud/src/push";
-import { type Cfg, CODE, P, _commitPush, _pull, hostName, journal, locked, HOME_DIR } from "./core";
+import { type Cfg, CODE, P, _commitPush, _pull, hostName, journal, locked, HOME_DIR, loadConfig } from "./core";
 import { writeHubToml } from "./sync";
+import { applyUiRequest } from "./ui-requests";
+import type { UiResult } from "../cloud/src/ui-requests";
 import { ensureWebClient } from "./webclient";
-import { type Event, MEDIA, appendEvent, applyOp, handleOwnerMessage, saveSettings, setMirror, settingsView, status, cancelTask, updateFleet } from "./server";
+import { type Event, MEDIA, appendEvent, applyOp, feed, handleOwnerMessage, saveSettings, setMirror, settingsView, status, cancelTask, updateFleet, recordRequest } from "./server";
+import { ActionSyncError } from "../cloud/src/action-errors";
+import { receiveMessage } from "./message-receipts";
 
 const base = (cfg: Cfg) => String(cfg.cloud?.url ?? "").replace(/\/$/, "");
 const headers = (cfg: Cfg) => ({ Authorization: `Bearer ${cfg.server?.token}`, "Content-Type": "application/json" });
 
-async function call(cfg: Cfg, path: string, init: RequestInit = {}, timeoutMs = 15_000) {
-  const r = await fetch(base(cfg) + path, { ...init, headers: headers(cfg), signal: AbortSignal.timeout(timeoutMs) }).catch(() => null);
+/** An inbox replay after a daemon restart must not create or amend the owner's work twice. */
+export const applyCloudOwnerMessage = (event: Event, handle = handleOwnerMessage) => receiveMessage("cloud", event.id,
+  { text: event.text, reply_to: event.ref, attachments: event.attachments ?? [], thread: event.thread === true }, () => event,
+  async (ev, first) => {
+    if (first) appendEvent(ev, { mirror: false });
+    await handle(ev.text, ev.ref, false, { paths: ev.attachments, key: ev.id, sentAt: ev.ts, thread: ev.thread });
+  });
+
+function reportActionFailure(key: string, data: Record<string, unknown>, ref?: string) {
+  const id = `action-warning-${key}`;
+  if (feed("", 2000).some((event) => event.id === id)) return;
+  appendEvent({ id, from: "hub", kind: "system", ref: typeof data.id === "string" ? data.id : ref, thread: true,
+    text: String(data.error ?? "The change was not confirmed. Check the team's records before trying again.") });
+}
+
+async function call(cfg: Cfg, path: string, init: RequestInit = {}, timeoutMs = 15_000, signal?: AbortSignal) {
+  const r = await fetch(base(cfg) + path, { ...init, headers: headers(cfg), signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]) }).catch(() => null);
   if (!r?.ok) return null;
   return r.json() as Promise<any>;
 }
 
 /** One of the Worker's media files ("/media/<id>": the owner's uploaded images), as bytes. */
-export async function cloudMedia(cfg: Cfg, path: string): Promise<Uint8Array | null> {
+export async function cloudMedia(cfg: Cfg, path: string, signal?: AbortSignal): Promise<Uint8Array | null> {
   if (!/^\/media\/[\w.\-]+$/.test(path)) return null;
-  const r = await fetch(base(cfg) + path, { headers: { Authorization: `Bearer ${cfg.server?.token}` }, signal: AbortSignal.timeout(60_000) }).catch(() => null);
+  const r = await fetch(base(cfg) + path, { headers: { Authorization: `Bearer ${cfg.server?.token}` }, signal: AbortSignal.any([AbortSignal.timeout(60_000), ...(signal ? [signal] : [])]) }).catch(() => null);
   return r?.ok ? new Uint8Array(await r.arrayBuffer()) : null;
 }
 
-/** Primary: run the bridge loop. */
+// Read again after each cycle: settings from the UI arrive through the shared mirror without a daemon restart.
+function pollMilliseconds() {
+  try {
+    const seconds = loadConfig().cloud?.poll_seconds;
+    if (Number.isInteger(seconds) && seconds >= 1 && seconds <= 60) return seconds * 1000;
+  } catch { /* A temporarily unreadable config must not spin the bridge. */ }
+  return 3000;
+}
+
+/** Primary: run the bridge loops; stop aborts transport and waits for any already-started owner action. */
 export function startCloudBridge(cfg: Cfg) {
-  if (!base(cfg) || !cfg.server?.token) return;
+  if (!base(cfg) || !cfg.server?.token) return async () => {};
+  const lifetime = new AbortController();
+  // Finish an accepted message's images and final feed events while shutdown aborts new polling.
+  const mirrorLifetime = new AbortController();
+  let stopped = false, timer: ReturnType<typeof setTimeout> | undefined, inboxTimer: ReturnType<typeof setTimeout> | undefined;
+  let acceptingEvents = true;
+  let wakeInbox: (() => void) | undefined, stopping: Promise<void> | undefined;
+  const request = (path: string, init?: RequestInit, timeout?: number) => stopped ? Promise.resolve(null) : call(cfg, path, init, timeout, lifetime.signal);
   const pending: Event[] = [];
   // an event's images live in this machine's media folder ("/media/<name>"): upload them first, then point the event at the copies
   const upload = async (url: string): Promise<string | null> => {
@@ -38,10 +73,11 @@ export function startCloudBridge(cfg: Cfg) {
     if (!url.startsWith("/media/") || !existsSync(f)) return url;
     const fd = new FormData();
     fd.append("file", Bun.file(f), basename(f));
-    const r = await fetch(base(cfg) + "/api/media", { method: "POST", body: fd, headers: { Authorization: `Bearer ${cfg.server?.token}` }, signal: AbortSignal.timeout(60_000) }).catch(() => null);
+    const r = await fetch(base(cfg) + "/api/media", { method: "POST", body: fd, headers: { Authorization: `Bearer ${cfg.server?.token}` }, signal: AbortSignal.any([AbortSignal.timeout(60_000), mirrorLifetime.signal]) }).catch(() => null);
     return r?.ok ? ((await r.json()) as { url: string }).url : null;
   };
-  const flush = async () => {
+  let flushing: Promise<void> | undefined;
+  const flush = () => flushing ??= (async () => {
     while (pending.length) {
       const e = pending[0];
       if (e.attachments?.length) {
@@ -49,69 +85,103 @@ export function startCloudBridge(cfg: Cfg) {
         if (urls.some((u) => !u)) return; // retry on the next poll
         pending[0] = { ...e, attachments: urls as string[] };
       }
-      if (!(await call(cfg, "/api/events", { method: "POST", body: JSON.stringify(pending[0]) }))) return;
+      if (!(await call(cfg, "/api/events", { method: "POST", body: JSON.stringify(pending[0]) }, 15_000, mirrorLifetime.signal))) return;
       pending.shift();
     }
-  };
-  setMirror((e) => { pending.push(e); void flush(); });
+  })().finally(() => { flushing = undefined; });
+  setMirror((e) => { if (acceptingEvents) { pending.push(e); void flush().catch((err) => console.error(`cloud bridge: ${err}`)); } });
 
-  let after = 0, n = 0, busy = false, lastStatus = "", lastShape = "", lastPush = 0;
+  const uiResults = new Map<string, UiResult>();
+  let after = 0, lastStatus = "", lastShape = "", lastPush = 0, pushing: Promise<void> | undefined;
   // push the dashboard at once when its shape changes (an answered decision must leave "Needs your decision" at once); live agent
   // activity alone is pushed at most once a minute, and an unchanged dashboard every ~5 min (Worker writes are budgeted)
-  const pushStatus = async (force = false) => {
+  const pushStatus = () => pushing ??= (async () => {
+    if (stopped) return;
     const s = status();
     const st = JSON.stringify(s);
     const shape = JSON.stringify({ ...s, active: s.active.map(({ activity: _, ...t }) => t) });
-    const due = shape !== lastShape || (st !== lastStatus && Date.now() - lastPush > 60_000) || force;
+    const due = shape !== lastShape || (st !== lastStatus && Date.now() - lastPush > 60_000) || Date.now() - lastPush >= 300_000;
     if (!due) return;
-    if (await call(cfg, "/api/host/state", { method: "PUT", body: JSON.stringify({ status: s, settings: settingsView() }) })) {
+    if (await request("/api/host/state", { method: "PUT", body: JSON.stringify({ status: s, settings: settingsView(), ui_api: 1 }) })) {
       lastStatus = st; lastShape = shape; lastPush = Date.now();
     }
-  };
+  })().finally(() => { pushing = undefined; });
   // housekeeping every few seconds: mirror events up, push the dashboard
   const loop = async () => {
-    if (busy) return; busy = true;
+    if (stopped) return;
     try {
       await flush();
-      await pushStatus(n++ % 100 === 0); // a forced re-push every ~5 min; the Worker skips unchanged writes
-    } catch (err) { console.error(`cloud bridge: ${err}`); }
-    busy = false;
+      await pushStatus();
+    } catch (err) { if (!stopped) console.error(`cloud bridge: ${err}`); }
+    if (!stopped) timer = setTimeout(() => { timer = undefined; loopRun = loop(); }, pollMilliseconds());
   };
   // the owner→fleet inbox, long-polled: the Worker holds the request until a message arrives, so the chat brain here
   // gets it within milliseconds (the owner's model login never leaves this machine; only the message and the reply travel)
   const inbox = async () => {
-    for (;;) {
+    while (!stopped) {
       const t0 = Date.now();
       try {
-        const r = await call(cfg, `/api/host/inbox?after=${after}&wait=25`, {}, 40_000);
+        const r = await request(`/api/host/inbox?after=${after}&wait=25`, {}, 40_000);
         for (const it of r?.items ?? []) {
+          if (stopped) break;
+          try {
           if (it.type === "message") {
             const e = it.event as Event;
-            appendEvent(e, { mirror: false }); // keep the local record (learning reads it); the cloud already has it
-            await handleOwnerMessage(e.text, e.ref, false, { paths: e.attachments, key: e.id, fetch: (p) => cloudMedia(cfg, p), sentAt: e.ts, thread: e.thread });
+            const result = await applyCloudOwnerMessage(e, (text, ref, amend, options) => handleOwnerMessage(text, ref, amend, { ...options, fetch: (p) => cloudMedia(cfg, p, mirrorLifetime.signal) }));
+            if (result.status !== 200) throw new ActionSyncError(String(result.data.error), result.data);
+          } else if (it.type === "ui-request" && typeof it.id === "string") {
+            await applyUiRequest(it.id, request, (req, projectFolder) => recordRequest(req, undefined, projectFolder), uiResults);
           } else if (it.type === "op" && it.op) {
-            await applyOp(it.op);
+            const result = await applyOp(it.op) as { ok?: boolean; error?: string; data?: Record<string, unknown> } | null;
+            if (!result || result.ok === false || result.data?.ok === false) throw new ActionSyncError(String(result?.error ?? result?.data?.error ?? "The action was not confirmed"), result?.data ?? { id: it.op.id });
+            if (it.op.tool === "configure_task") {
+              appendEvent({ id: crypto.randomUUID(), ts: new Date().toISOString(), from: "hub", kind: "system", ref: it.op.id, thread: true,
+                text: "Run settings updated. The scheduler will use your chosen machine requirements." });
+            }
           } else if (it.type === "cancel" && typeof it.id === "string") {
-            await cancelTask(it.id, it.done === true);
+            const result = await cancelTask(it.id, it.done === true);
+            if (result !== "cancelled" && result !== "done") throw new ActionSyncError(`Could not ${it.done ? "finish" : "cancel"} ${it.id}: ${result}`, { id: it.id });
           } else if (it.type === "update") {
-            await updateFleet();
+            if (await updateFleet() !== "ok") throw new ActionSyncError("The fleet update could not be started. Reconnect the main machine and try again.");
           } else if (it.type === "settings") {
             await saveSettings(it.patch);
-            await call(cfg, "/api/host/state", { method: "PUT", body: JSON.stringify({ settings: settingsView() }) });
+            await request("/api/host/state", { method: "PUT", body: JSON.stringify({ settings: settingsView() }) });
+          }
+          } catch (error) {
+            if (!(error instanceof ActionSyncError)) throw error;
+            reportActionFailure(String(it.seq), error.data, it.event?.ref ?? it.op?.id ?? it.id);
+            if (error.data.retryable === true) throw error;
           }
           after = it.seq;
         }
         if (r?.items?.length) await pushStatus();
-      } catch (err) { console.error(`cloud bridge inbox: ${err}`); }
+      } catch (err) { if (!stopped) console.error(`cloud bridge inbox: ${err}`); }
       // an older Worker (no long-poll) or an error answers at once: don't spin
-      const left = (cfg.cloud?.poll_seconds ?? 3) * 1000 - (Date.now() - t0);
-      if (left > 0) await Bun.sleep(left);
+      const left = pollMilliseconds() - (Date.now() - t0);
+      if (!stopped && left > 0) await new Promise<void>((resolve) => {
+        wakeInbox = resolve;
+        inboxTimer = setTimeout(() => { inboxTimer = undefined; wakeInbox = undefined; resolve(); }, left);
+      });
     }
   };
-  void loop();
-  void inbox();
-  setInterval(loop, (cfg.cloud?.poll_seconds ?? 3) * 1000);
+  let loopRun = loop();
+  const inboxRun = inbox();
   console.log(`cloud bridge → ${base(cfg)}`);
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    if (inboxTimer) clearTimeout(inboxTimer);
+    wakeInbox?.();
+    lifetime.abort();
+    return stopping ??= (async () => {
+      await Promise.allSettled([loopRun, inboxRun, pushing]);
+      // Let an owner action already underway publish its final feed events before closing the mirror.
+      acceptingEvents = false;
+      try { await flush(); }
+      catch (err) { console.error(`cloud bridge: ${err}`); }
+      finally { mirrorLifetime.abort(); pending.length = 0; }
+    })();
+  };
 }
 
 /** Web Push VAPID keypair: generated once, kept in ~/.noop/vapid.json (0600) so redeploys keep phones subscribed. */

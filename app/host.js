@@ -29,6 +29,39 @@ async function put(key, value) {
   });
 }
 
+/** Pending actions need a transaction acknowledgement, including abort/error, before they are sent. */
+async function pendingDocument(scope, text, expected) {
+  if (typeof scope !== "string" || !/^[a-f0-9]{64}$/.test(scope)) throw new Error("Invalid pending-action storage scope");
+  if (text !== undefined && typeof text !== "string") throw new Error("Pending-action storage requires text");
+  const writing = text !== undefined;
+  if (writing && expected !== null && typeof expected !== "string") throw new Error("Pending-action storage requires its previous value");
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    let value, failure;
+    const fail = (error) => { d.close(); reject(error ?? new Error("Pending-action storage transaction failed")); };
+    try {
+      const t = d.transaction(STORE, writing ? "readwrite" : "readonly");
+      t.onabort = () => fail(failure ?? t.error ?? new Error("Pending-action storage transaction was aborted"));
+      t.onerror = () => fail(t.error);
+      t.oncomplete = () => {
+        d.close();
+        if (writing) resolve({ scope, saved: true });
+        else if (value === undefined || value === null || typeof value === "string") resolve({ scope, text: value ?? null });
+        else reject(new Error("Saved pending actions are not text"));
+      };
+      const store = t.objectStore(STORE), request = store.get(`pending:${scope}`);
+      request.onsuccess = () => {
+        value = request.result;
+        if (!writing) return;
+        try {
+          if ((value ?? null) !== expected) throw new Error("Saved pending actions changed in another window. Reload before trying again.");
+          store.put(text, `pending:${scope}`);
+        } catch (error) { failure = error; t.abort(); }
+      };
+    } catch (error) { fail(error); }
+  });
+}
+
 const ua = () => (typeof navigator === "undefined" ? "" : navigator.userAgent);
 const isIos = () => /iPhone|iPad|iPod/.test(ua()) || (/Macintosh/.test(ua()) && navigator.maxTouchPoints > 1);
 const standalone = () =>
@@ -115,6 +148,11 @@ export function createHost(player) {
   }
   return {
     async call(name, args = {}) {
+      if (name === "pendingRead") return pendingDocument(args.scope);
+      if (name === "pendingWrite") {
+        if (typeof args.text !== "string") throw new Error("Pending-action storage requires text");
+        return pendingDocument(args.scope, args.text, args.expected);
+      }
       if (typeof location === "undefined") return {}; // headless test runs have no page
       switch (name) {
         case "page": {

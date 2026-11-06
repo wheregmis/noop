@@ -3,16 +3,16 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { type Cfg, P, journal, list, nextId, now, readDoc, writeDoc } from "./core";
 import { notify } from "./notify";
+import { autonomyLevel, type AutonomyLevel } from "../cloud/src/configuration";
 
-export type Level = "onboarding" | "assisted" | "autonomous";
+export type Level = AutonomyLevel;
 /** Global level, optionally overridden per agent ([autonomy.agents] reviewer = "assisted") as trust is earned. */
-export const level = (cfg: Cfg, agent?: string): Level =>
-  (agent && cfg.autonomy?.agents?.[agent]) || cfg.autonomy?.level || "onboarding";
+export const level = autonomyLevel;
 
 /** Should a task from this source wait for owner approval? Owner-created & approved work never does. */
-export function needsApproval(cfg: Cfg, source: string): boolean {
+export function needsApproval(cfg: Cfg, source: string, agent?: string): boolean {
   if (/^owner|^override|^approved|^decision/.test(source)) return false;
-  const l = level(cfg);
+  const l = level(cfg, agent);
   if (l === "autonomous") return false;
   if (l === "assisted") return /^followup/.test(source) && cfg.autonomy?.assisted_approve_followups === true;
   // read-only routines ([[routine]] readonly = true, or [autonomy] auto_routines) only observe; whatever they
@@ -25,13 +25,14 @@ export function needsApproval(cfg: Cfg, source: string): boolean {
 
 const QUEUED = ["inbox", "active", "waiting", "blocked"];
 const PARKED_COPY_MS = 6 * 3600_000;
-const isRoutine = (m: Record<string, string>, name: string) => (m.source ?? "").replace(/^approved:/, "") === `routine:${name}`;
+const isRoutine = (m: Record<string, string>, name: string, host?: string) => (m.source ?? "").replace(/^approved:/, "") === `routine:${name}`
+  && (!host || !m.scheduled_by || m.scheduled_by === host);
 
 /** Id of a copy of this routine that is queued or running (so a new run would be redundant), else "". */
-export function routineQueued(name: string): string {
+export function routineQueued(name: string, host?: string): string {
   for (const s of QUEUED) for (const p of list(P("tasks", s), /^T-.*\.md$/)) {
     const m = readDoc(p).meta;
-    if (!isRoutine(m, name)) continue;
+    if (!isRoutine(m, name, host)) continue;
     // an old copy parked on something slow (the owner clicking merge) must not starve the routine's other work
     if ((s === "waiting" || s === "blocked") && Date.now() - Date.parse(m.created ?? "") > PARKED_COPY_MS) continue;
     return m.id;
@@ -40,11 +41,11 @@ export function routineQueued(name: string): string {
 }
 
 /** A newer run of a routine replaces its older unapproved copies: move them to rejected with a note. */
-export function supersedeProposed(name: string, newId: string): string[] {
+export function supersedeProposed(name: string, newId: string, host?: string): string[] {
   const out: string[] = [];
   for (const p of list(P("tasks", "proposed"), /^T-.*\.md$/)) {
     const { meta, body } = readDoc(p);
-    if (meta.id === newId || !isRoutine(meta, name)) continue;
+    if (meta.id === newId || !isRoutine(meta, name, host)) continue;
     writeDoc(P("tasks", "rejected", `${meta.id}.md`), { ...meta, approval: `superseded:${newId}` }, body + `\n\n## Note\nsuperseded by ${newId}\n`);
     unlinkSync(p);
     out.push(meta.id);

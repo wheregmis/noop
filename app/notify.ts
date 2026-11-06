@@ -8,6 +8,18 @@ export type NotifyEvent = { kind: string; from?: unknown; text?: unknown; priori
 const KINDS = ["decision", "menu", "proposals", "login", "notice"];
 const TITLES: Record<string, string> = { decision: "Needs your decision", menu: "Pick the next step", proposals: "New proposals", login: "Sign-in alert", notice: "Noop" };
 
+/** Validate named zones in the runtime that will evaluate the preference. */
+export function notificationTimeZone(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim().length > 100 || !/^[A-Za-z_+-]+(?:\/[A-Za-z0-9_+.-]+)*$/.test(value.trim())) return null;
+  try { return new Intl.DateTimeFormat("en", { timeZone: value.trim() }).resolvedOptions().timeZone; }
+  catch { return null; }
+}
+
+export function deviceTimeZone(): string {
+  try { return notificationTimeZone(new Intl.DateTimeFormat().resolvedOptions().timeZone) ?? "UTC"; }
+  catch { return "UTC"; }
+}
+
 /** Is `now` inside the quiet hours (`{start, end}` from the app, "23:00-08:00" written by hand) in `tz`? */
 export function inQuiet(range: Quiet | undefined, tz: string | undefined, now = new Date()) {
   const text = range && typeof range === "object" ? `${range.start}-${range.end}` : range;
