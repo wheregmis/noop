@@ -305,6 +305,7 @@ function noteUnservable(cfg: Cfg, host: string) {
     if (!hosts.some((h) => reqs.every((r) => capOk(r, h.caps)))) {
       writeDoc(p, { ...meta, parked: now() }, body);
       journal(host, `🅿️ ${meta.id} parked until a host with ${reqs.join("+")} comes online`);
+      void notify(`${meta.id} "${meta.title}" can't run: no online host has ${reqs.join("+")}. It stays parked until one comes online.`, cfg, { ref: meta.id });
     }
   }
   for (const p of list(P("tasks", "inbox"), /^T-.*\.md$/)) { // unpark when capable host returns
