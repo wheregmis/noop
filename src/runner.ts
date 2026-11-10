@@ -44,7 +44,8 @@ Write summary, question and options in the owner's language (${L("English", "Sim
 Only use needs_decision after doing all preparation that does not depend on the answer.
 Never sit idle waiting on something slow (GitHub Actions/CI, a release, a review, a deploy): if the next step needs it, return "waiting" with waiting_on, wait_minutes and wait_check.
 Before returning "waiting", do every part of the task that does not depend on the condition (other platforms, docs, tests, screenshots, the next PR): implement and let CI verify rather than wait for a host. Waiting on another PR to merge is not a reason to stop: build on its branch or merge it locally, and note the dependency.
-The machine then runs other work and wakes you later with your notes; check the condition first, then continue from where you left off.`;
+The machine then runs other work and wakes you later with your notes; check the condition first, then continue from where you left off.
+A sub-agent (Task/Agent tool) is never woken once it replies, and the run ends when only its background commands are left: tell each sub-agent to run its commands in the foreground and reply only when finished, and never end a turn with "waiting for" a sub-agent without the json block.`;
 
 export function buildPrompt(meta: Record<string, string>, body: string, cfg: Cfg, resourceNote = ""): string {
   const agent = meta.agent || "lead";
