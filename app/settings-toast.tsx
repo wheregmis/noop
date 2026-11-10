@@ -1,6 +1,9 @@
 import { cleanup, Overlay, platform, reduceMotion, safeArea, signal, Text } from "nsh";
 import { Toast, ToastManager, ToastStack, type ToastEntry } from "nsh/base";
-import { colors, Icon, radius } from "./ui";
+import { colors, Icon, menuPopup } from "./ui";
+
+/** A phone shows it as a banner under the status bar; a desktop or the web at the bottom right, as their notices do. */
+const mobile = platform.os === "ios" || platform.os === "android";
 
 /** One retained save confirmation, shared by all settings pages. */
 export function createSettingsToast() {
@@ -36,8 +39,12 @@ export function createSettingsToast() {
 
 export function SettingsToast(props: { state: ReturnType<typeof createSettingsToast> }) {
   return (
-    <Overlay style={{ pointerEvents: "box-none", left: 0, right: 0, bottom: 0, paddingHorizontal: 16, paddingBottom: safeArea().bottom + 16, alignItems: "center" }}>
-      <ToastStack closeOnEscape={platform.os !== "ios" && platform.os !== "android"} placement="bottomCenter" style={{ width: 280, maxWidth: "100%" }}
+    <Overlay
+      style={mobile
+        ? { pointerEvents: "box-none", left: 0, right: 0, top: 0, paddingTop: safeArea().top + 8, paddingHorizontal: 12, alignItems: "center" }
+        : { pointerEvents: "box-none", right: 0, bottom: 0, padding: 16, alignItems: "flex-end" }}
+    >
+      <ToastStack closeOnEscape={!mobile} placement={mobile ? "topCenter" : "bottomRight"} style={{ width: mobile ? "100%" : 300, maxWidth: mobile ? 420 : "100%" }}
         motion={reduceMotion() ? { duration: 0 } : undefined}
         onExpandedChange={({ expanded }) => props.state.expanded.set(expanded)}
         onCancel={props.state.dismiss}>
@@ -46,11 +53,18 @@ export function SettingsToast(props: { state: ReturnType<typeof createSettingsTo
             <Toast testID="settings-toast" transitionStatus={entry().status}
               accessibilityLabel={String(entry().value)} onDismissRequest={props.state.dismiss}
               class="transition-all duration-200 motion-reduce:transition-none"
-              startingClass={reduceMotion() ? "" : "opacity-0 translate-y-2"}
-              endingClass="opacity-0" swipingClass="transition-none"
-              style={{ flexDirection: "row", alignItems: "center", gap: 10, padding: 14, borderRadius: radius.inset, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.raised }}>
-              <Icon name="check" size={18} tint={colors.up} />
-              <Text style={{ fontSize: 14, color: colors.text }}>{String(entry().value)}</Text>
+              startingClass={reduceMotion() ? "" : mobile ? "opacity-0 -translate-y-3" : "opacity-0 translate-y-2"}
+              endingClass={mobile ? "opacity-0 -translate-y-3" : "opacity-0"} swipingClass="transition-none"
+              style={{
+                ...menuPopup(),
+                minWidth: 0,
+                flexDirection: "row", alignItems: "center", gap: 10,
+                paddingHorizontal: 14, paddingVertical: mobile ? 12 : 10,
+                // a phone's banner is a rounder capsule, as the system's
+                ...(mobile ? { borderRadius: 18 } : {}),
+              }}>
+              <Icon name="check" size={16} tint={colors.up} />
+              <Text style={{ flex: 1, minWidth: 0, fontSize: mobile ? 15 : 13.5, color: colors.text }}>{String(entry().value)}</Text>
             </Toast>
           )}
         </Each>

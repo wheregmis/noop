@@ -56,34 +56,47 @@ runs:
         test -f "$ANDROID_HOME/platforms/android-35/android.jar"
 
     # Use the prebuilt NSH nightly when it is exactly the pinned commit: it has the CLI and every runtime in the
-    # release layout, so packaging skips the Rust build. Intel macOS and iOS (the nightly has no iOS runtime) build from source; the
-    # Linux runtime is still built here because noop's is built without WebKitGTK.
+    # release layout, so packaging skips the Rust build, Intel macOS and iOS included. The Linux runtime is still
+    # built here because the nightly's links WebKitGTK and noop's is built without it. An iOS runtime linked with an
+    # SDK older than 27 falls back to a source build.
     - id: nightly
-      if: steps.cache.outputs.cache-hit != 'true' && inputs.rust-target == '' && inputs.target != 'ios'
+      if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         REF: ${{ inputs.ref }}
+        TARGET: ${{ inputs.target }}
+        RUST_TARGET: ${{ inputs.rust-target }}
       run: |
         commit="$(gh release view nightly -R longbridge/nsh --json targetCommitish -q .targetCommitish || true)"
         if [ "$commit" != "$REF" ]; then
           echo "NSH nightly is $commit, not $REF: building from source"
           exit 0
         fi
-        case "$RUNNER_OS-$RUNNER_ARCH" in
-          Linux-X64) asset=nsh-linux-x86_64.tar.gz ;;
-          macOS-ARM64) asset=nsh-macos-arm64.tar.gz ;;
-          Windows-X64) asset=nsh-windows-x86_64.zip ;;
-          *) echo "No NSH nightly for $RUNNER_OS-$RUNNER_ARCH: building from source"; exit 0 ;;
+        case "$RUNNER_OS-$RUNNER_ARCH-$RUST_TARGET" in
+          Linux-X64-) asset=nsh-linux-x86_64.tar.gz ;;
+          macOS-ARM64-) asset=nsh-macos-arm64.tar.gz ;;
+          macOS-ARM64-x86_64-apple-darwin) asset=nsh-macos-x86_64.tar.gz ;;
+          Windows-X64-) asset=nsh-windows-x86_64.zip ;;
+          *) echo "No NSH nightly for $RUNNER_OS-$RUNNER_ARCH $RUST_TARGET: building from source"; exit 0 ;;
         esac
+        assets=("$asset")
+        [ "$TARGET" != ios ] || assets+=(nsh-ios-macos-arm64.tar.gz)
         tmp="$RUNNER_TEMP/nsh-nightly"
         rm -rf "$tmp" && mkdir -p "$tmp"
-        gh release download nightly -R longbridge/nsh -p "$asset" -p "$asset.sha256" -D "$tmp"
-        (cd "$tmp" && sha256sum -c "$asset.sha256" 2>/dev/null || shasum -a 256 -c "$asset.sha256")
-        case "$asset" in
-          *.zip) unzip -q "$tmp/$asset" -d "$tmp/x" ;;
-          *) mkdir -p "$tmp/x" && tar xzf "$tmp/$asset" -C "$tmp/x" ;;
-        esac
+        mkdir -p "$tmp/x"
+        for a in "${assets[@]}"; do
+          gh release download nightly -R longbridge/nsh -p "$a" -p "$a.sha256" -D "$tmp"
+          (cd "$tmp" && sha256sum -c "$a.sha256" 2>/dev/null || shasum -a 256 -c "$a.sha256")
+          case "$a" in
+            *.zip) unzip -q -o "$tmp/$a" -d "$tmp/x" ;;
+            *) tar xzf "$tmp/$a" -C "$tmp/x" ;;
+          esac
+        done
+        if [ "$TARGET" = ios ] && ! bash "$GITHUB_WORKSPACE/scripts/check-ios-sdk.sh" "$tmp/x/nsh/runtime/ios/iphoneos/nsh-ios-app"; then
+          echo "NSH nightly iOS runtime is linked with an older SDK: building from source"
+          exit 0
+        fi
         rm -rf "$HOME/.nsh-dist" && mkdir -p "$HOME/.nsh-dist"
         cp -R "$tmp/x/nsh/bin" "$tmp/x/nsh/runtime" "$HOME/.nsh-dist/"
         echo "used=true" >> "$GITHUB_OUTPUT"

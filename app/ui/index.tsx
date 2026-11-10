@@ -4,7 +4,7 @@ import { reduceMotion } from "nsh";
 import { type AnimatedValue, createAnimatedValue } from "nsh";
 import { platform } from "nsh";
 import { keymap } from "nsh";
-import { Button as BaseButton, Sheet as BaseSheet, Switch, Tooltip } from "nsh/base";
+import { Button as BaseButton, Sheet as BaseSheet, Switch } from "nsh/base";
 import { safeArea } from "nsh";
 import { Icon, type IconName } from "./icons";
 import { createPresence, type PopupSide } from "./popup";
@@ -17,6 +17,9 @@ export * from "./data-table";
 export * from "./slider";
 export * from "./scrollbar-theme";
 export * from "./avatar";
+export * from "./menu";
+export * from "./sidebar";
+export * from "./settings";
 
 /**
  * The thumb of a resize handle (`handleThumbClass`), as gpui-component
@@ -268,28 +271,6 @@ export function Figure(props: { value: string; unit?: string; note?: string; ton
   );
 }
 
-/** A small label in a tinted capsule. */
-export function Badge(props: { label: string; tone?: Tone; outline?: boolean }) {
-  const tone = () => props.tone ?? "neutral";
-  return (
-    <View
-      style={{
-        paddingHorizontal: 10,
-        height: 26,
-        borderRadius: 13,
-        justifyContent: "center",
-        backgroundColor: props.outline ? "transparent" : toneTint(tone()),
-        boxShadow: props.outline ? undefined : finish.chip.boxShadow,
-        borderWidth: 1,
-        borderColor: props.outline ? toneColor(tone()) : alpha(tone() === "neutral" ? colors.text : toneColor(tone()), 0.1),
-      }}
-    >
-      <Text style={{ fontSize: 12, fontWeight: "500", color: tone() === "neutral" ? colors.text : toneColor(tone()) }}>{props.label}</Text>
-    </View>
-  );
-}
-
-/** A label above a value, for grids of figures. */
 export function Stat(props: { label: string; value: string; tone?: Tone; width?: `${number}%` }) {
   return (
     <View style={{ width: props.width, gap: 3, paddingVertical: 4 }}>
@@ -339,7 +320,6 @@ export function Row(props: { first?: boolean; onPress?: () => void; children: JS
   );
 }
 
-export type ButtonVariant = "primary" | "secondary" | "accent" | "ghost" | "danger";
 
 /** A ring turning with its top arc in `tint`: work going on. */
 export function Spinner(props: { size: number; tint: string }) {
@@ -361,156 +341,6 @@ export function Spinner(props: { size: number; tint: string }) {
   );
 }
 
-/** A button's heights and label sizes, by size: compact with a pointer, roomier on a touch screen. */
-const buttonSizes = pointer
-  ? { small: { height: 24, font: 12, icon: 12, pad: 8 }, regular: { height: 28, font: 13, icon: 14, pad: 12 }, large: { height: 34, font: 14, icon: 15, pad: 16 } }
-  : { small: { height: 36, font: 14, icon: 14, pad: 12 }, regular: { height: 40, font: 15, icon: 16, pad: 16 }, large: { height: 48, font: 17, icon: 18, pad: 20 } };
-
-/**
- * A button: 28 pt tall on a desktop, 40 on a touch screen (`small` 24 / 36,
- * `large` 34 / 48). `primary` and `accent` are the citrus fill (the main
- * action), `secondary` a raised neutral, `ghost` bare until the pointer is
- * over it, `danger` a destructive action: the danger tone's tint, edge and
- * text on the raised finish's drop, as quiet as `secondary`. A `color`
- * fills it with that color instead. Under the pointer a raised button
- * lightens, pressed it sinks (an inner shade, and 3% smaller). `busy`
- * puts a spinner in the icon's place and takes no presses; a new icon or
- * the spinner grows in. Its width follows the label at once: a layout
- * animation would move every frame of the update, app-wide (a list
- * refreshing beside it too), so the motion stays on the glyph's own
- * opacity and scale.
- */
-export function Button(props: {
-  label: string;
-  variant?: ButtonVariant;
-  color?: string;
-  icon?: IconName;
-  disabled?: boolean;
-  /** Work started by it is going on: a spinner, no presses (not dimmed). */
-  busy?: boolean;
-  /** Grows to share a row with its siblings. */
-  flex?: number;
-  size?: "small" | "regular" | "large";
-  /** Shown as chosen: what it opens is open (a menu's or a popover's
-   * trigger), or it is on. A ghost button keeps the hover's `accent` fill, a
-   * raised one its pressed look, a filled one its pressed shade. */
-  selected?: boolean;
-  onPress: () => void;
-}) {
-  const dims = () => buttonSizes[props.size ?? "regular"];
-  // `nsh/base`'s Button gives the behavior (presses, disabled, the button
-  // role); the look below is the gallery's own.
-  const scale = createAnimatedValue(1);
-  // The leading glyph (the icon, or the spinner while busy) grows in each
-  // time it changes; at once with reduced motion.
-  const glyph = createAnimatedValue(1);
-  let shownGlyph = props.busy ? "busy" : props.icon;
-  effect(() => {
-    const next = props.busy ? "busy" : props.icon;
-    if (next === shownGlyph) return;
-    shownGlyph = next;
-    if (reduceMotion()) return;
-    glyph.set(0);
-    glyph.spring(1, motion.control);
-  });
-  const variant = () => props.variant ?? "primary";
-  const filled = () => !props.color && (variant() === "primary" || variant() === "accent");
-  const height = () => dims().height;
-  const danger = () => !props.color && variant() === "danger";
-  const fg = () => (props.color ? "#ffffff" : filled() ? colors.onAccent : danger() ? colors.danger : colors.text);
-  const look = (): ViewStyle =>
-    props.color
-      ? { backgroundColor: props.color, borderColor: "transparent", opacity: props.selected ? 0.88 : 1 }
-      : danger()
-        ? {
-            backgroundColor: props.selected ? alpha(colors.danger, 0.2) : tints.danger,
-            backgroundImage: "none",
-            borderColor: alpha(colors.danger, 0.32),
-            boxShadow: finish.raised.boxShadow,
-          }
-      : variant() === "ghost"
-        ? { backgroundColor: props.selected ? token("accent") : "transparent", borderColor: "transparent" }
-        : filled()
-          ? { ...finish.accent, opacity: props.selected ? 0.88 : 1 }
-          : props.selected
-            ? finish.pressed
-            : finish.raised;
-  return (
-    <BaseButton
-      // Busy, it keeps its focus and its look and takes no second press.
-      onPress={() => !props.busy && props.onPress()}
-      onPressDown={() => !props.busy && scale.spring(0.97, motion.press)}
-      onPressUp={() => scale.spring(1, motion.press)}
-      disabled={props.disabled}
-      accessibilityLabel={props.label}
-      selected={props.selected}
-      hoverStyle={props.disabled || props.selected || props.busy ? undefined : props.color || filled() ? { opacity: 0.94 } : danger() ? { backgroundColor: alpha(colors.danger, 0.16) } : variant() === "ghost" ? hovered() : finish.hover}
-      activeStyle={props.disabled || props.busy ? undefined : props.color || filled() ? { opacity: 0.88 } : danger() ? { backgroundColor: alpha(colors.danger, 0.22), boxShadow: "none" } : finish.pressed}
-      focusStyle={focusRing()}
-      style={{
-        flex: props.flex,
-        height: height(),
-        paddingHorizontal: dims().pad,
-        borderRadius: radius.control,
-        borderCurve: "continuous",
-        borderWidth: 1,
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: pointer ? 6 : 8,
-        opacity: props.disabled ? 0.4 : 1,
-        ...look(),
-        transform: [{ scale }],
-        transitionProperty: "background-color, border-color, box-shadow, opacity",
-        transitionDuration: 120,
-      }}
-    >
-      <If when={props.busy || props.icon}>
-        <View style={{ opacity: glyph, transform: [{ scale: glyph.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1] }) }] }}>
-          <If when={props.busy} else={<Icon name={props.icon!} size={dims().icon} tint={fg()} />}>
-            <Spinner size={dims().icon} tint={fg()} />
-          </If>
-        </View>
-      </If>
-      <Text style={{ fontSize: dims().font, fontWeight: "500", color: fg() }}>{props.label}</Text>
-    </BaseButton>
-  );
-}
-
-export function RoundButton(props: {
-  icon: IconName;
-  label: string;
-  variant?: "primary" | "secondary";
-  size?: number;
-  disabled?: boolean;
-  onPress: () => void;
-}) {
-  const size = props.size ?? (pointer ? 28 : 40);
-  const primary = () => (props.variant ?? "primary") === "primary";
-  return (
-    <Press
-      onPress={props.onPress}
-      disabled={props.disabled}
-      scale={0.92}
-      accessibilityLabel={props.label}
-      hoverStyle={primary() ? { opacity: 0.94 } : finish.hover}
-      style={{
-        width: size,
-        height: size,
-        borderRadius: size / 2,
-        alignItems: "center",
-        justifyContent: "center",
-        borderWidth: 1,
-        ...(primary() ? finish.accent : finish.raised),
-        transitionProperty: "background-color, border-color, box-shadow, opacity",
-        transitionDuration: 120,
-      }}
-    >
-      <Icon name={props.icon} size={size * 0.42} tint={primary() ? colors.onLight : colors.text} />
-    </Press>
-  );
-}
-
 /** A titled section of controls (the demos' sections): `Card`'s look, `note` at its trailing edge. */
 export function Section(props: { title: string; note?: string; style?: ViewStyle; children: JSX.Element }) {
   return (
@@ -524,79 +354,6 @@ export function Section(props: { title: string; note?: string; style?: ViewStyle
       {props.children}
     </Card>
   );
-}
-
-/**
- * An on / off switch (`nsh/base`'s `Switch`, in the gallery's look): the
- * knob springs across, the track changes color natively.
- */
-export function Toggle(props: { value: boolean; onChange: (value: boolean) => void; label?: string; testID?: string }) {
-  const look = switchLook(() => props.value);
-  return (
-    <Switch
-      testID={props.testID}
-      checked={props.value}
-      onChange={({ checked }) => props.onChange(checked)}
-      accessibilityLabel={props.label}
-      // 8 pt more to press on every side (a hit slop around the small
-      // track), without taking more room.
-      style={{ margin: -8, padding: 8 }}
-      trackStyle={look.trackStyle}
-      thumbStyle={look.thumbStyle}
-    />
-  );
-}
-
-/**
- * The gallery's switch, as the styles of `Switch`'s parts: a track sunk
- * into the surface that turns citrus, and a knob that springs across, both
- * natively. The knob keeps its size on and off; on, it is white with an
- * olive edge. `on` is the value the app owns: the knob follows it, from a
- * press or from elsewhere. 28 × 16 on a desktop; on a touch screen 42 × 24
- * (`small`: 34 × 20). Read the styles in JSX, so the appearance is followed.
- */
-export function switchLook(on: () => boolean, size: "small" | "regular" = "regular"): { readonly trackStyle: ViewStyle; readonly thumbStyle: ViewStyle } {
-  // The track's size and inset, and the knob: it travels what is left inside
-  // the border and the padding.
-  const [width, height, inset, knob] = pointer ? [28, 16, 1, 12] : size === "small" ? [34, 20, 1, 16] : [42, 24, 1, 20];
-  // The knob travels as gpui-kit's does (`spring_move`), the track's color
-  // with it; with reduced motion both change in place.
-  const t = follow(() => (on() ? 1 : 0), motion.move);
-  const x = t.interpolate({ inputRange: [0, 1], outputRange: [0, width - 2 - 2 * inset - knob] });
-  return {
-    get trackStyle(): ViewStyle {
-      return {
-        width,
-        height,
-        borderRadius: height / 2,
-        padding: inset,
-        backgroundColor: t.interpolate({ inputRange: [0, 1], outputRange: [colors.track, colors.switchOn] }),
-        borderWidth: 1,
-        borderColor: on() ? colors.switchOn : finish.track.borderColor,
-        boxShadow: on() ? "none" : finish.track.boxShadow,
-        transitionProperty: "border-color, box-shadow",
-        transitionDuration: 150,
-      };
-    },
-    get thumbStyle(): ViewStyle {
-      return {
-        width: knob,
-        height: knob,
-        borderRadius: knob / 2,
-        borderWidth: 1,
-        ...finish.knob,
-        ...(on()
-          ? {
-              backgroundColor: "#ffffff",
-              backgroundImage: "none",
-              borderColor: "transparent",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-            }
-          : {}),
-        transform: [{ translateX: x }],
-      };
-    },
-  };
 }
 
 /** A horizontal meter with an optional marker (a limit). */
@@ -647,24 +404,7 @@ export function Sheet(props: { open: boolean; onClose: () => void; children: JSX
 
 export { Icon, type IconName } from "./icons";
 
-/**
- * A short text as an element's `tooltip`: a `Tooltip` of `nsh/base` in a
- * small bubble of the theme's `popover` tokens that comes in with `popIn`
- * from its side (`placement`, default above), with the keys of a
- * `shortcut` after the text.
- */
-export function Tip(props: { label: string; shortcut?: string; placement?: PopupSide; delay?: number }) {
-  const presence = createPresence(props.placement ?? "top");
-  return (
-    <Tooltip placement={props.placement} delay={props.delay} onOpen={presence.show} onClose={presence.hide}>
-      <View class="flex-row items-center gap-2 rounded-md border border-border bg-popover px-2 py-1" style={presence.style}>
-        <Text class="text-xs text-popover-foreground">{props.label}</Text>
-        <If when={props.shortcut}>
-          <Text class="text-xs text-muted-foreground" style={{ fontVariant: ["tabular-nums"] }}>
-            {props.shortcut}
-          </Text>
-        </If>
-      </View>
-    </Tooltip>
-  );
-}
+export { Tooltip, TooltipContent } from "./tooltip";
+export * from "./tokens";
+export * from "./controls";
+export * from "./page";

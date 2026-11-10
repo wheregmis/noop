@@ -12,7 +12,7 @@ import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, ove
 import { notify, openDecisionIds, pollReplies } from "./notify";
 import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
 import { writeRules } from "./rules";
-import { backoffMinutes, isNoChangeRoutine, tooManyWakes, waitMeta } from "./waits";
+import { backoffMinutes, CHECKED_FALLBACK_MIN, isNoChangeRoutine, tooManyWakes, waitMeta } from "./waits";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
@@ -26,7 +26,7 @@ import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
 import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
 import { addFollowUp, followUpTarget, reopenTask, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
-import { runTool } from "../cloud/src/tools";
+import { isWrite, runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, noteStuckRoutine, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
@@ -236,7 +236,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     const w = waitMeta(res);
     const wakes = Number(meta.wakes ?? 0);
     // the owner's approval covers the whole task: a wait for CI before the approved merge must not revoke it
-    writeDoc(P("tasks", "waiting", `${meta.id}.md`), { ...done, gate_override: meta.gate_override, waiting_since: meta.waiting_since || now(), wake_at: w.wake_at, wait_kind: w.kind, wakes: wakes ? String(wakes) : undefined,
+    writeDoc(P("tasks", "waiting", `${meta.id}.md`), { ...done, gate_override: meta.gate_override, waiting_since: meta.waiting_since || now(), parked_at: now(), wake_at: w.wake_at, wait_kind: w.kind, wakes: wakes ? String(wakes) : undefined,
       waiting_on: res.waiting_on ?? "", wait_check: res.wait_check || undefined, wait_check_base: undefined },
       body + runNote + `\n**Waiting on:** ${res.waiting_on ?? "?"} (${w.kind === "human" ? "wakes on the owner's answer or an event" : `check again ${w.wake_at}`})\n`);
     journal(host, w.kind === "human" ? L(`⏳ ${meta.id} waiting on you: ${res.waiting_on ?? ""} (no timer, continues on the event)`, `⏳ ${meta.id} 等你处理：${res.waiting_on ?? ""}（不定时唤醒，事件到达再继续）`) : L(`⏳ ${meta.id} waiting on ${res.waiting_on ?? ""}, checking again in ${w.minutes} minutes`, `⏳ ${meta.id} 等待 ${res.waiting_on ?? ""}，${w.minutes} 分钟后再看`));
@@ -465,7 +465,14 @@ function wakeParents(host: string, ready = new Set<string>()) {
     }
     if (meta.wake_at || meta.wait_kind) { // parked on something slow: back to the queue once the time is up, or as soon as its check changes
       if (meta.wake_at && Date.parse(meta.wake_at) > Date.now() && !ready.has(meta.id)) continue;
-      const wakes = Number(meta.wakes ?? 0) + 1;
+      // A CI wait with a wait_check is watched by the daemon for free; waking an agent only to see "still pending" burns a
+      // slot and a wake. Until its check changes, the timer is just a fallback (CHECKED_FALLBACK_MIN after parking).
+      if (!ready.has(meta.id) && meta.wait_check && meta.wait_kind !== "human") {
+        const fallback = (Date.parse(meta.parked_at || meta.waiting_since || "") || 0) + CHECKED_FALLBACK_MIN * 60_000;
+        if (fallback > Date.now()) { writeDoc(p, { ...meta, wake_at: new Date(fallback).toISOString() }, body); continue; }
+      }
+      // Only wakes without progress count toward parking it as blocked; a changed wait_check is progress.
+      const wakes = Number(meta.wakes ?? 0) + (ready.has(meta.id) ? 0 : 1);
       if (tooManyWakes(wakes)) { // cycling without progress: stop waking it, tell the owner once what blocks it
         writeDoc(P("tasks", "blocked", `${meta.id}.md`), { ...meta, wake_at: undefined, wakes: String(wakes), status: "blocked" },
           `${body}\nBlocked after ${wakes} wake-ups, still waiting on: ${meta.waiting_on ?? "?"}\n`);
@@ -833,7 +840,8 @@ async function daemon(cfg: Cfg) {
     let out: BrainOut;
     try {
       out = await think(m, store, model, post);
-      if (!out.calls.length && !out.reply && out.rounds >= 4) throw new Error("no answer");
+      // out of rounds with no reply and nothing done (only lookups): the message would vanish, so it becomes work
+      if (!out.reply && out.rounds >= 4 && !out.calls.some((c) => isWrite(c.tool) && c.ok)) throw new Error("no answer");
     } catch (err) {
       // no model (CLI missing, logged out, timeout): the message still becomes work, silently — never lost, never canned
       console.error(`chat brain: ${err}`);

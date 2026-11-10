@@ -57,6 +57,16 @@ export function avatarIdentity(name: string) {
     : { background: oklch(0.97, 0.032, h), foreground: oklch(0.5, 0.145, h), border: oklch(0.89, 0.05, h) };
 }
 
+/**
+ * The initials of `name` (an account or a person): the first letters of its first two words (`jason.lee` → `JL`), or
+ * the first letter of a single word (`jason` → `J`); `?` without one.
+ */
+export function avatarInitials(name: string): string {
+  const words = name.replace(/@.*/, "").split(/[\s._+-]+/).filter(Boolean);
+  const first = (word: string | undefined) => (word ? [...word][0]!.toUpperCase() : "");
+  return words.length > 1 ? first(words[0]) + first(words[1]) : first(words[0]) || "?";
+}
+
 /** `#rrggbb` of an HSL color (SVG's paint takes hex everywhere). */
 function hex(h: number, s: number, l: number): string {
   const a = s * Math.min(l, 1 - l);

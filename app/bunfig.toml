@@ -1,0 +1,5 @@
+# Match the repository's unit-test suite and isolated data setup when run from app/.
+# Native UI tests remain under `nsh test`.
+[test]
+root = "../test"
+preload = ["../test/preload.ts"]

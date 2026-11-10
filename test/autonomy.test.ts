@@ -72,7 +72,7 @@ test("routine dedupe: newer run supersedes proposed copy, queued copy blocks", (
   expect(A.routineQueued("other")).toBe("");
 });
 
-test("routine dedupe: a long-parked copy stops blocking, a fresh one still does", () => {
+test("routine dedupe: parked (waiting/blocked) copies never block the next run", () => {
   const park = (dir: string, id: string, hours: number) =>
     writeDoc(P("tasks", dir, `${id}.md`), { id, source: "routine:parked", created: new Date(Date.now() - hours * 3600_000).toISOString() }, "");
   park("waiting", "T-0101", 7);
@@ -82,7 +82,7 @@ test("routine dedupe: a long-parked copy stops blocking, a fresh one still does"
   expect(A.routineQueued("parked")).toBe("T-0103");
   unlinkSync(P("tasks", "active", "T-0103.md"));
   park("waiting", "T-0104", 1);
-  expect(A.routineQueued("parked")).toBe("T-0104");
+  expect(A.routineQueued("parked")).toBe("");
 });
 
 test("a routine stuck behind a copy no host can run for 30+ minutes notifies the owner once per copy", async () => {

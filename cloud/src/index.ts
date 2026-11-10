@@ -95,11 +95,47 @@ export default {
     if (env.HUB_MOVED_TO) return fetch(new Request(env.HUB_MOVED_TO.replace(/\/$/, "") + url.pathname + url.search, req));
     const mcp = isMcpPath(url.pathname);
     if (mcp && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (!mcp && HASHED.test(url.pathname) && req.method === "GET") return hashedAsset(req, env, url);
     if (!mcp && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/media/")) return env.ASSETS.fetch(req);
     if (!env.HUB_TOKEN) return json({ error: "HUB_TOKEN secret not set" }, 500);
     return env.HUB.get(env.HUB.idFromName("hub")).fetch(req);
   },
 };
+
+/** Content-hashed files `nsh bundle` writes (`nsh.73cc16a15e.wasm`, `app.853c5dd616.js`): they never change, and the
+ *  bundle ships a Brotli 11 / gzip 9 copy next to each. Workers Assets only compresses on the fly at low levels
+ *  (the 14 MB runtime went out as 4.3 MB instead of 3.1 MB), so send the precompressed copy as is. */
+const HASHED = /\.[0-9a-f]{10}\.(wasm|m?js|css)$/;
+const TYPES: Record<string, string> = { wasm: "application/wasm", js: "text/javascript; charset=utf-8", mjs: "text/javascript; charset=utf-8", css: "text/css; charset=utf-8" };
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+async function hashedAsset(req: Request, env: Env, url: URL): Promise<Response> {
+  const accept = req.headers.get("accept-encoding") ?? "";
+  const accepted = new Map(accept.toLowerCase().split(",").map((part) => {
+    const [name, ...params] = part.trim().split(";");
+    const q = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
+    return [name.trim(), q === undefined ? 1 : Number(q.slice(2))] as const;
+  }));
+  const quality = (name: string) => accepted.get(name) ?? accepted.get("*") ?? 0;
+  const type = TYPES[url.pathname.slice(url.pathname.lastIndexOf(".") + 1)];
+  const variants = ([["br", "br"], ["gz", "gzip"]] as const).toSorted((a, b) => quality(b[1]) - quality(a[1]));
+  for (const [ext, enc] of variants) {
+    if (!(quality(enc) > 0)) continue;
+    const res = await env.ASSETS.fetch(new Request(new URL(url.pathname + "." + ext, url), { headers: { "accept-encoding": "identity" } }));
+    if (!res.ok || res.headers.get("content-type")?.toLowerCase().startsWith("text/html")) continue;
+    const headers = new Headers({ "content-type": type, "content-encoding": enc, "cache-control": IMMUTABLE, vary: "accept-encoding" });
+    const etag = res.headers.get("etag");
+    if (etag) headers.set("etag", etag);
+    // `manual`: the body is already encoded, the runtime must not compress it again.
+    return new Response(res.body, { status: 200, headers, encodeBody: "manual" } as ResponseInit);
+  }
+  const res = await env.ASSETS.fetch(req);
+  if (!res.ok) return res;
+  const out = new Response(res.body, res);
+  out.headers.set("cache-control", IMMUTABLE);
+  out.headers.append("vary", "accept-encoding");
+  return out;
+}
 
 /** Turned away by HUB_ALLOW_IPS. The visitor sees its own public IP (nothing else), so the owner can add a phone's
  *  network from the phone itself: JSON for the app and API clients, a small page for a browser. */

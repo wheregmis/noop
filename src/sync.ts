@@ -295,6 +295,7 @@ async function _pull(st: State, t: Transport): Promise<{ ok: boolean; lost: Set<
   for (let page = 0; page < 10_000; page++) {
     const r = await t(`/api/files/changes?since=${st.rev}`);
     if (!r || r.status !== 200) { if (r) console.error(`sync: pull failed ${r.status} ${JSON.stringify(r.json).slice(0, 200)}`); return { ok: false, lost, seen }; }
+    if (!Array.isArray(r.json?.files) || typeof r.json.rev !== "number") { console.error(`sync: pull got a malformed reply ${JSON.stringify(r.json).slice(0, 200)}`); return { ok: false, lost, seen }; }
     for (const f of r.json.files as Remote[]) { seen.add(f.path); if (applyRemote(st, f) === "lost") lost.add(f.path); }
     st.rev = r.json.rev;
     saveState(st);

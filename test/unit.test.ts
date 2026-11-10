@@ -126,6 +126,13 @@ test("quota/auth failover: same CLI's other account, then the other CLI, else no
   expect(failoverAccount(solo, { cli: "codex", name: "zz-test-c", dir: "" }, ["codex", "claude"], all)?.cli).toBe("claude");
 });
 
+test("classify: OpenAI 'no credits remaining' is a quota wall, so codex work falls back", async () => {
+  const { classify } = await import("../src/accounts");
+  expect(classify("ERROR: stream disconnected before completion: You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.")).toBe("quota");
+  expect(classify("Credit balance is too low")).toBe("quota");
+  expect(classify("exit 1: task failed")).toBeNull();
+});
+
 test("restart throttle: at most one voluntary restart per hour unless forced", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

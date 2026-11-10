@@ -5,6 +5,10 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { ensureWebClient } from "../src/webclient";
 
+// Every tar call is a process spawn (~3s for Git's tar.exe on Windows under PowerShell, more under load), and most
+// tests make two (release() packs, ensureWebClient unpacks) — that overruns bun's 5s default.
+const TAR = 30_000;
+
 describe("ensureWebClient", () => {
   let root: string, dir: string, assets: Record<string, Uint8Array | string>, requests: string[];
   let server: ReturnType<typeof Bun.serve>;
@@ -32,6 +36,9 @@ describe("ensureWebClient", () => {
     assets = {};
     requests = [];
     server = Bun.serve({
+      // Bind the address the client fetches: a wildcard port-0 bind can be handed a port another local app
+      // already listens on at 127.0.0.1, and the test's downloads then reach that app instead of this server.
+      hostname: "127.0.0.1",
       port: 0,
       fetch(req) {
         const name = new URL(req.url).pathname.slice(1);
@@ -50,7 +57,7 @@ describe("ensureWebClient", () => {
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("one");
     expect(readdirSync(dir).sort()).toEqual([".release", "noop"]);
-  });
+  }, TAR);
 
   test("does not download what it already has", async () => {
     await release("one");
@@ -58,7 +65,7 @@ describe("ensureWebClient", () => {
     requests.length = 0;
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(requests).toEqual(["sha256sums"]);
-  });
+  }, TAR);
 
   test("replaces the client with a newer release's", async () => {
     await release("one");
@@ -66,7 +73,7 @@ describe("ensureWebClient", () => {
     await release("two");
     await ensureWebClient(dir, base());
     expect(index()).toBe("two");
-  });
+  }, TAR);
 
   test("refuses a download that fails its checksum, keeping the client", async () => {
     await release("one");
@@ -74,7 +81,7 @@ describe("ensureWebClient", () => {
     await release("two", "0".repeat(64));
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("one");
-  });
+  }, TAR);
 
   test("keeps the client when the release can't be reached", async () => {
     await release("one");
@@ -82,7 +89,7 @@ describe("ensureWebClient", () => {
     assets = {};
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("one");
-  });
+  }, TAR);
 
   test("reports no client when there is none and no release has one", async () => {
     expect(await ensureWebClient(dir, base())).toBe(false);
@@ -102,7 +109,7 @@ describe("ensureWebClient", () => {
     assets.sha256sums = `${new Bun.CryptoHasher("sha256").update(bytes).digest("hex")}  noop-web.tar.gz\n`;
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("one");
-  });
+  }, TAR);
 
   test("leaves a locally built client alone", async () => {
     mkdirSync(join(dir, "noop"));
@@ -111,5 +118,5 @@ describe("ensureWebClient", () => {
     expect(await ensureWebClient(dir, base())).toBe(true);
     expect(index()).toBe("local");
     expect(requests).toEqual([]);
-  });
+  }, TAR);
 });

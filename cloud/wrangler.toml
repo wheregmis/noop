@@ -10,9 +10,10 @@ workers_dev = true
 #   HUB_SMTP         JSON {host, port, secure, user, pass, from} — from [email]
 
 [assets]
+binding = "ASSETS"
 directory = "../app/dist/web/noop"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/media/*", "/mcp", "/oauth/*", "/.well-known/*"]
+run_worker_first = ["/*.wasm", "/*.js", "/*.mjs", "/*.css", "/api/*", "/media/*", "/mcp", "/oauth/*", "/.well-known/*"]
 
 [[durable_objects.bindings]]
 name = "HUB"

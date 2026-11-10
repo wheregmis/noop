@@ -15,6 +15,9 @@ export function waitKind(res: { wait_kind?: string; waiting_on?: string }): Wait
 /** Poll interval for a CI wait_check after `checks` earlier polls: 5 → 10 → 20 → 40 minutes, then stays at 40. */
 export const backoffMinutes = (checks: number) => 5 * 2 ** Math.min(3, Math.max(0, checks));
 
+/** A CI wait whose wait_check the daemon polls wakes its agent on the clock only after this long without a change. */
+export const CHECKED_FALLBACK_MIN = 120;
+
 /** Wake-ups after which a task stops cycling and is parked as blocked. */
 export const MAX_WAKES = 6;
 export const tooManyWakes = (wakes: number) => wakes > MAX_WAKES;

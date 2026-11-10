@@ -25,8 +25,8 @@ concurrency:
 env:
   # NSH main with OTA updates through signed packages (longbridge/nsh#1189), the Android bindgen fix for NDK 27, and
   # checkForUpdate leaving the whole app alone while a package of its release runs (longbridge/nsh#1207), the Linux tray painting an SVG icon as a template (longbridge/nsh#1209), and shellInfo() for the installed app's version and NSH runtime (longbridge/nsh#1226). Also the Linux updater restarting from the pre-swap program path (longbridge/nsh#1269).
-  # Includes EmojiPicker (#1323), used by the chat composer.
-  NSH_REF: 36b91689c1e7c38379179a56381de7ddab16c6a5
+  # The 2026-11-10 nightly (c5214aa): what the app is developed and tested against.
+  NSH_REF: c5214aaf4bbdf33bc1d59e9595e009b6aa54d702
 
 defaults:
   run:

@@ -24,7 +24,6 @@ export function needsApproval(cfg: Cfg, source: string): boolean {
 }
 
 const QUEUED = ["inbox", "active", "waiting", "blocked"];
-const PARKED_COPY_MS = 6 * 3600_000;
 const isRoutine = (m: Record<string, string>, name: string) => (m.source ?? "").replace(/^approved:/, "") === `routine:${name}`;
 
 /** Id of a copy of this routine that is queued or running (so a new run would be redundant), else "".
@@ -33,8 +32,9 @@ export function routineQueued(name: string, host?: string): string {
   for (const s of QUEUED) for (const p of list(P("tasks", s), /^T-.*\.md$/)) {
     const m = readDoc(p).meta;
     if (!isRoutine(m, name) || (host && m.host !== host)) continue;
-    // an old copy parked on something slow (the owner clicking merge) must not starve the routine's other work
-    if ((s === "waiting" || s === "blocked") && Date.now() - Date.parse(m.created ?? "") > PARKED_COPY_MS) continue;
+    // a copy parked on something slow (CI, the owner clicking merge) has finished its pass: the next run must still
+    // pick up new PRs/issues instead of the backlog piling up behind it
+    if (s === "waiting" || s === "blocked") continue;
     return m.id;
   }
   return "";

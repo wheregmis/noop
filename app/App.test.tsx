@@ -368,6 +368,16 @@ describe("channel", () => {
     await app.waitFor("Task T-0005");
   });
 
+  test("an id inside a file path stays plain text; one on its own is a chip", async () => {
+    const extra = [{ id: "e30", ts: ts(40), from: "dev@linux-box", kind: "notice", text: "依据 tasks/done/T-0005.md 和 D-0294/notes，不重复 T-0005" }];
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], extra), width: 1200, height: 800, platform: "macos" });
+    await app.waitFor("text:/tasks\\/done\\/T-0005\\.md/");
+    expect(app.shows("text:/D-0294\\/notes/")).toBe(true);
+    // The chip of the id on its own (the earlier message has one too).
+    expect(app.shows("id:task-chip-T-0005 >> nth=1")).toBe(true);
+    expect(app.shows("id:task-chip-T-0005 >> nth=2")).toBe(false);
+  });
+
   test("a task page is its conversation: what was said about it, and a box that adds to it", async () => {
     const posts: { text: string; reply_to?: string }[] = [];
     const said = [
@@ -671,6 +681,12 @@ describe("channel", () => {
     await app.press("id:side-channels-archived");
     await app.waitFor("id:side-channel-old-ops");
     await app.press("id:side-channels-archived");
+    // the Channels heading folds the list; channels with unread stay visible
+    await app.press("id:side-channels");
+    await app.waitUntil(() => !app.shows("id:side-channel-omasend"));
+    expect(app.shows("id:side-channels-archived")).toBe(false);
+    await app.press("id:side-channels");
+    await app.waitFor("id:side-channel-omasend");
     await app.press("id:side-channel-omamail");
     await app.waitFor("omamail 的 PR 与 issue");
     await app.press("id:channel-edit-goal");
@@ -724,9 +740,7 @@ describe("channel", () => {
       network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, recent: [nohost, ...status.recent] } } },
     });
     await app.waitFor("id:side-queued");
-    expect(app.shows("Waiting for Windows machine")).toBe(false); // 排队 starts collapsed
-    await app.press("id:side-queued");
-    await app.waitFor("Waiting for Windows machine");
+    await app.waitFor("Waiting for Windows machine"); // 排队 starts open
     await app.press("label:T-0097 · Waiting for a machine");
     await app.waitFor("id:task-nohost");
     expect(app.shows("id:cancel-task")).toBe(true);
@@ -739,7 +753,6 @@ describe("channel", () => {
       storage: STORAGE, width: 1200, height: 800, platform: "macos",
       network: { ...hub([]), [`GET ${URL}/api/status`]: { body: { ...status, recent: [parked, ...status.recent] } } },
     });
-    await app.press("id:side-queued");
     await app.waitFor("Waiting");
     await app.press("label:T-0236 · Waiting on external result");
     await app.waitFor("id:cancel-task");
@@ -819,6 +832,18 @@ describe("images", () => {
       },
     };
   }
+
+  test("a zoomed image pages through its message's images in a loop", async () => {
+    const shots = { id: "i1", ts: ts(8), from: "lead@mac", kind: "notice", text: "截图", attachments: ["/media/1-a.png", "/media/2-b.png"] };
+    const app = await open("./App.tsx", { ...desk, network: { ...hub([], [shots]) } });
+    await app.waitFor("label:View full size");
+    await app.press("label:View full size >> nth=0");
+    await app.waitFor("text:1 / 2");
+    await app.press("id:image-next");
+    await app.waitFor("text:2 / 2");
+    await app.press("id:image-next");
+    await app.waitFor("text:1 / 2");
+  });
 
   test("the newest Markdown report opens in the reader pane, which zooms, closes and reopens", async () => {
     const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "推送通知梳理完成", attachments: ["/media/1762650000000-push-notifications.md"] };
@@ -1940,57 +1965,4 @@ describe("decision notification", () => {
       await app.waitFor("id:opt-D-0204-A");
     });
   }
-});
-
-describe("composer emoji", () => {
-  for (const platform of ["macos", "ios", "android"] as const) {
-    test(`composer emoji inserts without sending on ${platform}`, async () => {
-      const posts: { text: string }[] = [];
-      const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts), width: platform === "macos" ? 1200 : 390, height: 800, platform });
-      await app.waitFor("id:composer");
-      await app.type("id:composer", "你好");
-      await app.press("id:emoji");
-      await app.waitFor("id:emoji-picker");
-      await app.press("label:grinning face");
-      await app.waitUntil(() => app.value("id:composer") === "你好😀");
-      expect(posts).toEqual([]);
-      await app.press("id:emoji");
-      await app.waitFor("Recent");
-      if (platform === "macos") await app.keyboard.press("escape");
-      else await app.press("id:emoji-close");
-      await app.waitUntil(() => !app.shows("id:emoji-picker"));
-      expect(app.value("id:composer")).toBe("你好😀");
-      await app.press("id:send");
-      await app.waitUntil(() => posts.length === 1);
-      expect(posts[0].text).toBe("你好😀");
-    });
-  }
-  test("composer emoji searches and restores focus after Unicode text", async () => {
-    const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 800, platform: "macos" });
-    await app.type("id:composer", "a😀b");
-    await app.press("id:emoji");
-    await app.waitFor("id:emoji-picker");
-    await app.type("label:Search emoji", "grinning face");
-    await app.waitUntil(() => app.value("label:Search emoji") === "grinning face");
-    await app.press("label:grinning face");
-    await app.waitUntil(() => app.value("id:composer") === "a😀b😀");
-    await app.keyboard.press("x");
-    await app.waitUntil(() => app.value("id:composer") === "a😀b😀x");
-  });
-});
-
-test("composer emoji also inserts into task replies", async () => {
-  const posts: { text: string; reply_to?: string }[] = [];
-  const app = await open("./App.tsx", { storage: STORAGE, network: hub(posts), width: 1200, height: 800, platform: "macos" });
-  await app.waitFor("text:T-0005");
-  await app.press("text:T-0005");
-  await app.waitFor("id:task-composer");
-  await app.type("id:task-composer", "收到");
-  await app.press("id:emoji");
-  await app.press("label:grinning face");
-  await app.waitUntil(() => app.value("id:task-composer") === "收到😀");
-  expect(posts).toEqual([]);
-  await app.press("id:task-send");
-  await app.waitUntil(() => posts.length === 1);
-  expect(posts[0]).toMatchObject({ text: "收到😀", reply_to: "T-0005" });
 });

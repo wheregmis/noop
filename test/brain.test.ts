@@ -140,6 +140,17 @@ test("brain: nothing to say → nothing posted; invalid writes go back to the mo
   expect(out.calls.map((c) => [c.tool, c.ok])).toEqual([["amend_task", false], ["create_task", true]]);
 });
 
+test("brain: a lookup that never ends still answers on the last round", async () => {
+  const { st } = store();
+  const look = '{"calls":[{"tool":"get_task","args":{"id":"T-0184"}}],"reply":""}';
+  const m = scripted([look, look, look, '{"calls":[{"tool":"get_task","args":{"id":"T-0184"}}],"reply":"T-0184 还在跑。"}']);
+  const posted: string[] = [];
+  const out = await think({ text: "T-0184 卡在哪了" }, st, m, (r) => posted.push(r));
+  expect(m.seen[3]).toContain("Last turn");
+  expect(posted).toEqual(["T-0184 还在跑。"]);
+  expect(out.rounds).toBe(4);
+});
+
 test("context: open work, decisions, relevant memory, channel and reply target", () => {
   const { st } = store();
   const c = context(st, { text: "dark mode 不平衡", replyTo: "T-0184", answered: "D-0099", chat: ["owner: hi"] });

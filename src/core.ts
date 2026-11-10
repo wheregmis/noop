@@ -344,6 +344,7 @@ export function pickTask(cfg: Cfg, myLoad = 0, heavyOk = true): string | null {
 export const claim = (path: string, host: string) => locked(() => _claim(path, host));
 async function _claim(path: string, host: string): Promise<string | null> {
   if (!existsSync(path)) return null;
+  const raw = readFileSync(path);
   const { meta, body } = readDoc(path);
   const dest = P("tasks", "active", `${meta.id}.md`);
   writeDoc(dest, { ...meta, claimed_by: host, started: now(), host_caps: hostCaps(loadConfig()).join(",") }, body);
@@ -351,6 +352,8 @@ async function _claim(path: string, host: string): Promise<string | null> {
   if (await _commitPush(`[${host}] claim ${meta.id}: ${meta.title}`)) return dest;
   // undo only our claim (other pending local results stay queued); after a lost race the pull already applied the winner
   sync.revertLocal([relative(DATA, dest), relative(DATA, path)]);
+  // a task queued here and not pushed yet has no synced copy to revert to: put it back rather than delete it
+  if (!readdirSync(P("tasks")).some((d) => existsSync(P("tasks", d, `${meta.id}.md`)))) writeFileSync(path, raw);
   return null;
 }
 

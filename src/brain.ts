@@ -290,6 +290,7 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
     let input = context(st, m);
     for (let round = 0; round < MAX_ROUNDS; round++) {
       res.rounds++;
+      const last = round === MAX_ROUNDS - 1;
       const tm = Date.now();
       const out = await conv.send(input);
       res.ms.model.push(Date.now() - tm);
@@ -299,7 +300,8 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
       const writes = turn.calls.filter((c) => isWrite(c.tool) && BRAIN_TOOLS.some((t) => t.name === c.tool));
       const unknown = turn.calls.filter((c) => !BRAIN_TOOLS.some((t) => t.name === c.tool));
       const invalid = writes.map((c) => ({ c, op: writeOp(c.tool, c.args, st) })).filter((x) => typeof x.op === "string");
-      if (reads.length || unknown.length || invalid.length) {
+      // the last round answers with what it has: a lookup that never ends must not swallow the message
+      if (!last && (reads.length || unknown.length || invalid.length)) {
         const results: string[] = [];
         for (const c of reads) {
           const r = await runTool(st, c.tool, c.args);
@@ -310,7 +312,7 @@ export async function think(m: BrainIn, st: ToolStore, model: Model, post: (repl
         for (const x of invalid) { res.calls.push({ ...x.c, ok: false, error: x.op as string }); results.push(`${x.c.tool}(${JSON.stringify(x.c.args)}) → ERROR ${x.op}`); }
         const pending = writes.filter((c) => !invalid.some((x) => x.c === c));
         if (pending.length) results.push(`Not run yet (send them again if still wanted): ${pending.map((c) => c.tool).join(", ")}`);
-        input = `Tool results:\n${results.join("\n")}\n\nNow answer: one JSON object.`;
+        input = `Tool results:\n${results.join("\n")}\n\n${round === MAX_ROUNDS - 2 ? "Last turn: no more read calls, reply now with what you have" : "Now answer"}: one JSON object.`;
         continue;
       }
       // final turn: post the reply, then run the writes

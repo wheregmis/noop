@@ -158,6 +158,44 @@ export function dayLabel(key: string, now = new Date()): string {
   return yy === now.getFullYear() ? L(`${mon} ${dd}`, `${mm} 月 ${dd} 日`) : L(`${mon} ${dd}, ${yy}`, `${yy} 年 ${mm} 月 ${dd} 日`);
 }
 
+/** Days as whole numbers, so the gap between two day keys is a subtraction. */
+const dayNumber = (key: string) => { const [y, m, d] = key.split("-").map(Number); return Date.UTC(y, m - 1, d) / 86400000; };
+
+/** A run of days in a newest-first list: `newest` and `oldest` are day keys, equal for a single day. */
+export type DayGroup<T> = { key: string; newest: string; oldest: string; items: T[] };
+
+/**
+ * Groups a newest-first list by day. A day with fewer than `min` items joins the
+ * nearer of its neighbouring groups (by days apart; the newer one on a tie), so the
+ * list isn't cut into many tiny sections.
+ */
+export function groupByDay<T>(items: T[], dateOf: (t: T) => string, min = 3): DayGroup<T>[] {
+  const groups: DayGroup<T>[] = [];
+  for (const t of items) {
+    const d = dateOf(t) ? dayKey(dateOf(t)) : "";
+    const last = groups[groups.length - 1];
+    if (last && last.oldest === d) last.items.push(t);
+    else groups.push({ key: d, newest: d, oldest: d, items: [t] });
+  }
+  for (;;) {
+    const i = groups.findIndex((g) => g.items.length < min);
+    if (i < 0 || groups.length < 2) break;
+    const gap = (a: string, b: string) => (a && b ? Math.abs(dayNumber(a) - dayNumber(b)) : Infinity);
+    const before = i > 0 ? gap(groups[i - 1].oldest, groups[i].newest) : Infinity;
+    const after = i < groups.length - 1 ? gap(groups[i].oldest, groups[i + 1].newest) : Infinity;
+    const j = before <= after ? i - 1 : i; // merge groups[j] and groups[j + 1]
+    const a = groups[j], b = groups[j + 1];
+    groups.splice(j, 2, { key: `${a.newest}~${b.oldest}`, newest: a.newest, oldest: b.oldest, items: [...a.items, ...b.items] });
+  }
+  return groups;
+}
+
+/** The heading of a day group: one day, or a range like "Nov 8 – Nov 6". */
+export function dayRangeLabel(newest: string, oldest: string, now = new Date()): string {
+  if (!newest) return L("Unknown date", "未知日期");
+  return newest === oldest || !oldest ? dayLabel(newest, now) : `${dayLabel(newest, now)} – ${dayLabel(oldest, now)}`;
+}
+
 /** The timeline's rows: the events with a separator before each new day. */
 export type Row = { key: string; day: string } | { key: string; event: HubEvent };
 export function rows(events: HubEvent[]): Row[] {

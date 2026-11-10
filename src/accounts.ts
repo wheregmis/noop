@@ -78,7 +78,7 @@ export function accountEnv(a: Account): Record<string, string> {
 }
 
 // ------------------------------------------------------------------ failure classification
-const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)/i;
+const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|no credits remaining|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)/i;
 const AUTH = /not logged in|please run \/login|invalid api key|authentication[_ ]error|\b401\b|oauth token (has )?expired|login required|unauthorized|codex login/i;
 
 export type Failure = "quota" | "auth" | null;
