@@ -146,3 +146,35 @@ test("followups of an owner-answered idle menu count as the owner's pick; a skip
   expect(dec.ownerPickedMenu(resumed("T-0303"))).toBe(false);
   expect(dec.ownerPickedMenu({ id: "T-0304", kind: "menu" })).toBe(false); // first run: nothing answered yet
 });
+
+test("judge.merge_cards: the judge's confident A on an A-recommended merge card closes it and opens the gate", async () => {
+  const card = (tid: string, rec = "A") => {
+    const id = dec.openDecision({ id: tid, agent: "reviewer" }, { status: "needs_decision", summary: "https://github.com/o/r/pull/9 fixes x",
+      question: "Merge PR #9?", recommendation: rec, options: ["A: merge", "B: wait"] } as any, "h");
+    core.writeDoc(core.P("tasks", "blocked", `${tid}.md`), { id: tid, agent: "reviewer", decision: id }, "review");
+    return id;
+  };
+  const on = { judge: { enabled: true, merge_cards: true }, autonomy: { level: "trusted" } } as any;
+  judgeReply = { verdict: "decided", answer: "A", reason: "precedent", cite: "D-0053" };
+  const a = card("T-0401");
+  await dec.routeDecision(a, on, "h");
+  expect(closed(a).answered_by).toBe("judge");
+  expect(core.readDoc(core.P("tasks", "inbox", "T-0401.md")).meta.gate_override).toBe(a);
+  const b = card("T-0402", "B"); // reviewer did not recommend merging: still the owner's call
+  await dec.routeDecision(b, on, "h");
+  expect(existsSync(core.P("decisions", "open", `${b}.md`))).toBe(true);
+  judgeReply = { verdict: "hold", answer: "A", reason: "unsure" };
+  const c = card("T-0403");
+  await dec.routeDecision(c, on, "h");
+  expect(existsSync(core.P("decisions", "open", `${c}.md`))).toBe(true);
+});
+
+test("idle.auto_answer answers a menu without asking, and its items count as the owner's pick", async () => {
+  sent.length = 0;
+  const id = dec.openDecision({ id: "T-0405", agent: "chief-of-staff", kind: "menu" }, { status: "needs_decision", summary: "idle", question: "Which next actions?", recommendation: "1", options: ["1. a", "2. b"] } as any, "h");
+  core.writeDoc(core.P("tasks", "blocked", "T-0405.md"), { id: "T-0405", agent: "chief-of-staff", kind: "menu", source: "idle", decision: id }, "menu");
+  await dec.routeDecision(id, { judge: { enabled: true }, idle: { auto_answer: "all" } } as any, "h");
+  expect(sent.length).toBe(0);
+  expect(closed(id).answer).toBe("all");
+  expect(dec.ownerPickedMenu(core.readDoc(core.P("tasks", "inbox", "T-0405.md")).meta)).toBe(true);
+});
