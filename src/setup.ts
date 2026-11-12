@@ -122,7 +122,10 @@ export async function selfUpdate(opts: { busy?: number; force?: boolean; deploy?
   }
   else await g("merge", "--ff-only", "-q", "@{u}");
   const deps = await $`bun install --frozen-lockfile`.cwd(CODE).quiet().nothrow();
-  const test = await $`bun test`.cwd(CODE).quiet().nothrow();
+  // A sleeping Mac can exhaust test timeouts during maintenance wakes. Keep it awake only for validation
+  // (-s also prevents system sleep on AC); caffeinate releases its assertions and preserves the test exit code.
+  const testCmd = process.platform === "darwin" ? ["/usr/bin/caffeinate", "-is", "bun", "test"] : ["bun", "test"];
+  const test = await $`${testCmd}`.cwd(CODE).quiet().nothrow();
   if (deps.exitCode !== 0 || test.exitCode !== 0) {
     await g("reset", "--hard", "-q", head); // roll back a bad release
     await $`bun install --frozen-lockfile`.cwd(CODE).quiet().nothrow();

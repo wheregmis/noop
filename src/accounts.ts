@@ -78,7 +78,10 @@ export function accountEnv(a: Account): Record<string, string> {
 }
 
 // ------------------------------------------------------------------ failure classification
-const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|no credits remaining|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)/i;
+// "try again at/in <time>" is a quota reset hint. A vague "try again in a moment" is what a gateway 5xx says
+// ("a server-side issue, usually temporary"): counting it as quota put the account on a one-hour cooldown
+// and moved all its work to the other CLI over a blip.
+const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|no credits remaining|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)(?! (?:a|a few|some) (?:moments?|bit|while|seconds?|minutes?)\b)/i;
 const AUTH = /not logged in|please run \/login|invalid api key|authentication[_ ]error|\b401\b|oauth token (has )?expired|login required|unauthorized|codex login/i;
 
 export type Failure = "quota" | "auth" | null;

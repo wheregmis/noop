@@ -2,7 +2,7 @@
 import type { JSX } from "nsh";
 import { signal, View } from "nsh";
 import { ContextMenu } from "nsh/base";
-import { MenuPanel, menuBox } from "./menu";
+import { MenuPanel, menuBox, menuEnter } from "./menu";
 import { alpha, colors } from "./theme";
 import { corner, duration, fill, press, size } from "./tokens";
 import { Tooltip } from "./tooltip";
@@ -44,7 +44,7 @@ export function SidebarRow(props: { onPress?: () => void; selected?: boolean; ti
   );
   if (!props.menu) return row;
   return (
-    <ContextMenu margin={8} popupStyle={menuBox()} onOpenChange={({ open }) => menuOpen.set(open)} trigger={row}>
+    <ContextMenu margin={8} popupStyle={menuBox()} popupStartingStyle={menuEnter()} onOpenChange={({ open }) => menuOpen.set(open)} trigger={row}>
       <MenuPanel>{props.menu}</MenuPanel>
     </ContextMenu>
   );

@@ -20,7 +20,7 @@ tick_seconds = 60
 caps = []                             # extra capability tags, e.g. ["gpu", "docker", "home-lan"]
 
 [resources]
-work_dirs = ["~/work"]                # where repo target/ and node_modules/ live
+work_dirs = ["~/work"]                # where repo target/ and node_modules/ live (Codex may write there too)
 disk_min_gb = 30                      # below this → tiered cleanup
 disk_min_pct = 10
 disk_hard_min_gb = 5                  # below this → stop starting new agents

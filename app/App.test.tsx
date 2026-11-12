@@ -174,6 +174,9 @@ describe("login", () => {
       const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: platform === "android" ? 1200 : 390, height: 844, platform });
       if (platform === "ios") await app.press("label:Menu");
       await app.press("id:user-menu");
+      await app.waitFor("id:theme-dark");
+      // iOS shows an ordinary menu: plain rows on the glass, no account card
+      expect(app.shows("id:user-menu-avatar")).toBe(platform !== "ios");
       await app.press("id:theme-dark");
       expect(app.storage()["hub.theme"]).toBe("dark");
       await app.press("id:theme-light");
@@ -405,6 +408,64 @@ describe("channel", () => {
     expect(posts[0]).toEqual({ text: "再看下 iPad", reply_to: "T-0005", thread: true });
     await app.waitUntil(() => app.value("id:task-composer") === "");
     await app.waitFor("text:再看下 iPad");
+  });
+
+  // macOS sends Copy to the input that has the keyboard: a press on what a page shows takes it back, as the main timeline does
+  test("on macOS a press on a task page's messages or its report takes the keyboard from the task's box", async () => {
+    const said = [
+      { id: "e11", ts: ts(11), from: "dev@linux-box", kind: "notice", ref: "T-0005", text: "手机上也正常，截图附上" },
+      { id: "r1", ts: ts(12), from: "dev@linux-box", kind: "notice", ref: "T-0005", text: "验收报告", attachments: ["/media/1762650000000-acceptance.md"] },
+    ];
+    const app = await open("./App.tsx", { storage: STORAGE, width: 1200, height: 800, platform: "macos", network: {
+      ...hub([], said),
+      [`GET ${URL}/media/*`]: { body: "# Acceptance\n\nCopy works on every page." },
+      [`GET ${URL}/api/tasks/get?*`]: { body: { id: "T-0005", title: "修复登录页", agent: "dev", state: "done", created: ts(1), runs: [] } },
+    } });
+    await app.waitFor("id:task-chip-T-0005 >> nth=0");
+    await app.press("id:task-chip-T-0005 >> nth=0");
+    await app.waitFor("id:task-talk");
+    await app.type("id:task-composer", "草稿");
+    await app.keyboard.press("a");
+    await app.waitUntil(() => app.value("id:task-composer") === "草稿a");
+    await app.drag("text:手机上也正常，截图附上", { x: 40, y: 0 });
+    await app.keyboard.press("b");
+    expect(app.value("id:task-composer")).toBe("草稿a");
+    await app.press("id:doc-attachment");
+    await app.waitUntil(() => app.shows("text:Copy works on every page."));
+    await app.type("id:task-composer", "草稿");
+    const draft = app.value("id:task-composer");
+    await app.drag("text:Copy works on every page.", { x: 40, y: 0 });
+    await app.keyboard.press("c");
+    expect(app.value("id:task-composer")).toBe(draft);
+  });
+
+  test("on macOS a press on a channel's messages or its report takes the keyboard from the composer", async () => {
+    const chans = [{ slug: "nsh-i18n", name: "NSH i18n", goal: "NSH 多语言", status: "active", created: ts(-900), last_activity: ts(5), stale: false, count: 0, refs: [], items: [] }];
+    const talk = [
+      { id: "c2", ts: ts(4), from: "lead@primary", kind: "notice", text: "日文已完成 80%，剩下 API 文档", channel: "nsh-i18n" },
+      { id: "c3", ts: ts(5), from: "lead@primary", kind: "notice", text: "日文报告", channel: "nsh-i18n", attachments: ["/media/1762650000000-ja.md"] },
+    ];
+    const app = await open("./App.tsx", {
+      storage: STORAGE, width: 1400, height: 800, platform: "macos",
+      network: { ...hub([], talk), [`GET ${URL}/api/channels`]: { body: { channels: chans } }, [`GET ${URL}/api/channels/feed?*`]: { body: { events: talk } },
+        [`GET ${URL}/media/*`]: { body: "# Japanese\n\nAll strings are translated." } },
+    });
+    await app.waitFor("id:side-channel-nsh-i18n");
+    await app.press("id:side-channel-nsh-i18n");
+    await app.waitFor("text:日文已完成 80%，剩下 API 文档");
+    await app.type("id:composer", "草稿");
+    const draft = app.value("id:composer");
+    await app.drag("text:日文已完成 80%，剩下 API 文档", { x: 40, y: 0 });
+    await app.keyboard.press("x");
+    expect(app.value("id:composer")).toBe(draft);
+    // the report stays closed until the user opens it
+    await app.press("id:doc-attachment");
+    await app.waitUntil(() => app.shows("text:All strings are translated."));
+    await app.type("id:composer", "草稿");
+    const again = app.value("id:composer");
+    await app.drag("text:All strings are translated.", { x: 40, y: 0 });
+    await app.keyboard.press("y");
+    expect(app.value("id:composer")).toBe(again);
   });
 
   test("a task's conversation stays on its page: the main channel skips it, old messages load, and its cards can be answered there", async () => {
@@ -845,17 +906,21 @@ describe("images", () => {
     await app.waitFor("text:1 / 2");
   });
 
-  test("the newest Markdown report opens in the reader pane, which zooms, closes and reopens", async () => {
+  test("a report in the reader pane zooms, closes and reopens; entering the chat leaves it closed", async () => {
     const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "推送通知梳理完成", attachments: ["/media/1762650000000-push-notifications.md"] };
     const app = await open("./App.tsx", {
       ...desk,
-      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: { body: "# Push notifications\n\nAPNs and **FCM** support." } },
+      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: { body: "# T-9170 Push notifications\n\nAPNs and **FCM** support. D-O0011 remains readable." } },
     });
     await app.waitFor("id:doc-attachment");
     expect(app.shows("text:push-notifications")).toBe(true);
-    // opened by itself, beside the chat on a wide window
+    // a report already in the conversation stays closed until the user opens it
+    await app.wait(300);
+    expect(app.shows("id:doc-reader")).toBe(false);
+    await app.press("id:doc-attachment");
     await app.waitFor("id:doc-side");
-    await app.waitUntil(() => app.shows("text:Push notifications"));
+    await app.waitUntil(() => app.shows("text:T-9170 Push notifications"));
+    expect(app.shows("id:task-chip-T-9170")).toBe(false);
     expect(app.shows("text:Markdown · Reading")).toBe(true);
     expect(app.shows("text:100%")).toBe(true);
     await app.press("id:doc-zoom-in");
@@ -904,6 +969,7 @@ describe("images", () => {
       ...desk,
       network: { ...hub([], [report]), [`GET ${URL}/media/*`]: () => (++calls === 1 ? { status: 500, body: "" } : { body: "# Second try" }) },
     });
+    await app.press("id:doc-attachment");
     await app.waitFor("id:doc-retry");
     expect(app.shows("text:Couldn’t load (500)")).toBe(true);
     await app.press("id:doc-retry");
@@ -911,12 +977,33 @@ describe("images", () => {
     expect(calls).toBe(2);
   });
 
-  test("on a phone the report reader covers the chat as a sheet", async () => {
+  test("on a wide desktop a report that arrives while the chat is open opens beside it", async () => {
+    const later: unknown[] = [];
+    const app = await open("./App.tsx", {
+      ...desk,
+      network: { ...hub([]), [`GET ${URL}/api/feed?*`]: () => ({ body: { events: later.splice(0) } }), [`GET ${URL}/media/*`]: { body: "# Fresh report" } },
+    });
+    await app.waitFor("id:composer");
+    later.push({ id: "r2", ts: new Date().toISOString(), from: "lead@mac", kind: "notice", text: "新报告", attachments: ["/media/1762650000001-fresh.md"] });
+    await app.waitFor("id:doc-side", { timeout: 10000 });
+    await app.waitUntil(() => app.shows("text:Fresh report"));
+  });
+
+  for (const platform of ["ios", "android"] as const) test(`on a phone the report reader is a sheet the user opens (${platform})`, async () => {
+    const later: unknown[] = [];
     const report = { id: "r1", ts: ts(8), from: "lead@mac", kind: "notice", text: "报告", attachments: ["/media/1762650000000-report.md"] };
     const app = await open("./App.tsx", {
-      ...desk, width: 390, height: 844,
-      network: { ...hub([], [report]), [`GET ${URL}/media/*`]: { body: "# Report" } },
+      storage: { ...STORAGE, "hub.notifyAsked": "1" }, width: 390, height: 844, platform,
+      network: { ...hub([], [report]), [`GET ${URL}/api/feed?*`]: () => ({ body: { events: later.splice(0) } }), [`GET ${URL}/media/*`]: { body: "# Report" } },
     });
+    await app.waitFor("id:doc-attachment");
+    // neither entering the chat nor a new report opens it on a phone
+    later.push({ id: "r2", ts: new Date().toISOString(), from: "lead@mac", kind: "notice", text: "新报告", attachments: ["/media/1762650000001-new.md"] });
+    await app.waitFor("新报告", { timeout: 10000 });
+    await app.wait(300);
+    expect(app.shows("id:doc-sheet")).toBe(false);
+    expect(app.shows("id:drawer")).toBe(false);
+    await app.press("id:doc-attachment >> nth=0");
     await app.waitFor("id:doc-sheet");
     expect(app.shows("id:doc-expand")).toBe(false);
     await app.press("id:doc-close");

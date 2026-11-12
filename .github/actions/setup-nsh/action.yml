@@ -114,15 +114,14 @@ runs:
       with:
         targets: ${{ inputs.rust-target }}
 
-    # Linux runtime libraries are needed even when the built NSH distribution is cached.
+    # Cached distributions need runtime libraries, not a C/Rust build toolchain.
     - if: runner.os == 'Linux' && ((steps.cache.outputs.cache-hit != 'true' && steps.nightly.outputs.used != 'true') || inputs.target == 'linux')
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y clang llvm libclang-dev pkg-config
-        [ "$TARGET" != linux ] || sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev xvfb xauth
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        PREBUILT: ${{ steps.nightly.outputs.used }}
+      run: bash "$GITHUB_WORKSPACE/scripts/setup-linux-deps.sh"
     - if: steps.cache.outputs.cache-hit != 'true' && (steps.nightly.outputs.used != 'true' || inputs.target == 'linux') && runner.os == 'Windows'
       shell: bash
       run: |

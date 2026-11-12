@@ -104,9 +104,11 @@ function rosterLine(): string {
     }).join("\n");
 }
 
-/** workspace-write only covers the cwd and /tmp; agents also need project checkouts, scratch, the hub and cargo's caches. */
-export function codexWritableDirs(home = homedir()): string[] {
-  const dirs = [join(home, "work"), join(home, ".noop", "work"), join(home, ".agent-hub", "work"), ROOT, join(home, ".cargo")];
+/** workspace-write only covers the cwd and /tmp; agents also need project checkouts, scratch, the hub and cargo's caches.
+ *  `workDirs` is the owner's `[resources].work_dirs`: wherever they keep their repos, not only the default `~/work`. */
+export function codexWritableDirs(home = homedir(), workDirs: string[] = []): string[] {
+  const configured = workDirs.map((d) => d.replace(/^~/, home));
+  const dirs = [join(home, "work"), join(home, ".noop", "work"), join(home, ".agent-hub", "work"), ROOT, join(home, ".cargo"), ...configured];
   const real = dirs.filter((d) => existsSync(d)).map((d) => realpathSync(d));
   return [...new Set(real)];
 }
@@ -127,7 +129,7 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false): string[
     // non-interactive: workspace-write sandbox with network, never ask for approval
     const cmd = ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
       "-c", 'approval_policy="never"', "-c", "sandbox_workspace_write.network_access=true"];
-    for (const dir of codexWritableDirs()) cmd.push("--add-dir", dir);
+    for (const dir of codexWritableDirs(homedir(), cfg.resources?.work_dirs)) cmd.push("--add-dir", dir);
     if (c.model) cmd.push("-m", c.model);
     return [...cmd, "-"];
   }

@@ -3,10 +3,10 @@
  * App code passes `menuPopup()` as `popupStyle` and fills it with `MenuRow` / `MenuSep`; it does not restyle them.
  */
 import type { JSX, ViewStyle } from "nsh";
-import { platform, Text } from "nsh";
+import { platform, Text, View } from "nsh";
 import { MenuItem, MenuSeparator } from "nsh/base";
 import { Icon, type IconName } from "./icons";
-import { PopIn, type PopupSide } from "./popup";
+import type { PopupSide } from "./popup";
 import { alpha, colors } from "./theme";
 import { corner, duration, fill, font, leading, menuGlass, space, touch } from "./tokens";
 
@@ -33,14 +33,27 @@ export const menuPopup = (): ViewStyle => ios
 export const menuRowCorner = ios ? corner.sheet - space.sm : corner.control - 2;
 
 /**
- * The popup box a `Menu` / `ContextMenu` gets (`popupStyle`): bare, so the look rides on `MenuPanel` inside it, which
- * the menu makes on every opening and which so comes in with `popIn` each time.
+ * The popup box a `Menu` / `ContextMenu` gets (`popupStyle`, which its submenus take too): it carries the surface and
+ * its shadow itself, since the menu scrolls its contents in a clipping view and a shadow drawn inside would be cut at
+ * the box's edges. It comes in with `menuEnter` as `popupStartingStyle`.
  */
-export const menuBox = (): ViewStyle => ({ padding: 0, borderWidth: 0, backgroundColor: "transparent", boxShadow: "none" });
+export const menuBox = (look: ViewStyle = menuPopup()): ViewStyle => ({
+  ...look,
+  transitionProperty: "opacity, transform",
+  transitionDuration: 150,
+  transitionTimingFunction: "ease-out",
+});
 
-/** A menu's contents on the popup surface, popping in as the menu opens. */
-export function MenuPanel(props: { side?: PopupSide; style?: ViewStyle; children: JSX.Element }) {
-  return <PopIn side={props.side} style={{ ...menuPopup(), ...props.style }}>{props.children}</PopIn>;
+/** The first frame of a menu's box (`popupStartingStyle`): `popIn`'s fade, grow and slide out of the trigger. */
+export const menuEnter = (side: PopupSide = "bottom"): ViewStyle => {
+  const away = side === "top" || side === "left" ? 4 : -4;
+  const slide = side === "top" || side === "bottom" ? { translateY: away } : { translateX: away };
+  return { opacity: 0, transform: [{ scale: 0.96 }, slide] };
+};
+
+/** A menu's contents; the surface is the popup box's (`menuBox`). */
+export function MenuPanel(props: { style?: ViewStyle; children: JSX.Element }) {
+  return <View style={props.style}>{props.children}</View>;
 }
 
 /** A row's hover and press: the ghost control's fills. */

@@ -117,11 +117,16 @@ export const menuGlass = (tint: string, cornerRadius: number): ViewStyle => ({
         boxShadow: "0 10px 32px rgba(0,0,0,0.16)" }),
 });
 
-/** The floating surface of a message composer, which the conversation scrolls under. */
+/**
+ * The floating surface of a message composer, which the conversation scrolls under. On iOS 26 it is the bare native
+ * glass, as `menuGlass`: iOS draws a view's background over its glass (NSH #866), so any fill there veils the
+ * material, and the glass draws its own edge, so it takes no hairline or shadow either. Earlier iOS keeps the blur
+ * with a light tint; the desktops keep their tinted glass.
+ */
 export const composerGlass = (active = false): ViewStyle => ({
   ...glass(colors.field, corner.composer),
-  ...(platform.os === "ios" ? { backgroundColor: alpha(colors.field, 0.25) } : {}),
-  boxShadow: "0 4px 16px rgba(0,0,0,0.06)",
+  ...(platform.os === "ios" ? { backgroundColor: iosGlass ? "transparent" : alpha(colors.field, 0.25) } : {}),
+  boxShadow: iosGlass ? "none" : "0 4px 16px rgba(0,0,0,0.06)",
   borderWidth: platform.os === "ios" || platform.os === "macos" ? 0 : 1,
   borderColor: alpha(colors.text, active ? 0.22 : 0.1),
   transitionProperty: "border-color",

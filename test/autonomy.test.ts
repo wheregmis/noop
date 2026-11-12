@@ -58,6 +58,29 @@ test("open batch whose tasks are all gone is closed right away", async () => {
   expect(files("decisions", "open")).toEqual(["P-0002.md"]);
 });
 
+test("a stub without frontmatter in tasks/proposed is not proposed and does not rebuild the batch", async () => {
+  // an agent appended a note to the old path of an already-approved task
+  await Bun.write(P("tasks", "proposed", "T-0001.md"), "\n\n## Note\nfollow-up for whoever picks this up\n");
+  task("proposed", "T-0002", "followup:T-0000");
+  await A.proposeBatch(cfg, "pc");
+  expect(files("decisions", "open")).toEqual(["P-0001.md"]);
+  expect(readDoc(P("decisions", "open", "P-0001.md")).meta.items).toBe("T-0002");
+  expect(sent[0]).not.toContain("undefined");
+  await A.proposeBatch(cfg, "pc");
+  expect(files("decisions", "open")).toEqual(["P-0001.md"]);
+  expect(files("decisions", "closed")).toEqual([]);
+  expect(sent.length).toBe(1);
+});
+
+test("answer numbers follow the card lines even when a batch has an empty slot", () => {
+  // a batch built before stubs were skipped: line 1 was an empty item, line 2 the real task
+  writeDoc(P("decisions", "open", "P-0001.md"), { id: "P-0001", kind: "proposals", created: ago(1), items: ",T-0002" }, "x");
+  task("proposed", "T-0002", "followup:T-0000");
+  expect(A.resolveProposals("P-0001", "2", "owner(chat)")).toBe(true);
+  expect(readDoc(P("tasks", "inbox", "T-0002.md")).meta.approval).toBe("P-0001");
+  expect(files("tasks", "rejected")).toEqual([]);
+});
+
 test("routine dedupe: newer run supersedes proposed copy, queued copy blocks", () => {
   task("proposed", "T-0001", "routine:pr-review");
   task("proposed", "T-0002", "routine:other");

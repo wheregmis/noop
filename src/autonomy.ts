@@ -1,7 +1,7 @@
 // Graduated autonomy. Start conservative ("onboarding"): self-generated work needs owner approval,
 // the judge only shadows. Graduation is proposed by the architect from metrics, decided by the owner.
 import { existsSync, unlinkSync } from "node:fs";
-import { type Cfg, L, P, journal, list, nextId, now, readDoc, writeDoc } from "./core";
+import { type Cfg, L, P, fileId, journal, list, nextId, now, readDoc, writeDoc } from "./core";
 import { notify } from "./notify";
 
 export type Level = "onboarding" | "assisted" | "autonomous";
@@ -70,7 +70,9 @@ export const judgeMayDecide = (cfg: Cfg, agent?: string) => level(cfg, agent) !=
 
 /** Batch tasks/proposed into one numbered approval message. */
 export async function proposeBatch(cfg: Cfg, host: string) {
-  const items = list(P("tasks", "proposed"), /^T-.*\.md$/).slice(0, 9);
+  // only real task files: an agent appending a note to a task's old path leaves a stub without frontmatter,
+  // which would show as "undefined（undefined）" and, never matching the batch, rebuild it on every tick
+  const items = list(P("tasks", "proposed"), /^T-.*\.md$/).filter((p) => readDoc(p).meta.id === fileId(p)).slice(0, 9);
   const itemIds = items.map((p) => readDoc(p).meta.id);
   const openPath = list(P("decisions", "open")).find((p) => readDoc(p).meta.kind === "proposals");
   if (openPath) {
@@ -119,14 +121,15 @@ export function resolveProposals(id: string, answer: string, by: string): boolea
   const f = P("decisions", "open", `${id}.md`);
   if (!existsSync(f)) return false;
   const { meta, body } = readDoc(f);
-  const ids = (meta.items ?? "").split(",").filter(Boolean);
+  // keep empty slots: card line n is items[n-1], so dropping an empty id would shift every later pick by one
+  const ids = (meta.items ?? "").split(",");
   const a = answer.trim().toLowerCase();
   const picked = new Set<number>(a.startsWith("all") ? ids.map((_, i) => i + 1)
     : a.startsWith("none") ? [] : (a.match(/^[\d,\s，]+/)?.[0] ?? "").split(/[,，\s]+/).filter(Boolean).map(Number));
   const note = answer.replace(/^[\d,\s，]+|^(all|none)\s*/i, "").trim();
   ids.forEach((tid, i) => {
     const p = P("tasks", "proposed", `${tid}.md`);
-    if (!existsSync(p)) return;
+    if (!tid || !existsSync(p)) return;
     const { meta: tm, body: tb } = readDoc(p);
     const ok = picked.has(i + 1);
     writeDoc(P("tasks", ok ? "inbox" : "rejected", `${tid}.md`), { ...tm, source: ok ? `approved:${tm.source}` : tm.source, approval: ok ? id : `rejected:${id}` },

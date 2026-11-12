@@ -35,7 +35,7 @@ export function Button(props: {
   icon?: IconName;
   /** A key shown before the label (a shortcut, a number to press). */
   kbd?: string;
-  /** A short faint note after the label. */
+  /** A short faint note below the label, sharing its available width. */
   note?: string;
   /** Work started by it is going on: a spinner in the icon's place, no presses. */
   loading?: boolean;
@@ -159,10 +159,12 @@ export function Button(props: {
       <If when={!props.loading && !props.checked && props.icon}>
         <View style={{ marginTop: (m().line - m().icon) / 2 }}><Icon name={props.icon!} size={m().icon} tint={fg()} /></View>
       </If>
-      <Text style={{ flexShrink: 1, textAlign: props.grow ? "center" : "left", fontSize: m().font, lineHeight: m().line, fontWeight: "500", color: fg() }}>{props.label}</Text>
-      <If when={props.note}>
-        <Text style={{ fontSize: font.sm, lineHeight: leading.sm, color: variant() === "primary" && !props.checked ? alpha(colors.onAccent, 0.7) : colors.faint }}>{props.note}</Text>
-      </If>
+      <View style={{ flexShrink: 1, minWidth: 0, gap: 2 }}>
+        <Text style={{ textAlign: props.grow ? "center" : "left", fontSize: m().font, lineHeight: m().line, fontWeight: "500", color: fg() }}>{props.label}</Text>
+        <If when={props.note}>
+          <Text style={{ fontSize: font.sm, lineHeight: leading.sm, color: variant() === "primary" && !props.checked ? alpha(colors.onAccent, 0.7) : colors.faint }}>{props.note}</Text>
+        </If>
+      </View>
       {/* the picked option: a blue check at the end */}
       <If when={props.checked}>
         <View style={{ marginTop: (m().line - m().icon) / 2 }}><Icon name="check" size={m().icon} tint={colors.info} /></View>
