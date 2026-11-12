@@ -81,7 +81,7 @@ function learn(meta: Record<string, string>, answer: string, by: string): Record
 const cardTasks = (meta: Record<string, string>) => (meta.tasks || meta.task || "").split(",").filter(Boolean);
 
 /** Close a decision and put its task back in the inbox with the answer appended. */
-export function closeDecision(id: string, answer: string, by: string, note = ""): boolean {
+export function closeDecision(id: string, answer: string, by: string, note = "", judgeGate = false): boolean {
   const src = P("decisions", "open", `${id}.md`);
   if (!existsSync(src)) return false;
   const { meta, body } = readDoc(src);
@@ -94,7 +94,8 @@ export function closeDecision(id: string, answer: string, by: string, note = "")
     const { meta: tm, body: tb } = readDoc(t);
     // the owner answered the question the gate raised: unlock it for that run; the agent reads the answer and
     // only acts if the answer says so (no keyword matching on the owner's words). Supervisor cards never open a gate.
-    const gated = /^owner/.test(by) && !meta.supervisor_cause;
+    // judgeGate: the owner opted in (judge.merge_cards) to the judge's confident A on a merge card.
+    const gated = (/^owner/.test(by) || judgeGate) && !meta.supervisor_cause;
     writeDoc(P("tasks", "inbox", `${task}.md`),
       { ...tm, claimed_by: undefined, status: undefined, resumes: id, gate_override: gated ? id : undefined },
       `${tb}\n\n## Decision ${id} (${by})\nQ: ${meta.question}\nA: **${answer}**\nContinue the task accordingly.\n`);
@@ -111,7 +112,7 @@ export function ownerPickedMenu(task: Record<string, string>): boolean {
   const f = P("decisions", "closed", `${task.resumes}.md`);
   if (!existsSync(f)) return false;
   const d = readDoc(f).meta;
-  return d.kind === "menu" && d.task === task.id && /^owner/.test(d.answered_by ?? "") && d.ignored !== "yes";
+  return d.kind === "menu" && d.task === task.id && /^(owner|judge\(auto_answer\))/.test(d.answered_by ?? "") && d.ignored !== "yes";
 }
 
 /** The answer that sets a card aside: the owner skipped it (often just forgot to pick); it is not a rejection. */
@@ -167,8 +168,14 @@ export function sendBack(id: string, reason: string) {
 }
 
 export async function routeDecision(id: string, cfg: Cfg, host: string) {
-  let v = await judge(id, cfg);
   const f = P("decisions", "open", `${id}.md`);
+  const auto = cfg.idle?.auto_answer;
+  if (auto && readDoc(f).meta.kind === "menu") { // owner opted in: answer the menu as the owner always has
+    closeDecision(id, String(auto), "judge(auto_answer)", "Answered by idle.auto_answer in config.toml.");
+    journal(host, `⚖️ ${id} menu auto-answered: ${auto}`);
+    return;
+  }
+  let v = await judge(id, cfg);
   let { meta, body } = readDoc(f);
   // Every judge run is recorded (hold included) so closeDecision can score it against the owner's answer.
   if (meta.kind !== "menu" && cfg.judge?.enabled !== false) {
@@ -179,12 +186,14 @@ export async function routeDecision(id: string, cfg: Cfg, host: string) {
     journal(host, `👤 shadow-judge on ${id}: would ${v.verdict} "${v.answer ?? v.reason}"`);
     v = { verdict: "hold", reason: L(`Onboarding period, the judge thinks: ${v.verdict === "decided" ? v.answer : "send back: " + v.reason}`, `学习期，judge 认为：${v.verdict === "decided" ? v.answer : "应退回: " + v.reason}`) };
   }
-  if (v && v.verdict !== "hold" && isMergeCard(meta)) { // the judge's answer cannot click merge: hold for the owner
+  // judge.merge_cards (opt-in): a confident A on a card the reviewer recommended A merges; anything else still waits.
+  const judgeMerges = cfg.judge?.merge_cards === true && v?.verdict === "decided" && choice(v.answer) === "A" && choice(meta.recommendation) === "A";
+  if (v && v.verdict !== "hold" && isMergeCard(meta) && !judgeMerges) { // the judge's answer cannot click merge: hold for the owner
     journal(host, L(`👤 ${id} is a merge card, the judge does not answer it (the judge thinks: ${v.answer ?? v.reason})`, `👤 ${id} 是合并卡，judge 不代答（judge 认为：${v.answer ?? v.reason}）`));
     v = { verdict: "hold", reason: "merge card" };
   }
   if (v?.verdict === "decided" && v.answer) {
-    closeDecision(id, v.answer, "judge", `Reason: ${v.reason} (cite: ${v.cite ?? "-"})`);
+    closeDecision(id, v.answer, "judge", `Reason: ${v.reason} (cite: ${v.cite ?? "-"})`, judgeMerges && isMergeCard(meta));
     journal(host, `⚖️ judge decided ${id}: ${v.answer} (${v.cite ?? v.reason})`);
     return;
   }

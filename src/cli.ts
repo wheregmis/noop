@@ -698,11 +698,12 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       if (!v || !existsSync(t.p)) continue;
       // the planner may only add what one machine can meet together with the task's own: a guessed os:linux on a macOS-only fleet parks the task for good
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...fleetCanMeet(t.meta, String(v.requires ?? ""))].map((x) => x.trim()).filter(Boolean))].join(",");
-      const pinned = t.meta.cli && t.meta.cli !== "auto";
+      // an explicit task CLI, or the member's own CLI order (with its backups), beats the planner's guess
+      const pinned = (t.meta.cli && t.meta.cli !== "auto") || !!cfg.clis?.agents?.[t.meta.agent || "lead"];
       const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
       writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
-      journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? t.meta.cli : v.cli}`);
+      journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? allowedClis(t.meta, cfg).join("→") : v.cli}`);
     }
     await _commitPush(`[${host}] plan ${todo.length} tasks`);
   });
