@@ -50,7 +50,8 @@ test("view: a channel lists its tasks and their cards newest first, and is stale
   expect(om.stale).toBe(false);
   expect(om.count).toBe(3);
   expect(v.channels.find((c) => c.slug === "omasend")!.stale).toBe(false); // just created
-  expect(channelsView(store(), Date.parse("2026-11-20T00:00:00Z")).channels.every((c) => c.stale)).toBe(true);
+  // omasend was created with the real clock, so judge staleness relative to it, not a fixed date
+  expect(channelsView(store(), Date.now() + 8 * 86_400_000).channels.every((c) => c.stale)).toBe(true);
 });
 
 

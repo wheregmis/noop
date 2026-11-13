@@ -1,3 +1,5 @@
+import { TextView, type MarkdownExtension } from "nsh/base";
+
 /** A GFM table's delimiter row ("|---|:--:|", "--- | ---"): dashes with optional colons, cells split by pipes. */
 const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
 
@@ -28,13 +30,17 @@ export function hubMarkdown(text: string): string {
     .split(/(^```[\s\S]*?^```)/m)
     .map((part, i) => {
       if (i % 2) return part;
-      // A "\\" ending a table row becomes part of its last cell, and on the delimiter row it ends the table.
+      // Keep table structure untouched; let TextView handle GFM links and HTML.
       const table = tableNewlines(part);
       return part
-        // single newlines are hard breaks, except around list items (a "\\" there shows up literally)
-        .replace(/([^\n])\n(?!\n|\s*(?:[-*+]|\d+[.)])\s)/g, (m0, c, off, all) => table.has(off + 1) || /^\s*(?:[-*+]|\d+[.)])\s/.test(all.slice(all.lastIndexOf("\n", off) + 1, off + 1)) ? `${c}\n` : `${c}\\\n`)
-        // Bare URLs stop at CJK / full-width punctuation and spaces ("pull/1：让" links pull/1 only).
-        .replace(/(?<![(<\[`])\bhttps?:\/\/[^\s<>()\[\]`\u3000-\u303f\uff00-\uffef\u2018-\u201f\u4e00-\u9fff]+[^\s<>()\[\]`.,;:!?'"\u3000-\u303f\uff00-\uffef\u2018-\u201f\u4e00-\u9fff]/g, "<$&>");
+        // Two spaces preserve chat line breaks without visible punctuation at block boundaries.
+        .replace(/([^\n])\n(?!\n|\s*(?:[-*+]|\d+[.)])\s)/g, (m0, c, off, all) => table.has(off + 1) || /^\s*(?:[-*+]|\d+[.)])\s/.test(all.slice(all.lastIndexOf("\n", off) + 1, off + 1)) ? `${c}\n` : `${c}  \n`);
     })
     .join("");
+}
+
+/** Reports use the source verbatim; chat preserves single-line breaks. HTML is
+ * interpreted by TextView's native document parser, never a browser/WebView. */
+export function parseHubMarkdown(text: string, report = false, extensions: MarkdownExtension[] = []) {
+  return TextView.parse(report ? text : hubMarkdown(text), { math: false, html: true }, extensions);
 }

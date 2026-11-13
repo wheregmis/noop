@@ -31,12 +31,13 @@ heavy_max_load = 0.5                  # heavy tasks (bench/full build) start onl
 stale_repo_days = 7                   # target/ of repos (and, on macOS, Xcode DerivedData / ccache entries) untouched this long may be removed
 
 [clis]
+# Which CLI runs a task, strongest first: a `cli` pinned on the task (`noop add --cli …`, a routine's cli) > the
+# owner's per-member config below (Settings → Members) > the planner's per-task suggestion > either, Claude first.
 # Claude Opus = challenging work (development, debugging, architecture, UI, judge, learning, evolution).
-# Codex (ChatGPT) = routine work; these agents use Codex first and fall back to Claude. Tasks marked
-# difficulty = "hard" or weight = "heavy" always go to Claude.
-routine_agents = ["dispatcher", "ops-watcher", "reporter", "oss-triage", "reviewer", "chief-of-staff"]
-# per-agent override, e.g.  [clis.agents]  reviewer = ["codex", "claude"]
+# Codex (ChatGPT) = routine work. The planner only suggests, so it can never override a member pinned here.
 timeout_minutes = 90
+[clis.agents]
+# reviewer = ["codex", "claude"]      # per-member order; ["codex"] = codex only (unless codex has no usable account)
 [clis.claude]
 permission_mode = "bypassPermissions" # hard gates still apply via --disallowedTools (src/gates.ts)
 model = "claude-opus-5-5"

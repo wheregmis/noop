@@ -169,14 +169,22 @@ describe("login", () => {
     expect(log.logouts).toBe(1);
     expect(app.storage()["hub.token"]).toBe(undefined);
   });
-  for (const platform of ["ios", "android"] as const) {
+  test("the iOS account menu leaves its menu content to UIKit", async () => {
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 390, height: 844, platform: "ios" });
+    await app.press("label:Menu");
+    await app.waitFor("id:user-menu");
+    // This headless host has no UIKit button to activate. Verify only the
+    // app composition here; native opening and selection need an iOS host.
+    // NSH engine tests cover MenuButton native properties and selection events.
+    expect(app.shows("id:theme-dark")).toBe(false);
+    expect(app.shows("id:user-menu-avatar")).toBe(false);
+  });
+  for (const platform of ["android"] as const) {
     test(`the mobile account menu on ${platform} switches appearance and language`, async () => {
-      const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: platform === "android" ? 1200 : 390, height: 844, platform });
-      if (platform === "ios") await app.press("label:Menu");
+      const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 844, platform });
       await app.press("id:user-menu");
       await app.waitFor("id:theme-dark");
-      // iOS shows an ordinary menu: plain rows on the glass, no account card
-      expect(app.shows("id:user-menu-avatar")).toBe(platform !== "ios");
+      expect(app.shows("id:user-menu-avatar")).toBe(true);
       await app.press("id:theme-dark");
       expect(app.storage()["hub.theme"]).toBe("dark");
       await app.press("id:theme-light");
@@ -190,7 +198,7 @@ describe("login", () => {
       await app.waitUntil(() => !app.shows("id:menu-lang-zh"));
       await app.press("id:user-menu");
       await app.press("id:settings");
-      await app.waitFor(platform === "ios" ? "id:logout" : "id:settings-tab-account");
+      await app.waitFor("id:settings-tab-account");
     });
   }
   test("the sidebar user menu switches appearance and language and opens settings", async () => {
@@ -360,20 +368,28 @@ describe("channel", () => {
     expect(app.shows("text:/Queued 2/")).toBe(true);
   });
 
-  test("a task id is a chip that opens the task; a GitHub PR link is a plain link named repo#n", async () => {
-    const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 800, platform: "macos" });
+  for (const os of ["macos", "linux"] as const) test(`a task tag opens the task on ${os}; a GitHub PR link stays a plain link`, async () => {
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([]), width: 1200, height: 800, platform: os });
     await app.waitFor("text:app#42");
     expect(app.shows("id:gh-chip-app-42")).toBe(false);
     expect(app.shows("text:/github\\.com\\/acme\\/app/")).toBe(false);
     await app.press("text:app#42");
     expect(app.openedUrls()).toEqual(["https://github.com/acme/app/pull/42"]);
-    await app.press("id:task-chip-T-0005");
+    expect(app.shows("id:task-chip-T-0005")).toBe(os !== "macos");
+    await app.press(os === "macos" ? "text:T-0005" : "id:task-chip-T-0005");
     await app.waitFor("Task T-0005");
+  });
+
+  test("macOS decision and proposal tags remain visible message text", async () => {
+    const extra = [{ id: "e30", ts: ts(40), from: "dev@linux-box", kind: "notice", text: "按 D-0408 选 A 处理，参考 P-H0001" }];
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], extra), width: 1200, height: 800, platform: "macos" });
+    await app.waitFor("text:/按 D-0408 选 A 处理/");
+    expect(app.shows("text:/P-H0001/")).toBe(true);
   });
 
   test("an id inside a file path stays plain text; one on its own is a chip", async () => {
     const extra = [{ id: "e30", ts: ts(40), from: "dev@linux-box", kind: "notice", text: "依据 tasks/done/T-0005.md 和 D-0294/notes，不重复 T-0005" }];
-    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], extra), width: 1200, height: 800, platform: "macos" });
+    const app = await open("./App.tsx", { storage: STORAGE, network: hub([], extra), width: 1200, height: 800, platform: "linux" });
     await app.waitFor("text:/tasks\\/done\\/T-0005\\.md/");
     expect(app.shows("text:/D-0294\\/notes/")).toBe(true);
     // The chip of the id on its own (the earlier message has one too).
@@ -718,6 +734,32 @@ describe("channel", () => {
     await app.waitFor("早就做完了");
   });
 
+  test("all tasks: Return searches, the result line names the query, and clearing brings every task back", async () => {
+    const row = (i: number) => ({ id: `T-${1000 + i}`, title: `旧任务 ${i}`, agent: "lead", state: "done", updated: ts(1) });
+    const app = await open("./App.tsx", {
+      storage: STORAGE, width: 1200, height: 800, platform: "macos",
+      network: {
+        ...hub([]),
+        [`GET ${URL}/api/tasks?*`]: (r: { url: string }) => {
+          const q = new ParsedURL(r.url).searchParams.get("q");
+          if (q) return { body: { tasks: [row(70)], total: 1 } };
+          return { body: { tasks: Array.from({ length: 3 }, (_, i) => row(i)), total: 3 } };
+        },
+      },
+    });
+    await app.waitFor("Channel");
+    await app.press("label:All tasks");
+    await app.waitFor("旧任务 0");
+    expect(app.shows("Search")).toBe(false); // no separate button: Return searches
+    await app.type("id:task-search", "旧任务 70");
+    await app.submit("id:task-search");
+    await app.waitFor("1 task matches “旧任务 70”");
+    expect(app.shows("旧任务 0")).toBe(false);
+    await app.press("id:task-search-clear");
+    await app.waitFor("旧任务 0");
+    expect(app.shows("task matches")).toBe(false);
+  });
+
   test("channels: the sidebar lists them with unread counts; a channel shows its goal, items, edit and archive", async () => {
     const posts: unknown[] = [];
     const fresh = ts(5);
@@ -893,6 +935,26 @@ describe("images", () => {
       },
     };
   }
+
+  test("a log or a report file is a file card that opens it, not an expired image", async () => {
+    const files = {
+      id: "f1", ts: ts(8), from: "lead@mac", kind: "notice", text: "收口完成",
+      attachments: ["/media/1794484440777-report.md", "/media/1794484440793-verify.log"],
+    };
+    // the app's nsh.json grants openUrl only for https, as the real hub is; a secure hub keeps the press recordable
+    const secure = URL.replace("http:", "https:");
+    const network = Object.fromEntries(
+      Object.entries({ ...hub([], [files]), [`GET ${URL}/media/*`]: { body: "# report" } }).map(([key, value]) => [key.replace(URL, secure), value]),
+    );
+    const app = await open("./App.tsx", { ...desk, storage: { ...STORAGE, "hub.url": secure }, network });
+    await app.waitFor("id:file-attachment");
+    expect(app.count("id:file-attachment")).toBe(1);
+    expect(app.shows("text:verify.log")).toBe(true);
+    expect(app.shows("id:media-gone")).toBe(false);
+    await app.press("id:file-attachment");
+    await app.waitUntil(() => app.openedUrls().length === 1);
+    expect(app.openedUrls()).toEqual([`${secure}/media/1794484440793-verify.log?token=tok`]);
+  });
 
   test("a zoomed image pages through its message's images in a loop", async () => {
     const shots = { id: "i1", ts: ts(8), from: "lead@mac", kind: "notice", text: "截图", attachments: ["/media/1-a.png", "/media/2-b.png"] };
@@ -1418,6 +1480,23 @@ describe("notifications", () => {
     await app.waitUntil(() => app.host.calls().some((c) => c.name === "clearNotifications" && (c.data as { ref: string }).ref === "D-0001"));
   });
 
+  test("a card the hub has already closed leaves the badge, though its ask stays in the feed", async () => {
+    // D-0001 answered from the chat: the brain's answer_decision posts a notice, not an owner message naming the id, so
+    // the feed still reads it pending while the hub has no card open. Counting the feed kept the badge on "1" for days
+    // (D-0004); what counts is the hub's open list, the one the sidebar shows.
+    const app = await open("./App.tsx", {
+      storage: { ...STORAGE, "hub.notifyAsked": "1" },
+      host: { handlers: browser(device()) },
+      network: { ...server(newLog()), [`GET ${URL}/api/status`]: { body: { ...status, decisions: [] } } },
+      width: 1200, height: 800, platform: "macos",
+    });
+    await app.waitFor("text:/要不要升级依赖/"); // the ask is on screen: the feed did load
+    await app.waitUntil(() => {
+      const badge = app.host.calls().filter((c) => c.name === "setBadge");
+      return badge.length > 0 && (badge[badge.length - 1].data as { count: number }).count === 0;
+    });
+  });
+
   test("mark a message unread, the channel's unread count, and mark all as read", async () => {
     const app = await open("./App.tsx", {
       storage: { ...STORAGE, "hub.lastSeen": events[0].ts, "hub.notifyAsked": "1" },
@@ -1662,6 +1741,8 @@ describe("phones", () => {
       await app.press("id:settings-top");
       await app.waitFor("id:phone-settings");
       for (const t of ["Notifications", "Members", "Routines", "Parallelism", "Account", "Sign out"]) expect(app.shows(`id:phone-settings >> text:${t}`)).toBe(true);
+      // iOS has the system's segmented control for the appearance (NSH's SegmentedControl); Android has no such section.
+      expect(app.shows("id:phone-settings >> text:Appearance")).toBe(platform === "ios");
       // A member pushes its page: models and autonomy as radio rows.
       await app.press("id:member-reporter");
       await app.waitFor("id:phone-member");

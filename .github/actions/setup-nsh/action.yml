@@ -4,7 +4,7 @@ description: >
   It is the layout of an nsh release (bin/ and runtime/), so packaging needs no Rust once cached.
 inputs:
   ref:
-    description: The longbridge/nsh commit to build
+    description: The longbridge/nsh commit to build, or `nightly` for the commit of the current NSH nightly release
     required: true
   target:
     description: linux, windows, macos, ios, android or web
@@ -16,6 +16,19 @@ inputs:
 runs:
   using: composite
   steps:
+    # `nightly` pins the run to the commit the NSH nightly release was built from, so the prebuilt CLI and runtimes
+    # below always match and packaging skips the Rust build.
+    - id: ref
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REF: ${{ inputs.ref }}
+      run: |
+        if [ "$REF" = nightly ]; then
+          REF="$(gh release view nightly -R longbridge/nsh --json targetCommitish -q .targetCommitish)"
+          echo "NSH nightly is $REF"
+        fi
+        echo "sha=$REF" >> "$GITHUB_OUTPUT"
     # The linked SDK controls UIKit's appearance. Include the toolchain in the
     # cache key so upgrading Xcode cannot silently reuse an old native runtime.
     - id: apple-sdk
@@ -34,7 +47,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.nsh-dist
-        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}${{ steps.apple-sdk.outputs.key }}${{ inputs.target == 'macos' && format('-{0}', inputs.rust-target || 'native') || '' }}${{ inputs.target == 'linux' && '-crypto-v1' || '' }}
+        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ steps.ref.outputs.sha }}${{ steps.apple-sdk.outputs.key }}${{ inputs.target == 'macos' && format('-{0}', inputs.rust-target || 'native') || '' }}${{ inputs.target == 'linux' && '-crypto-v1' || '' }}
 
     # The x86_64 CLI also generates x86_64 OTA archive names. It needs Rosetta even on cache hits.
     - if: runner.os == 'macOS' && runner.arch == 'ARM64' && inputs.rust-target == 'x86_64-apple-darwin'
@@ -64,7 +77,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-        REF: ${{ inputs.ref }}
+        REF: ${{ steps.ref.outputs.sha }}
         TARGET: ${{ inputs.target }}
         RUST_TARGET: ${{ inputs.rust-target }}
       run: |
@@ -105,7 +118,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: longbridge/nsh
-        ref: ${{ inputs.ref }}
+        ref: ${{ steps.ref.outputs.sha }}
         path: .nsh-src
         # Keep the native build's host tools when cross-compiling Intel on the same Mac runner.
         clean: ${{ inputs.target != 'macos' || inputs.rust-target == '' }}
@@ -192,7 +205,7 @@ runs:
       uses: actions/cache/save@v4
       with:
         path: ~/.nsh-dist
-        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ inputs.ref }}-${{ inputs.rust-target || 'native' }}
+        key: nsh-dist-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-${{ steps.ref.outputs.sha }}-${{ inputs.rust-target || 'native' }}
 
     - if: inputs.target == 'ios'
       shell: bash

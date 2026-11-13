@@ -202,6 +202,9 @@ export class Hub extends DurableObject<Env> {
     this.sql.exec("CREATE INDEX IF NOT EXISTS events_channel ON events (json_extract(json, '$.channel')) WHERE json_extract(json, '$.channel') IS NOT NULL");
     // Indexed receipt lookup: one row per retry, no event scan or polling.
     this.sql.exec("CREATE INDEX IF NOT EXISTS events_client_id ON events (json_extract(json, '$.client_id')) WHERE json_extract(json, '$.client_id') IS NOT NULL");
+    // Event ids are the host's idempotency key (a retried POST must not store the event twice); indexed so every
+    // upload checks one row, not the whole history.
+    this.sql.exec("CREATE INDEX IF NOT EXISTS events_id ON events (json_extract(json, '$.id')) WHERE json_extract(json, '$.id') IS NOT NULL");
     if (this.sql.exec("SELECT v FROM kv WHERE k = 'events_ref_filled'").toArray().length === 0) {
       this.sql.exec("UPDATE events SET ref = json_extract(json, '$.ref') WHERE ref IS NULL");
       this.sql.exec("INSERT OR REPLACE INTO kv (k, v) VALUES ('events_ref_filled', '1')");
@@ -824,6 +827,12 @@ export class Hub extends DurableObject<Env> {
       const e = (await req.json()) as Partial<Ev>;
       // over budget, routine fleet chatter is dropped (still in the local journal); what the owner must see still goes through
       if (this.level() === "shed" && SHEDDABLE.has(String(e.kind ?? ""))) return json({ dropped: "write budget" });
+      // the event id is the idempotency key: a host that never saw the reply (timeout, Worker restart, a retry after a
+      // dropped response) posts the same event again, and storing it twice shows the same message twice in the chat.
+      // Same rule ownerMessage already applies to client_id. The check and the insert below run without an await in
+      // between, so two requests carrying one id cannot both get past it.
+      if (typeof e.id === "string" && this.sql.exec("SELECT 1 FROM events WHERE json_extract(json, '$.id') = ? LIMIT 1", e.id).toArray().length)
+        return json({ duplicate: true });
       return json(this.append(e));
     }
     if (p === "/api/host/state" && m === "PUT") {

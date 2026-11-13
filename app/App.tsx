@@ -2,6 +2,7 @@
 // Design: the NSH gallery's (~/work/nsh/examples/gallery): its theme tokens (theme.json is the
 // gallery's), its shared UI layer (nsh-gallery-ui: palette, icons, tooltips, scroll bars), its
 // sidebar + toolbar layout; sized up for reading a chat all day (16 pt text, 40 pt controls).
+import { ReaderSheet } from "./ui/reader-sheet";
 import { L, lang, LANG_KEY, LANGS } from "./i18n";
 
 /** A sender's name in the current language (agents localized, others without the @host). */
@@ -39,16 +40,29 @@ import {
 import fs from "fs/promises";
 import type { InputRef, JSX, ScrollRef, SpeechSession, ViewStyle } from "nsh";
 import { AlertDialog, Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious, Toast, ToastStack, Button as BaseButton, ContextMenu, Dialog, Menu, MenuItem, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, Sheet, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline } from "nsh/base";
+// MenuButton and SegmentedControl through the namespaces: runtimes before NSH's native iOS controls (longbridge/nsh#1736)
+// lack these exports, and a missing named import would fail to link. Without them iOS keeps the drawn menu and choices.
+import * as nshBase from "nsh/base";
+import * as nshMobile from "nsh/mobile";
 import { isAvailable as hasWindow, titleBar, currentWindow } from "nsh/desktop";
 import { checkForPackage, checkForUpdate, downloadPackage, downloadUpdate, installAndRestart, restartToPackage, runningPackage } from "nsh/updater";
 // shellInfo through the namespace: runtimes older than it lack the export, and a missing named import would fail to link
 import * as nshUpdater from "nsh/updater";
 import { CLIENT_VERSION } from "./version";
+
+/** One row of the system menu `MenuButton` shows: an action, a submenu (`items`) or an inline group (`inline`). */
+type MenuButtonItem = { id: string; label: string; icon?: string; disabled?: boolean; checked?: boolean; inline?: boolean; items?: MenuButtonItem[] };
+type MenuButtonProps = { testID?: string; accessibilityLabel?: string; title?: string; items: MenuButtonItem[]; onSelect: (event: { id: string }) => void; style?: ViewStyle; children?: JSX.Element };
+type SegmentedControlProps = { testID?: string; items: { title: string }[]; selectedIndex: number; onChange: (event: { index: number }) => void };
+const MenuButton = (nshBase as { MenuButton?: (props: MenuButtonProps) => JSX.Element }).MenuButton;
+const SegmentedControl = (nshMobile as { SegmentedControl?: (props: SegmentedControlProps) => JSX.Element }).SegmentedControl;
 import { createSettingsToast, SettingsToast } from "./settings-toast";
 import { agentDisplayName, avatarOf } from "./avatars";
+import { badgeCount } from "./badge";
 import { CheckMark } from "./ui/icons";
-import { attachmentName, isDoc } from "./files";
-import { hubMarkdown } from "./markdown";
+import { attachmentName, isDoc, isImage } from "./files";
+import { parseHubMarkdown } from "./markdown";
+import { messageTags, taskTagId } from "./message-tags";
 import { type Channel, channelDigest, sortChannels } from "./channels";
 import { isRead, markRead, unreadEvents, toggleMessageRead, type MessageReadState as ReadState } from "./read";
 import { setupTray, type TrayChat } from "./tray";
@@ -60,8 +74,6 @@ import {
   avatarInitials,
   colors,
   focusRing,
-  iosGlass,
-  menuGlass,
   hovered,
   Icon,
   type IconName,
@@ -81,6 +93,7 @@ import {
   Indicator,
   type IndicatorStatus,
   Input as TextField,
+  SearchField,
   Kbd,
   Separator,
   size,
@@ -610,15 +623,19 @@ function Rich(props: { text: string; muted?: boolean; quiet?: boolean; context?:
   const lineHeight = () => (props.quiet ? 19 : small ? 21 : size.line) * k();
   const doc = () => {
     // Reports preserve identifiers as text; chat-only chips can replace a heading prefix with an invisible attachment.
-    const d = TextView.parse(hubMarkdown(linkRepoRefs(props.text, props.context)), { math: false, html: false }, props.report ? [] : EXTENSIONS);
-    return { ...d, blocks: ghBlocks(d.blocks) };
+    const d = parseHubMarkdown(linkRepoRefs(props.text, props.context), props.report, props.report ? [] : EXTENSIONS);
+    return messageTags({ ...d, blocks: ghBlocks(d.blocks) }, platform.os);
   };
   return (
     <View style={{ gap: 6 }}>
       <TextView
         document={doc()}
         selectable
-        onLinkPress={({ url }) => { if (/^(https?|mailto):/i.test(url)) void openUrl(url).catch(() => {}); }}
+        onLinkPress={({ url }) => {
+          const task = taskTagId(url);
+          if (task) taskLink(task);
+          else if (/^(https?|mailto):/i.test(url)) void openUrl(url).catch(() => {});
+        }}
         renderCustom={(node) => <Custom node={node} small={small} />}
         styles={{
           root: { gap: 8 * k(), fontSize: fontSize(), lineHeight: lineHeight(), color: small ? colors.muted : colors.text },
@@ -653,12 +670,14 @@ function Media(props: { hub: Hub; path: string; /** Every attachment of its mess
   const frame: ViewStyle = { borderRadius: radius.inset, backgroundColor: colors.inset };
   if (isDoc(props.path)) return <DocAttachment src={src} name={attachmentName(props.path)} />;
   if (isVideo(props.path)) return <Video src={src} controls paused style={{ ...frame, borderWidth: 1, borderColor: colors.border, width: "100%", maxWidth: 480, aspectRatio: 16 / 9 }} />;
+  // a log, a patch, a pptx: the image decoder can only fail on it, which reads as an expired image
+  if (!isImage(props.path)) return <FileAttachment src={src} name={attachmentName(props.path)} />;
   // a thumbnail that keeps the timeline readable; press it to see the full image
   const THUMB = 240;
   const size = () => (ratio() >= 1 ? { width: THUMB, height: THUMB / ratio() } : { width: THUMB * ratio(), height: THUMB });
   const gone = signal(false); // past the media retention (or otherwise unavailable)
   // the message's images, which the zoomed view pages through in a loop
-  const images = () => (props.siblings ?? [props.path]).filter((p) => !isDoc(p) && !isVideo(p));
+  const images = () => (props.siblings ?? [props.path]).filter(isImage);
   return (
     <If
       when={!gone()}
@@ -695,6 +714,35 @@ function Media(props: { hub: Hub; path: string; /** Every attachment of its mess
         <ImagePager hub={props.hub} paths={images()} start={Math.max(0, images().indexOf(props.path))} onClose={() => zoomed.set(false)} />
       </Dialog>
     </If>
+  );
+}
+
+/**
+ * An attachment the client cannot show inline (a log, a patch, a pptx, a pdf): a card that opens the authenticated file
+ * itself, instead of handing it to the image decoder and reporting the load as an expired image.
+ */
+function FileAttachment(props: { src: string; name: string }) {
+  const ext = () => (props.name.match(/\.(\w{1,5})$/)?.[1] ?? "FILE").toUpperCase();
+  return (
+    <View
+      testID="file-attachment"
+      role="button"
+      accessibilityLabel={L(`Open ${props.name}`, `打开 ${props.name}`)}
+      onPress={() => void openUrl(props.src).catch(() => {})}
+      hoverStyle={hovered()}
+      style={{
+        flexDirection: "row", alignItems: "center", gap: 10, width: 344, maxWidth: "100%", padding: 12,
+        borderRadius: radius.inset, borderCurve: "continuous", borderWidth: 1, cursor: "pointer",
+        borderColor: colors.border, backgroundColor: colors.background,
+      }}
+    >
+      <View style={{ width: 40, height: 44, flexShrink: 0, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", gap: 3 }}>
+        <Icon name="document" size={18} tint={colors.muted} />
+        <Text style={{ fontFamily: MONO, fontSize: 8, fontWeight: "600", letterSpacing: 0.5, color: colors.faint }}>{ext()}</Text>
+      </View>
+      <Text style={{ flex: 1, minWidth: 0, fontSize: 14, lineHeight: 19, fontWeight: "600", color: colors.text, numberOfLines: 2 }}>{props.name}</Text>
+      <Icon name="download" size={14} tint={colors.faint} />
+    </View>
   );
 }
 
@@ -821,7 +869,7 @@ function DocAttachment(props: { src: string; name: string }) {
 const releaseKeyboard = () => { if (platform.os === "macos") Keyboard.dismiss(); };
 
 const DOC_SCALES = [0.875, 1, 1.125, 1.25, 1.4];
-/** The reader beside the chat (a full sheet on a phone): the open report rendered with TextView, with text zoom and a wider pane. */
+/** The report sheet, with independent text zoom and panel maximization. */
 /**
  * The report reader. Beside the chat (`wide`) it runs to the window's top edge: its header is part of the window's
  * title bar (drags the window, and leaves room for the window buttons Linux and Windows draw at the right).
@@ -846,7 +894,7 @@ function DocPane(props: { doc: DocRef; wide: boolean; expanded: boolean; onExpan
         <Text testID="doc-scale" style={{ width: 36, textAlign: "center", fontSize: 11.5, fontVariant: ["tabular-nums"], color: colors.faint }}>{`${Math.round(DOC_SCALES[step()] * 100)}%`}</Text>
         {btn({ id: "doc-zoom-in", icon: "zoom-in", label: L("Larger text", "放大文字"), disabled: step() === DOC_SCALES.length - 1, onPress: () => step.set(Math.min(DOC_SCALES.length - 1, step() + 1)) })}
         <If when={props.wide}>
-          {btn({ id: "doc-expand", icon: props.expanded ? "minimize" : "maximize", label: props.expanded ? L("Narrow reader", "收窄阅读栏") : L("Widen reader", "加宽阅读栏"), on: props.expanded, onPress: props.onExpand })}
+          {btn({ id: "doc-expand", icon: props.expanded ? "minimize" : "maximize", label: props.expanded ? L("Restore reader", "还原阅读栏") : L("Maximize reader", "放大阅读栏"), on: props.expanded, onPress: props.onExpand })}
         </If>
         {btn({ id: "doc-close", icon: "close", label: L("Close reader", "关闭阅读栏"), onPress: props.onClose })}
       </View>
@@ -1517,14 +1565,19 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
   const error = signal("");
   const loading = signal(false);
   const query = signal("");
+  const searched = signal(""); // the query the shown results are for
+  const searching = signal(false); // a first page is on its way (the field's spinner), not a "Load more"
   let asked = 0; // the newest request; an older answer that lands late is dropped
   async function load(reset: boolean) {
     const mine = ++asked;
     loading.set(true);
     const offset = reset ? 0 : untracked(tasks).length;
-    const r = await props.hub.api("GET", `/api/tasks?limit=${HISTORY_PAGE}&offset=${offset}&q=${encodeURIComponent(untracked(query).trim())}`);
+    const q = reset ? untracked(query).trim() : untracked(searched);
+    if (reset) { searched.set(q); searching.set(true); }
+    const r = await props.hub.api("GET", `/api/tasks?limit=${HISTORY_PAGE}&offset=${offset}&q=${encodeURIComponent(q)}`);
     if (mine !== asked) return;
     loading.set(false);
+    searching.set(false);
     if (!r.ok) { error.set(r.status ? L(`Couldn’t load (${r.status})`, `读取失败（${r.status}）`) : L("Can’t reach the server", "连不上服务器")); return; }
     error.set("");
     const page = (r.data.tasks as TaskInfo[] | undefined) ?? [];
@@ -1535,20 +1588,27 @@ function TaskHistory(props: { hub: Hub; wide: boolean; onTask: (id: string) => v
   return (
     <Scroll testID="task-history" style={{ flex: 1 }}>
       <View style={{ width: "100%", maxWidth: size.column, alignSelf: "center", gap: 12, paddingHorizontal: props.wide ? 32 : 16, paddingVertical: 20 }}>
-        {/* searched on the button or Enter, not on every keystroke: each search reads every task on the server */}
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <TextField
-            testID="task-search"
-            value={query()}
-            onChange={query.set}
-            onSubmit={() => void load(true)}
-            placeholder={L("Search by ID, title or member", "搜索编号、标题或成员")}
-            style={{ flex: 1 }}
-          />
-          <Button testID="task-search-button" label={L("Search", "搜索")} variant="secondary" disabled={loading()} onPress={() => void load(true)} />
-        </View>
+        {/* searched on Return, not on every keystroke: each search reads every task on the server */}
+        <SearchField
+          testID="task-search"
+          value={query()}
+          onChange={query.set}
+          onSubmit={() => void load(true)}
+          onClear={() => { query.set(""); if (searched()) void load(true); }}
+          placeholder={L("Search by ID, title or member", "搜索编号、标题或成员")}
+          clearLabel={L("Clear search", "清除搜索")}
+          loading={searching()}
+          hint={query().trim() !== searched()}
+        />
         <If when={error()}><Text style={{ fontSize: 14, color: colors.danger }}>{error()}</Text></If>
-        <If when={total() === 0 && !loading()}><Text style={{ fontSize: 14, color: colors.faint }}>{L("No matching tasks", "没有符合的任务")}</Text></If>
+        <If when={searched() && total() !== null && !error()}>
+          <Text style={{ fontSize: 13, color: colors.faint }}>
+            {total() === 0
+              ? L(`No tasks match “${searched()}”`, `没有与“${searched()}”匹配的任务`)
+              : L(`${total()} ${total() === 1 ? "task matches" : "tasks match"} “${searched()}”`, `${total()} 个任务与“${searched()}”匹配`)}
+          </Text>
+        </If>
+        <If when={!searched() && total() === 0 && !loading()}><Text style={{ fontSize: 14, color: colors.faint }}>{L("No tasks yet", "还没有任务")}</Text></If>
         <Each of={groupByDay(tasks(), (t) => t.updated ?? "")} key={(g) => g.key}>
           {(g) => (
         <View>
@@ -2159,19 +2219,13 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
   const account = () => email().split("@")[0] ?? "";
   // A pointer gets a compact popup at the trigger; a finger gets the sheet at the bottom with rows it can hit.
   const touch = platform.os === "ios" || platform.os === "android";
-  /**
-   * iOS drops the custom account card and grouped fills: plain rows and separators on the bare glass. It is still NSH's
-   * drawn Menu: NSH shows a system menu (`Menu.popup`) only on the desktops, and has no UIMenu for a view on iOS.
-   */
+  /** iOS shows the system's own pull-down menu (`MenuButton`'s UIMenu) instead of the drawn one below. */
   const ios = platform.os === "ios";
   const m = touch
     ? { row: 52, padX: 16, gap: 12, icon: 20, label: 16, value: 14, avatar: 44, name: 20, mail: 14, seg: 44, segH: 44, sepX: 12 }
     : { row: 30, padX: 8, gap: 10, icon: 15, label: 13.5, value: 13, avatar: 30, name: 13.5, mail: 12, seg: 28, segH: 22, sepX: 8 };
   const sheet = (): ViewStyle => ({ left: 12, right: 12, bottom: Math.max(12, safeArea().bottom), padding: 12 });
-  const surface = (): ViewStyle => platform.os === "ios"
-    // iOS: the sheet is Liquid Glass (a blurred, nearly opaque fallback before iOS 26), its groups quiet fills on it.
-    ? { ...menuGlass(colors.raised, corner.sheet), ...sheet() }
-    : touch
+  const surface = (): ViewStyle => touch
     // Android: opaque, as the sheet sits over the sidebar's own rows.
     ? { backgroundColor: colors.raised, borderRadius: corner.sheet, borderCurve: "continuous", boxShadow: "0 10px 40px rgba(0,0,0,0.18)", ...sheet() }
     // No minWidth here: the language submenu takes this same style and should fit its rows; the menu gets its width from its header.
@@ -2180,8 +2234,8 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
   const label = (text: string) => <Text style={{ flex: 1, minWidth: 0, fontSize: m.label, color: colors.text, ...(touch ? {} : { numberOfLines: 1 }) }}>{text}</Text>;
   const lead = (name: IconName) => <Icon name={name} size={m.icon} tint={colors.muted} />;
   const sep = () => <MenuSep />;
-  /** A group of rows on the sheet: none on iOS, whose rows sit on the glass as a menu's do; the surface on Android. */
-  const group = () => (ios ? "transparent" : colors.surface);
+  /** A group of rows on Android's sheet. */
+  const group = () => colors.surface;
   const initials = () => avatarInitials(account());
   /** The account's identity: its initials on a soft tint of its own stable hue, with a hairline of the same hue. */
   const avatar = (box: number, testID?: string) => (
@@ -2190,14 +2244,8 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
       <Text style={{ fontSize: Math.round(box * (initials().length > 1 ? 0.38 : 0.44)), fontWeight: "600", color: avatarIdentity(account() || "?").foreground }}>{initials()}</Text>
     </View>
   );
-  /**
-   * The current appearance's segment: on iOS 26 the system's Liquid Glass material (no fill, which iOS draws over the
-   * glass, and no shadow: the glass has its own edge); a raised field elsewhere. NSH has no UISegmentedControl, so the
-   * control itself is drawn rows; only its thumb is the native material.
-   */
-  const selectedSegment = (): ViewStyle => iosGlass
-    ? { backgroundColor: "transparent", glassEffect: "regular", backdropFilter: "blur(20px)" }
-    : { backgroundColor: colors.field, boxShadow: "0 1px 2px rgba(0,0,0,0.14)" };
+  /** The current appearance's segment: a raised field (iOS shows the system menu's checks instead). */
+  const selectedSegment = (): ViewStyle => ({ backgroundColor: colors.field, boxShadow: "0 1px 2px rgba(0,0,0,0.14)" });
   /** One of the two appearances, as a segment whose raised thumb marks the current one. */
   const appearance = (dark: boolean, title: string, icon: IconName) => (
     <MenuItem testID={dark ? "theme-dark" : "theme-light"} accessibilityLabel={title}
@@ -2220,6 +2268,38 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
       </View>
     </MenuItem>
   );
+  const menuLabel = () => L("Account menu", "用户菜单");
+  const triggerStyle = (): ViewStyle => ({ width: "100%", flexDirection: "row", alignItems: "center", gap: 8, minHeight: touch ? 44 : 40, paddingLeft: 8, paddingRight: 10, borderRadius: radius.control, borderCurve: "continuous" });
+  const triggerContent = () => <>
+    {avatar(touch ? 28 : 24, "user-avatar")}
+    <Text testID="user-account" style={{ flex: 1, fontSize: 13, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{account() || L("Account", "账户")}</Text>
+    <Icon name="chevron-up" size={12} tint={colors.faint} />
+  </>;
+  if (ios && MenuButton) {
+    /** The system menu's rows, as data: the same actions, language and appearance as the drawn menu's. */
+    const items = (): MenuButtonItem[] => [
+      { id: "mark-all-read", label: L("Mark all as read", "全部已读"), icon: "checkmark.circle", disabled: !props.reads.main().length },
+      { id: "settings", label: L("Settings…", "设置…"), icon: "gearshape" },
+      { id: "", label: L("Language", "语言"), icon: "globe", items: LANGS.map((l) => ({ id: `lang:${l.id}`, label: l.label, checked: lang() === l.id })) },
+      { id: "", label: L("Appearance", "外观"), inline: true, items: [
+        { id: "theme-light", label: L("Light", "浅色"), icon: "sun.max", checked: !isDark() },
+        { id: "theme-dark", label: L("Dark", "深色"), icon: "moon", checked: isDark() },
+      ] },
+    ];
+    const select = (id: string) => {
+      if (id === "mark-all-read") props.reads.all();
+      else if (id === "settings") props.onSettings();
+      else if (id.startsWith("lang:")) pickLang(id.slice("lang:".length));
+      else if ((id === "theme-dark") !== isDark() && id.startsWith("theme-")) toggleTheme();
+    };
+    return (
+      <View onTouchStartCapture={() => Keyboard.dismiss()} style={{ width: "100%" }}>
+        <MenuButton testID="user-menu" accessibilityLabel={menuLabel()} title={email()} items={items()} onSelect={({ id }) => select(id)} style={triggerStyle()}>
+          {triggerContent()}
+        </MenuButton>
+      </View>
+    );
+  }
   return (
     <Menu
       align="start"
@@ -2232,22 +2312,14 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
       popupStartingStyle={touch ? undefined : menuEnter("top")}
       backdropClass="bg-scrim"
       trigger={
-        <View
-          role="button"
-          testID="user-menu"
-          accessibilityLabel={L("Account menu", "用户菜单")}
-          hoverStyle={hovered()}
-          style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 8, minHeight: touch ? 44 : 40, paddingLeft: 8, paddingRight: 10, borderRadius: radius.control, borderCurve: "continuous" }}
-        >
-          {avatar(touch ? 28 : 24, "user-avatar")}
-          <Text testID="user-account" style={{ flex: 1, fontSize: 13, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{account() || L("Account", "账户")}</Text>
-          <Icon name="chevron-up" size={12} tint={colors.faint} />
+        <View role="button" testID="user-menu" accessibilityLabel={menuLabel()} hoverStyle={hovered()} style={triggerStyle()}>
+          {triggerContent()}
         </View>
       }
     >
       <View>
-      <View style={{ ...(touch ? {} : { minWidth: 254 }), flexDirection: "row", alignItems: "center", gap: touch ? 12 : 10, paddingHorizontal: m.padX, paddingTop: touch ? 12 : 6, paddingBottom: ios ? 12 : touch ? 24 : 7 }}>
-        <If when={!ios}>{avatar(m.avatar, "user-menu-avatar")}</If>
+      <View style={{ ...(touch ? {} : { minWidth: 254 }), flexDirection: "row", alignItems: "center", gap: touch ? 12 : 10, paddingHorizontal: m.padX, paddingTop: touch ? 12 : 6, paddingBottom: touch ? 24 : 7 }}>
+        {avatar(m.avatar, "user-menu-avatar")}
         <View style={{ flex: 1, minWidth: 0, gap: touch ? 4 : 1 }}>
           <Text style={{ fontSize: m.name, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{account() || L("Account", "账户")}</Text>
           <If when={email()}>
@@ -2255,7 +2327,7 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
           </If>
         </View>
       </View>
-      <If when={!touch || ios}>{sep()}</If>
+      <If when={!touch}>{sep()}</If>
       <View style={touch ? { backgroundColor: group(), borderRadius: 12, borderCurve: "continuous" } : {}}>
         <MenuItem testID="mark-all-read" disabled={!props.reads.main().length} onSelect={props.reads.all} hoverStyle={menuRowHover()} activeStyle={menuRowHover()} disabledStyle={{ opacity: 0.4 }} style={row()}>
           {lead("check")}{label(L("Mark all as read", "全部已读"))}
@@ -2278,8 +2350,7 @@ function UserMenu(props: { hub: Hub; onSettings: () => void; reads: MessageReads
           </PopIn>
         </Submenu>
       </View>
-      <If when={ios}>{sep()}</If>
-      <View style={touch ? { gap: 8, paddingTop: ios ? 8 : 16, paddingHorizontal: 4 } : { ...row(), height: 34 }}>
+      <View style={touch ? { gap: 8, paddingTop: 16, paddingHorizontal: 4 } : { ...row(), height: 34 }}>
         <If when={!touch}>{lead(isDark() ? "moon" : "sun")}</If>
         <Text style={{ ...(touch ? { paddingHorizontal: 12 } : { flex: 1 }), fontSize: touch ? 14 : m.label, color: touch ? colors.muted : colors.text }}>{L("Appearance", "外观")}</Text>
         <View style={{ flexDirection: "row", gap: touch ? 4 : 2, padding: touch ? 4 : 2, borderRadius: touch ? 12 : 8, borderCurve: "continuous", backgroundColor: alpha(colors.text, 0.07) }}>
@@ -3312,6 +3383,23 @@ function PhoneSettings(props: { hub: Hub; push: Push; settings: Settings; onOpen
       <Section title={L("Language", "语言")}>
         <LangChoices />
       </Section>
+      <If when={platform.os === "ios"}>
+        {/* iOS: the system's segmented control (Liquid Glass on iOS 26); the account menu has the same choice as checks. */}
+        <Section title={L("Appearance", "外观")}>
+          {SegmentedControl
+            ? <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+                <SegmentedControl testID="settings-appearance"
+                  items={[{ title: L("Light", "浅色") }, { title: L("Dark", "深色") }]}
+                  selectedIndex={isDark() ? 1 : 0}
+                  onChange={({ index }) => { if ((index === 1) !== isDark()) toggleTheme(); }} />
+              </View>
+            // A runtime without the native control: the same choice as rows, like the language above.
+            : <Choices label={L("Appearance", "外观")}
+                choices={[{ id: "light", label: L("Light", "浅色"), testID: "settings-appearance-light" }, { id: "dark", label: L("Dark", "深色"), testID: "settings-appearance-dark" }]}
+                selected={isDark() ? "dark" : "light"}
+                onPick={(id) => { if ((id === "dark") !== isDark()) toggleTheme(); }} />}
+        </Section>
+      </If>
       <Section title={L("Memory", "记忆")} hint={L("The rules the team works by, your preferences, member profiles and past decisions. Read-only.", "团队做事依据的规则、你的偏好、成员档案和决策先例。只读。")}>
         <SetRow first label={L("Rules & memory", "规则与记忆")} chevron onPress={() => props.onOpen({ name: "rules" })} testID="settings-rules" />
       </Section>
@@ -3643,6 +3731,7 @@ const SHORTCUTS = (): [string, string][] => [
   [`R  ·  ${keymap.label("alt+r")}`, L("Reply to the current decision (other instructions)", "回复当前决策（其他指示）")],
   [`G  ·  ${keymap.label("alt+g")}`, L("Back to bottom", "回到底部")],
   ["Esc", L("Cancel reply / leave the message box / close", "取消回复 / 离开输入框 / 关闭")],
+  [`${keymap.label("mod+alt+left")} / ${keymap.label("mod+alt+right")}`, L("Resize report reader", "调整阅读栏宽度")],
   [keymap.label("mod+,"), L("Team settings", "团队设置")],
   [keymap.label("mod+b"), L("Show / hide sidebar", "显示 / 隐藏侧栏")],
   [keymap.label("mod+shift+l"), L("Toggle light / dark", "切换浅色 / 深色")],
@@ -3847,13 +3936,12 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // a different hub or a sign-out starts with no reports kept from the last one
   cleanup(clearDocCache);
   const readerWide = signal(false);
-  /** Room for the chat beside the reader; below it the reader covers the chat like a sheet. */
+  const resizedReaderWidth = signal<number | null>(null);
+  /** The sheet covers only the conversation, keeping the navigation sidebar accessible. */
   const chatRoom = () => windowSize().width - (wide() && sidebarOpen() ? size.sidebar : 0);
   const readerSide = () => wide() && chatRoom() >= 860;
-  const readerWidth = () => (readerWide() ? Math.round(chatRoom() * 0.62) : Math.min(460, Math.round(chatRoom() * 0.42)));
+  const readerWidth = () => Math.min(chatRoom(), resizedReaderWidth() ?? Math.max(360, Math.min(460, Math.round(chatRoom() * 0.42))));
   const shownDoc = () => { const d = reading(); return d && d.at === readerAt() ? d : null; };
-  /** The reader beside a page that has one (the channel, a task), from the window's top edge. */
-  const docSide = () => !!shownDoc() && readerSide() && (top().name === "channel" || top().name === "task");
   /**
    * When the conversation was entered: reports already there stay closed (their cards and the header's button open
    * them). On a desktop a report that arrives later, while the reader has room beside the chat, opens by itself; on a
@@ -3872,7 +3960,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   const readerPane = () => {
     const d = shownDoc();
     if (!d) return null;
-    return <DocPane doc={d} wide={readerSide()} expanded={readerWide()} onExpand={() => { if (!reduceMotion()) LayoutAnimation.configureNext(LayoutAnimation.create(180, "easeInEaseOut")); readerWide.set(!readerWide()); }} onClose={() => reading.set(null)} />;
+    return <DocPane doc={d} wide={!touch} expanded={readerWide()} onExpand={() => { if (!reduceMotion()) LayoutAnimation.configureNext(LayoutAnimation.create(180, "easeInEaseOut")); readerWide.set(!readerWide()); }} onClose={() => reading.set(null)} />;
   };
   const visibleMessages = signal<HubEvent[]>([]);
   effect(() => {
@@ -3940,6 +4028,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     return out;
   });
   const pending = computed(() => hub.events().filter((e) => isAsk(e) && !answered().has(e.ref!)));
+  /** The badge and the tray count the hub's open cards, as the sidebar does (see badge.ts). */
+  const waitingCount = computed(() => badgeCount(hub.status(), answered(), pending().length));
   /** The pending ask the keys act on: the one picked (J / K, the sidebar), else the newest. */
   const target = computed(() => {
     const p = pending();
@@ -4316,7 +4406,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   }
   // The app's badge and the page's title count the decisions waiting. iOS needs the permission, so it follows that too.
   effect(() => {
-    const n = pending().length;
+    const n = waitingCount();
     push.info();
     if (hub.loaded()) setBadge(n);
   });
@@ -4410,7 +4500,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     else show({ name: "team" });
   };
   // The tray menu counts the decisions waiting and opens the one the keys act on, or the team settings.
-  effect(() => props.onTray?.({ pending: pending().length, review: () => { const ref = untracked(target); if (ref) pick(ref); }, settings: openTeam }));
+  effect(() => props.onTray?.({ pending: waitingCount(), review: () => { const ref = untracked(target); if (ref) pick(ref); }, settings: openTeam }));
   cleanup(() => props.onTray?.(null));
 
   // Shortcuts. Single keys never fire while typing (`notEditing`).
@@ -4862,20 +4952,6 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       </View>
     </View>
   );
-  /** Any page with report cards (the channel, a task) gets the same reader beside it, or over it on a phone. */
-  const withReader = (page: JSX.Element) => (
-    <View style={{ flex: 1, flexDirection: "row", minWidth: 0 }}>
-      {page}
-      {/* room for the reader, which `docSide` draws over the page's bar up to the window's top edge */}
-      <If when={shownDoc() && readerSide()}>
-        <View style={{ width: readerWidth() }} />
-      </If>
-      <If when={shownDoc() && !readerSide() && !touch}>
-        <View testID="doc-sheet" style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, paddingBottom: safeArea().bottom, backgroundColor: colors.background }}>{readerPane()}</View>
-      </If>
-    </View>
-  );
-
   const gutter = () => (wide() ? 32 : 16);
   const titleOf = (r: Route): string => {
     switch (r.name) {
@@ -4922,8 +4998,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
         alignItems: "center",
         gap: 6,
         paddingLeft: (wide() && sidebarOpen() ? 0 : hasWindow ? titleBar().left : 0) + (wide() ? 24 : 8),
-        // the reader beside the chat takes the bar's right end and the window buttons with it
-        paddingRight: (docSide() ? readerWidth() : hasWindow ? titleBar().right : 0) + (wide() ? 16 : 8),
+        // Opening the reader leaves the header geometry intact.
+        paddingRight: (hasWindow ? titleBar().right : 0) + (wide() ? 16 : 8),
         borderBottomWidth: 0.5,
         borderBottomColor: surfaceEdge(),
         backgroundColor: colors.background,
@@ -4964,8 +5040,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   );
   const content = (r: Route) => {
     switch (r.name) {
-      case "channel": return withReader(channelPage());
-      case "task": return withReader(<TaskDetail hub={hub} id={r.id} wide={wide()} onFold={(f) => taskFolds.update((m) => ({ ...m, [r.id]: f }))} />);
+      case "channel": return channelPage();
+      case "task": return <TaskDetail hub={hub} id={r.id} wide={wide()} onFold={(f) => taskFolds.update((m) => ({ ...m, [r.id]: f }))} />;
       case "tasks": return <TaskHistory hub={hub} wide={wide()} onTask={openTask} />;
       case "host": return <MachineDetail hub={hub} host={r.host} wide={wide()} onTask={openTask} />;
       case "team":
@@ -5030,13 +5106,18 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
           </NavPage>
         )}
       </NavStack>
-      <If when={docSide()}>
-        <View testID="doc-side" style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: readerWidth(), borderLeftWidth: 0.5, borderColor: surfaceEdge(), backgroundColor: colors.background }}>{readerPane()}</View>
-      </If>
       <If when={!wide() && !touch && drawer()}>
         <View testID="drawer-dismiss" role="button" accessibilityLabel={L("Close sidebar", "关闭侧栏")} onPress={() => drawer.set(false)} pan={{ x: drawerX }} onPanStart={() => { Keyboard.dismiss(); drawerDragging.set(true); }} onPanEnd={finishDrawerPan} style={{ position: "absolute", top: 0, bottom: 0, left: 0, right: 0, backgroundColor: "rgba(0,0,0,0.08)" }} />
       </If>
       </View>
+
+      <If when={!touch}>
+        <ReaderSheet open={!!shownDoc()} availableWidth={chatRoom()} insetLeft={windowSize().width - chatRoom()}
+          width={readerWidth()} expanded={readerWide()} onResize={(width) => resizedReaderWidth.set(width)}
+          onClose={() => reading.set(null)}>
+          {readerPane()}
+        </ReaderSheet>
+      </If>
 
       {/* A touch screen: the sidebar is a sheet from the left edge, the report reader one from the bottom over the chat. */}
       <If when={touch}>
@@ -5053,7 +5134,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
         </Sheet>
         <Sheet
           side="bottom"
-          open={!!shownDoc() && !readerSide()}
+          open={!!shownDoc()}
           onOpenChange={({ open }) => { if (!open) reading.set(null); }}
           closeOnSwipe
           backdropClass="bg-scrim"

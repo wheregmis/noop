@@ -43,17 +43,28 @@ export function startCloudBridge(cfg: Cfg) {
     const r = await fetch(base(cfg) + "/api/media", { method: "POST", body: fd, headers: { Authorization: `Bearer ${cfg.server?.token}` }, signal: AbortSignal.timeout(60_000) }).catch(() => null);
     return r?.ok ? ((await r.json()) as { url: string }).url : null;
   };
-  const flush = async () => {
-    while (pending.length) {
-      const e = pending[0];
-      if (e.attachments?.length) {
-        const urls = await Promise.all(e.attachments.map(upload));
-        if (urls.some((u) => !u)) return; // retry on the next poll
-        pending[0] = { ...e, attachments: urls as string[] };
+  // One flush at a time: the mirror hook and the 3s loop both call this, and two overlapping runs post the same
+  // pending[0] twice (the same message shows up twice in the chat) and shift() past an event that never went up.
+  // The reset hangs off .finally (a microtask), never off the body: an empty queue drains synchronously, so a
+  // try/finally inside would clear the flag before the assignment below stores it and the queue would stall — and an
+  // event appended in that same tick would then wait for the next 3s poll. A failed upload sets `stalled` so the
+  // re-kick below does not spin on a dead Worker; the poll retries it, as before.
+  let flushing: Promise<void> | null = null, stalled = false;
+  const flush = (): Promise<void> => {
+    if (flushing) return flushing;
+    return (flushing = (async () => {
+      stalled = false;
+      while (pending.length) {
+        const e = pending[0];
+        if (e.attachments?.length) {
+          const urls = await Promise.all(e.attachments.map(upload));
+          if (urls.some((u) => !u)) { stalled = true; return; } // retry on the next poll
+          pending[0] = { ...e, attachments: urls as string[] };
+        }
+        if (!(await call(cfg, "/api/events", { method: "POST", body: JSON.stringify(pending[0]) }))) { stalled = true; return; }
+        pending.shift();
       }
-      if (!(await call(cfg, "/api/events", { method: "POST", body: JSON.stringify(pending[0]) }))) return;
-      pending.shift();
-    }
+    })().finally(() => { flushing = null; if (!stalled && pending.length) void flush(); }));
   };
   setMirror((e) => { pending.push(e); void flush(); });
 

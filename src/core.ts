@@ -113,11 +113,16 @@ export function readDoc(path: string): Doc {
   return { meta, body: m[2] };
 }
 
+/** Model output is untrusted: a field the spec says is a string can arrive as a number, object or nothing at all.
+ *  Coerce at the door so one malformed field cannot abort a whole run (it used to take the daemon down). */
+export const asText = (v: unknown): string =>
+  typeof v === "string" ? v : v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
 export function writeDoc(path: string, meta: Record<string, string | undefined>, body: string) {
   mkdirSync(dirname(path), { recursive: true });
   const head = Object.entries(meta).filter(([, v]) => v !== undefined)
     .map(([k, v]) => `${k}: ${String(v).replace(/\n/g, " ")}`).join("\n");
-  writeFileSync(path, `---\n${head}\n---\n${body.trimEnd()}\n`);
+  writeFileSync(path, `---\n${head}\n---\n${asText(body).trimEnd()}\n`);
 }
 
 export const list = (dir: string, re = /\.md$/) =>
@@ -206,6 +211,8 @@ export let approvalGate: (source: string) => boolean = () => false;
 export const setApprovalGate = (fn: (source: string) => boolean) => { approvalGate = fn; };
 
 export function newTask(title: string, body = "", o: TaskOpts = {}): string {
+  title = asText(title);
+  body = asText(body);
   const id = nextId("T", P("tasks"));
   // work the owner asked for (directly or via a delegated parent) never needs re-approval
   const folder = o.extra?.origin !== "owner" && approvalGate(o.source ?? "owner") ? "proposed" : "inbox";
@@ -220,13 +227,29 @@ export function newTask(title: string, body = "", o: TaskOpts = {}): string {
 
 export const which = (bin: string) => Bun.which(bin) !== null;
 
-/** Which CLI runs a task: the owner's per-agent config wins, else what the planner (an AI call, see planInbox) chose.
- *  Unplanned tasks may use either, Claude first. */
+/** Which CLI runs a task, strongest first:
+ *  1. a CLI pinned on the task itself (`noop add --cli …`, a routine's `cli`): the owner naming one for this task;
+ *  2. the owner's per-member config (Settings → Members → `clis.agents`): policy for that agent, not a suggestion;
+ *  3. `cli_hint`, what the planner (an AI call, see planInbox) suggested for this task — a hint, so it may not
+ *     override policy. It used to be written into `cli`, which made every planned task look owner-pinned;
+ *  4. otherwise either CLI, Claude first.
+ *  The per-member config is checked before the hint on purpose: an owner who sets a member to codex-only in the app
+ *  must not have that silently undone by the planner picking Claude for a task it calls "hard". */
 export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
   if (meta.cli && meta.cli !== "auto") return [meta.cli];
-  const per = cfg.clis?.agents?.[meta.agent || "lead"] as string[] | undefined;
-  if (per) return per;
+  const per = cfg.clis?.agents?.[meta.agent || "lead"];
+  if (Array.isArray(per) && per.length) return per;
+  if (meta.cli_hint === "claude" || meta.cli_hint === "codex") return [meta.cli_hint];
   return ["claude", "codex"];
+}
+
+/** What the planner may write back about the CLI: only a `cli_hint`, and only when the task is not pinned and its
+ *  agent has no per-member policy — either of those would overrule the suggestion anyway. */
+export function cliHintPatch(meta: Record<string, string>, per: unknown, suggestion: unknown): Record<string, string> {
+  const pinned = meta.cli && meta.cli !== "auto";
+  const hint = suggestion === "claude" || suggestion === "codex" ? suggestion : "";
+  if (pinned || (Array.isArray(per) && per.length) || !hint) return {};
+  return { cli_hint: hint };
 }
 
 export function chooseCli(meta: Record<string, string>, cfg: Cfg): string | null {
@@ -365,10 +388,13 @@ export function journal(host: string, line: string) {
 }
 
 export function remember(agent: string, lessons: string[] | undefined, source: string) {
-  if (!lessons?.length) return;
+  // a single lesson the model sent as a bare string (not the array the spec asks for) is still a lesson
+  const list = (Array.isArray(lessons) ? lessons : typeof lessons === "string" ? [lessons] : [])
+    .map(asText).map((l) => l.trim()).filter(Boolean);
+  if (!list.length) return;
   const f = P("agents", agent, "memory.md");
   if (!existsSync(f)) { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, `# ${agent} memory\n\n`); }
-  appendFileSync(f, lessons.map((l) => `- ${l} _(${source}, ${today()})_\n`).join(""));
+  appendFileSync(f, list.map((l) => `- ${l} _(${source}, ${today()})_\n`).join(""));
 }
 
 export const readIf = (p: string, tail = 12000) => (existsSync(p) ? readFileSync(p, "utf8").slice(-tail) : "");
@@ -380,10 +406,10 @@ export const recentJournal = (days = 2) =>
   list(P("journal")).slice(-days).map((p) => readFileSync(p, "utf8").slice(-4000)).join("\n");
 
 export function precedents(n = 30): string {
-  return list(P("decisions", "closed")).slice(-n).map((p) => {
-    const { meta } = readDoc(p);
-    return `- ${meta.id} [${meta.agent}] Q: ${meta.question}\n  → **${meta.answer}** (by ${meta.answered_by})`;
-  }).join("\n");
+  // the latest answers, not the last file names: by name every P-… batch and D-C… card sorts after every D-0… card
+  const at = (m: Record<string, string>) => m.answered ?? m.created ?? "";
+  return list(P("decisions", "closed")).map((p) => readDoc(p).meta).sort((a, b) => (at(a) < at(b) ? -1 : at(a) > at(b) ? 1 : 0)).slice(-n)
+    .map((meta) => `- ${meta.id} [${meta.agent}] Q: ${meta.question}\n  → **${meta.answer}** (by ${meta.answered_by})`).join("\n");
 }
 
 export function signature(agent: string, host: string, cfg: Cfg) {

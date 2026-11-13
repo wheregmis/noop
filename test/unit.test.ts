@@ -34,6 +34,13 @@ test("external signature links the Noop name to its site", () => {
 test("result parsing", () => {
   expect(parseResult('blah\n```json\n{"status":"done","summary":"ok"}\n```').status).toBe("done");
   expect(parseResult("no block").status).toBe("failed");
+  // codex sometimes ends its reply with a bare JSON object instead of a fenced ```json block
+  expect(parseResult('{"status":"done","summary":"ok"}').status).toBe("done");
+});
+
+test("result parsing repairs a raw line break inside a JSON string", () => {
+  const out = '```json\n{"status":"delegated","summary":"ok","followups":[{"title":"x","body":"line one\n","agent":"a"}]}\n```';
+  expect(parseResult(out)).toMatchObject({ status: "delegated", followups: [{ title: "x", body: "line one\n", agent: "a" }] });
 });
 
 test("owner image uploads: images only, 10 MB, attachments are the hub's own media", async () => {
@@ -260,6 +267,18 @@ test("a reply to an agent's message goes to the brain with that task, never as a
   expect(drainInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
 });
 
+test("an answer in words to a proposals card goes to the brain; numbers, all and none go straight to the card", async () => {
+  const { handleOwnerMessage, setOwnerTask, drainInbound } = await import("../src/server");
+  const calls: string[] = [];
+  setOwnerTask(async (text) => { calls.push(text); });
+  await handleOwnerMessage("只做文档那项，另一个先不做", "P-0005");
+  await handleOwnerMessage("P-0006 1、不做 2、做");
+  await handleOwnerMessage("1，3", "P-0008");
+  await handleOwnerMessage("P-0009 all");
+  expect(calls).toEqual(["P-0005 只做文档那项，另一个先不做", "P-0006 1、不做 2、做"]);
+  expect(drainInbound()).toEqual([{ id: "P-0008", answer: "1，3", source: "chat" }, { id: "P-0009", answer: "all", source: "chat" }]);
+});
+
 test("a result block survives a later turn from a background task notification", async () => {
   const lines = [
     { type: "result", result: "still compiling" },
@@ -474,4 +493,35 @@ test("gate_override relaxes only the approvable gates", () => {
   expect(relaxed).not.toContain("Bash(gh api repos/:*)");
   for (const g of ["--disallowedTools", "Bash(rm -rf /:*)", "Bash(rm -rf ~:*)", "Bash(gh repo delete:*)", "Bash(gh secret:*)", "Bash(kubectl delete:*)"])
     expect(relaxed).toContain(g);
+});
+
+test("a model-emitted followup without a title cannot abort the run", async () => {
+  const { asText, newTask, readDoc, P } = await import("../src/core");
+  const { followupsOf } = await import("../src/cli");
+  // what the model actually sent when the daemon died: no title, only a body
+  const res = parseResult('```json\n{"status":"delegated","summary":"ok","followups":[{"body":"no title here"},{"title":"real work","agent":"lead"},"a bare string",null,{"title":42}]}\n```');
+  expect(followupsOf(res, 8).map((f) => f.title)).toEqual(["real work", "a bare string", "42"]);
+  expect(followupsOf({ status: "done", summary: "" }, 8)).toEqual([]); // no followups at all
+  expect(followupsOf({ status: "delegated", summary: "", followups: "nope" as any }, 8)).toEqual([]);
+  expect(followupsOf(res, 1).map((f) => f.title)).toEqual(["real work"]); // the depth cap still applies
+  // and the boundary itself no longer throws when a title is missing or not a string
+  for (const title of [undefined, null, 7, { a: 1 }]) expect(newTask(title as any, "")).toMatch(/^T-/);
+  expect(readDoc(P("tasks", "inbox", `${newTask("kept", "")}.md`)).meta.title).toBe("kept");
+  expect(asText({ a: 1 })).toBe('{"a":1}');
+});
+
+test("lessons sent as a bare string are kept, not fatal", async () => {
+  const { readIf, remember, P } = await import("../src/core");
+  const dir = P("agents", "crashguard-test", "memory.md");
+  rmSync(dir, { force: true });
+  expect(() => remember("crashguard-test", "one lesson" as any, "T-1")).not.toThrow();
+  expect(readIf(dir)).toContain("- one lesson _(T-1");
+  rmSync(dir, { force: true });
+  remember("crashguard-test", ["first", "", 5 as any], "T-2");
+  expect(readIf(dir)).toContain("- first _(T-2");
+  expect(readIf(dir)).toContain("- 5 _(T-2");
+  expect(readIf(dir)).not.toContain("-  _("); // blanks dropped
+  rmSync(dir, { force: true });
+  expect(() => remember("crashguard-test", undefined, "T-3")).not.toThrow();
+  expect(() => remember("crashguard-test", { length: 2 } as any, "T-4")).not.toThrow(); // no write, no crash
 });

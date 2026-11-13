@@ -5,12 +5,12 @@ import { $ } from "bun";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
-  type Cfg, P, ROOT, _commitPush, _pull, agentName, chooseCli, claim, commitPush, fleetCanMeet, heartbeat, hostCaps, hostName, journal,
+  type Cfg, P, ROOT, _commitPush, _pull, agentName, asText, chooseCli, claim, commitPush, fleetCanMeet, heartbeat, hostCaps, hostName, journal,
   list, loadConfig, locked, newTask, now, onlineHosts, pickTask, pull, readDoc, remember, writeDoc,
 } from "./core";
 import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, ownerPickedMenu, recentJudgeIds, routeDecision } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
-import { STALLED, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
+import { STALLED, type Result, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
 import { writeRules } from "./rules";
 import { backoffMinutes, CHECKED_FALLBACK_MIN, isNoChangeRoutine, tooManyWakes, waitMeta } from "./waits";
 import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
@@ -25,12 +25,12 @@ import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
 import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
-import { addFollowUp, followUpTarget, reopenTask, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
+import { addFollowUp, reopenTask, routeWithoutModel, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
 import { isWrite, runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
 import { judgeAccuracy, level, needsApproval, noteStuckRoutine, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
-import { CODE, L, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
+import { CODE, L, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, cliHintPatch, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 import { channelPrompt, channels, resolveChannels, updateChannel } from "./channels";
 
@@ -209,7 +209,7 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   const delegated = res.status === "delegated" && (res.followups?.length ?? 0) > 0;
   const children: string[] = [];
   const chans = [...new Set([...(meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(res.channels)])].join(",") || undefined;
-  for (const f of (res.followups ?? []).slice(0, depth > maxDepth ? 0 : 8)) {
+  for (const f of followupsOf(res, depth > maxDepth ? 0 : 8)) {
     const id = newTask(f.title, f.body ?? "", { agent: f.agent ?? agent, priority: f.priority ?? meta.priority, repo: f.repo, requires: f.requires, host: f.host,
       source: `followup:${meta.id}`, extra: { depth: String(depth), ...((f as any).difficulty === "hard" ? { difficulty: "hard" } : {}), ...(ownerWork ? { origin: "owner" } : {}), ...(delegated ? { parent: meta.id } : {}), ...(meta.origin_channel ? { origin_channel: meta.origin_channel } : {}), ...(chans ? { channels: resolveChannels(chans.split(",")).join(",") } : {}) } });
     children.push(id);
@@ -262,6 +262,18 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   });
 }
 
+/** The followups this run may spawn: the array the result spec asks for, minus entries with no usable title.
+ *  The model writes this JSON, so an entry can be a bare string, `null`, or a body with no title at all — spawning it
+ *  would write a task whose title is undefined (and used to abort the whole run inside writeDoc). */
+export const followupsOf = (res: ReturnType<typeof parseResult>, limit: number): NonNullable<Result["followups"]> => {
+  const raw = res.followups;
+  return (Array.isArray(raw) ? raw : [])
+    .map((f: any) => (typeof f === "string" ? { title: f } : f && typeof f === "object" ? f : null))
+    .filter((f: any): f is NonNullable<Result["followups"]>[number] => asText(f?.title).trim() !== "")
+    .slice(0, limit)
+    .map((f) => ({ ...f, title: asText(f.title).trim() }));
+};
+
 const FOLLOW_UP = "## Owner follow-up";
 
 async function handleReplies(cfg: Cfg, host: string) {
@@ -273,7 +285,7 @@ async function handleReplies(cfg: Cfg, host: string) {
       if (resolveProposals(r.id, r.answer, `owner(${r.source})`)) {
         journal(host, `${r.id} owner approved: ${r.answer}`);
         await notify(L(`${r.id} queued as you chose`, `${r.id} 已按你的选择排队`), cfg);
-      }
+      } else if (open.has(r.id)) await notify(L(`${r.id} is still open: reply with item numbers (\`${r.id} 1,3\`), all or none`, `${r.id} 还没定：请回复编号（\`${r.id} 1,3\`）、all 或 none`), cfg);
       continue;
     }
     if (r.id.startsWith("L-")) {
@@ -672,13 +684,21 @@ async function planNow(cfg: Cfg, host: string) {
   const todo = list(P("tasks", "inbox"), /^T-.*\.md$/).map((p) => ({ p, ...readDoc(p) })).filter((t) => !t.meta.planned).slice(0, 12);
   if (!todo.length) return;
   const hosts = onlineHosts(cfg).map((h) => `- ${h.host}: ${h.caps.join(",")}`).join("\n");
+  // the owner's per-member CLI policy (Settings → Members → clis.agents): the planner suggests, it may not override it
+  const fixed = new Map<string, string[]>();
+  for (const t of todo) {
+    const a = t.meta.agent || "lead", per = cfg.clis?.agents?.[a];
+    if (Array.isArray(per) && per.length) fixed.set(a, per);
+  }
   const r = await quickAsk(`You place tasks for an AI agent fleet running on several machines.
 For each task decide:
 - channels: zero to three slugs from the channel goals below, or {"name":"...","goal":"..."} for a new work topic.
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
 - cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
+  A suggestion only — never pick against an agent's fixed CLI below.
 - difficulty: "hard" or "normal".
+${fixed.size ? `\nAgent CLI (the owner's setting — not yours to change):\n${[...fixed].map(([a, c]) => `- ${a}: fixed to ${c.join(" → ")} (leave cli out)`).join("\n")}\n` : ""}
 
 ${channelPrompt()}
 
@@ -688,7 +708,7 @@ ${hosts || "(unknown)"}
 Tasks:
 ${todo.map((t) => `- ${t.meta.id} [agent ${t.meta.agent}${t.meta.requires ? `, already requires ${t.meta.requires}` : ""}]: ${t.meta.title} — ${t.body.slice(0, 500).replace(/\s+/g, " ")}`).join("\n")}
 
-Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude", "difficulty": "normal", "channels": []}, ...}`,
+Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": "claude" or omitted, "difficulty": "normal", "channels": []}, ...}`,
     cfg, P("logs", "runs", `plan-${Date.now()}.log`));
   if (!r || typeof r !== "object") return; // planner unavailable: tasks run unplanned after plan_wait_minutes
   await locked(async () => {
@@ -698,12 +718,15 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       if (!v || !existsSync(t.p)) continue;
       // the planner may only add what one machine can meet together with the task's own: a guessed os:linux on a macOS-only fleet parks the task for good
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...fleetCanMeet(t.meta, String(v.requires ?? ""))].map((x) => x.trim()).filter(Boolean))].join(",");
-      // an explicit task CLI, or the member's own CLI order (with its backups), beats the planner's guess
-      const pinned = (t.meta.cli && t.meta.cli !== "auto") || !!cfg.clis?.agents?.[t.meta.agent || "lead"];
+      const per = fixed.get(t.meta.agent || "lead");
+      const hint = v.cli === "codex" || v.cli === "claude" ? v.cli : "";
       const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
-      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req, ...(pinned ? {} : { cli: v.cli === "codex" ? "codex" : "claude" }),
+      writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req,
+        ...cliHintPatch(t.meta, per, v.cli),
         ...(v.difficulty === "hard" ? { difficulty: "hard" } : {}), planned: now() }, t.body);
-      journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${pinned ? allowedClis(t.meta, cfg).join("→") : v.cli}`);
+      // what will actually run — plus the planner's raw answer when the owner's policy overruled it, so it stays traceable
+      const run = allowedClis(readDoc(t.p).meta, cfg);
+      journal(host, `🧭 ${t.meta.id} planned: ${req || "any host"} · ${run.join(" → ")}${hint && hint !== run[0] ? ` (planner said ${hint})` : ""}`);
     }
     await _commitPush(`[${host}] plan ${todo.length} tasks`);
   });
@@ -844,13 +867,17 @@ async function daemon(cfg: Cfg) {
       // out of rounds with no reply and nothing done (only lookups): the message would vanish, so it becomes work
       if (!out.reply && out.rounds >= 4 && !out.calls.some((c) => isWrite(c.tool) && c.ok)) throw new Error("no answer");
     } catch (err) {
-      // no model (CLI missing, logged out, timeout): the message still becomes work, silently — never lost, never canned
+      // no model (CLI missing, logged out, quota, timeout): the message still becomes work, never lost, never guessed onto some
+      // other task. The owner is told where it went; the reason goes to the journal and brain.jsonl (stderr is not visible)
       console.error(`chat brain: ${err}`);
-      // a terse follow-up without a reply target continues the task the channel was just about
-      const target = reply ?? followUpTarget(text, feed(new Date(Date.now() - 15 * 60_000).toISOString(), 200));
-      const amended = target ? await store.act({ tool: "amend_task", id: target, text }) : null;
-      const r = amended?.ok ? amended : await store.act({ tool: "create_task", title: text.split("\n")[0].slice(0, 80) });
-      out = { reply: "", calls: [{ tool: "fallback", args: {}, ok: !!r.ok, result: r }], rounds: 0, ms: { model: [], total: Date.now() - got }, fallback: true };
+      const routed = await routeWithoutModel(store, { text, reply, why: err });
+      post(routed.note, routed.id);
+      await locked(async () => {
+        await _pull();
+        journal(host, L(`⚠️ chat assistant unavailable (${routed.why}); the owner's message went to ${routed.id ?? "no task"}`, `⚠️ 聊天助手不可用（${routed.why}）；owner 的消息已交给 ${routed.id ?? "无任务"}`));
+        await _commitPush(`[${host}] chat assistant unavailable`);
+      });
+      out = { reply: routed.note, calls: [{ tool: "fallback", args: {}, ok: routed.ok, error: routed.why, result: { id: routed.id, amended: routed.amended } }], rounds: 0, ms: { model: [], total: Date.now() - got }, fallback: true };
     } finally { chatNow = null; }
     logBrain(m, out, got);
   });

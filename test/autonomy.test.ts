@@ -81,6 +81,40 @@ test("answer numbers follow the card lines even when a batch has an empty slot",
   expect(files("tasks", "rejected")).toEqual([]);
 });
 
+test("an answer in words picks nothing: the card stays open instead of rejecting every item", () => {
+  writeDoc(P("decisions", "open", "P-0001.md"), { id: "P-0001", kind: "proposals", created: ago(1), items: "T-0002,T-0003" }, "x");
+  task("proposed", "T-0002", "followup:T-0000");
+  task("proposed", "T-0003", "followup:T-0000");
+  expect(A.resolveProposals("P-0001", "只做文档那项，另一个先不做", "owner(chat)")).toBe(false);
+  expect(files("decisions", "open")).toEqual(["P-0001.md"]);
+  expect(files("tasks", "proposed")).toEqual(["T-0002.md", "T-0003.md"]);
+  // the brain turns the words into a pick and keeps them as the owner's note
+  expect(A.resolveProposals("P-0001", "1: 2 先不做，只做文档那项", "owner(chat)")).toBe(true);
+  expect(readFileSync(P("tasks", "inbox", "T-0002.md"), "utf8")).toContain("## Owner note (P-0001)\n2 先不做，只做文档那项");
+  expect(files("tasks", "rejected")).toEqual(["T-0003.md"]);
+});
+
+test("numbers followed by words, or a word that only starts like all/none, keep the card open", () => {
+  writeDoc(P("decisions", "open", "P-0001.md"), { id: "P-0001", kind: "proposals", created: ago(1), items: "T-0002,T-0003" }, "x");
+  task("proposed", "T-0002", "followup:T-0000");
+  task("proposed", "T-0003", "followup:T-0000");
+  // a Slack/Discord/CLI reply skips the chat brain: "1、不做 2、做" means do 2, not a pick of 1
+  for (const words of ["1、不做 2、做", "1 no 2 yes", "allow 2", "nonetheless 1"])
+    expect(A.resolveProposals("P-0001", words, "owner(slack)")).toBe(false);
+  expect(files("decisions", "open")).toEqual(["P-0001.md"]);
+  expect(files("tasks", "proposed")).toEqual(["T-0002.md", "T-0003.md"]);
+  expect(A.resolveProposals("P-0001", "1, 2", "owner(slack)")).toBe(true);
+  expect(files("tasks", "rejected")).toEqual([]);
+});
+
+test("precedents are the latest answers, whatever the id", () => {
+  const card = (id: string, answered: string) => writeDoc(P("decisions", "closed", `${id}.md`), { id, question: `q ${id}`, answer: "A", answered }, "x");
+  card("D-0009", "2026-11-12T10:00:00Z");
+  card("D-C0001", "2026-11-10T10:00:00Z");
+  card("P-0005", "2026-11-11T10:00:00Z");
+  expect([...core.precedents(2).matchAll(/^- (\S+)/gm)].map((m) => m[1])).toEqual(["P-0005", "D-0009"]);
+});
+
 test("routine dedupe: newer run supersedes proposed copy, queued copy blocks", () => {
   task("proposed", "T-0001", "routine:pr-review");
   task("proposed", "T-0002", "routine:other");

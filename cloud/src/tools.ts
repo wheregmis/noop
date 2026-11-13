@@ -138,7 +138,8 @@ const options = (s?: string) => (s ?? "").split(" | ").map((x) => x.trim()).filt
 export function listDecisions(st: ToolStore, which: "open" | "closed" = "open", limit = 30) {
   return st.list(`decisions/${which}/`).filter((f) => f.path.endsWith(".md")).slice(0, limit).map((f) => {
     const { meta, body } = parseDoc(f.text);
-    return { id: meta.id, question: meta.question, options: options(meta.options), recommendation: meta.recommendation, task: meta.task,
+    // a proposals card has no options field: its numbered lines are what the owner picks from
+    return { id: meta.id, question: meta.question, options: meta.kind === "proposals" ? body.match(/^\d+\. .+$/gm) ?? [] : options(meta.options), recommendation: meta.recommendation, task: meta.task,
       agent: meta.agent, created: meta.created, answer: meta.answer, context: body.match(/## Context\n([\s\S]*?)(\n## |$)/)?.[1]?.trim().slice(0, 4000) };
   });
 }
@@ -293,7 +294,7 @@ export const TOOLS: Tool[] = [
     description: "Correct or delete one existing memory entry, when the owner says it is wrong, outdated or should go. New facts go in remember." },
   { name: "answer_decision", title: "Answer a decision", annotations: RW, write: true,
     inputSchema: obj({ id: str("Decision id, e.g. D-0025"), answer: str("An option letter (A, B, …) or a free-text answer") }, ["id", "answer"]),
-    description: "Answer a decision card (or change the answer the owner gave minutes ago), exactly like tapping an option in the Noop app." },
+    description: "Answer a decision card (or change the answer the owner gave minutes ago), exactly like tapping an option in the Noop app. For a proposals card (P-…) the answer must start with the item numbers to do, all or none, then a colon and the owner's words: \"1,3: skip the rest\", \"2: not 1\"." },
 ];
 
 export const toolsFor = (where: "mcp" | "brain") => TOOLS.filter((t) => !t.only || t.only === where);

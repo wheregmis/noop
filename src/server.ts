@@ -38,7 +38,26 @@ export type Event = {
 export const MEDIA = join(DATA, "..", "media");
 const NSH_WEB = join(import.meta.dir, "..", "app", "dist", "web", "noop"); // built NSH web client
 const FEED_DIR = join(DATA, "..", "feed"); // primary-local (next to the data repo), append-only JSONL per day
-const sockets = new Set<ServerWebSocket<unknown>>();
+/** `status`: the client asked for dashboard frames (?v=2), as the web client always does. */
+type Sock = ServerWebSocket<{ status?: boolean }>;
+const sockets = new Set<Sock>();
+/** Owner clients that asked for status frames get the dashboard pushed, as the Cloudflare hub does; without it their
+ * badge and "waiting for you" list would only change on reconnect. Change-detected, so a quiet hub sends nothing. */
+const STATUS_PUSH_MS = 5_000;
+let statusPushed = "";
+let statusTimer: ReturnType<typeof setInterval> | null = null;
+function pushStatus() {
+  const watching = [...sockets].filter((ws) => ws.data?.status);
+  if (!watching.length) {
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    statusPushed = "";
+    return;
+  }
+  const s = JSON.stringify({ $status: status() });
+  if (s === statusPushed) return;
+  statusPushed = s;
+  for (const ws of watching) try { ws.send(s); } catch { /* the socket is going away */ }
+}
 type Inbound = { id: string; answer: string; source: string };
 const inbound: Inbound[] = [];
 /** A chat message goes to the chat brain (src/brain.ts), which replies and acts through noop's tools. `reply`: the task
@@ -379,13 +398,16 @@ export async function handleOwnerMessage(
   const id = m?.[1] ?? (reply_to && /^[DLP]-[A-Z]?\d{4}$/.test(reply_to) ? reply_to : null);
   // a reply to an agent's message about a task (or a message on its page): it goes to that task, whatever came just before
   const replyTask = !id && reply_to && /^T-\d{4,}$/.test(reply_to) ? reply_to : undefined;
-  if (id) {
-    inbound.push({ id, answer: (m ? m[2] : text).trim(), source: "chat" });
+  const answer = (m ? m[2] : text).trim();
+  // a proposals card takes item numbers, all or none; words ("just the docs one", "1 no 2 yes") go to the brain, which sees the items
+  const words = !!ownerTask && !!id?.startsWith("P-") && !/^(all|none)\b|^[\d\s,，]+$/i.test(answer);
+  if (id && !words) {
+    inbound.push({ id, answer, source: "chat" });
     if (id.startsWith("D-")) lastAnswer = { id, at: Date.now() };
   } else if (ownerTask) {
     // everything else goes to the chat brain: it answers, looks things up, and creates or adjusts work through the tools
-    const answered = !noAmend && !replyTask && lastAnswer && Date.now() - lastAnswer.at < AMEND_MS ? lastAnswer.id : undefined;
-    await ownerTask(text, { reply: replyTask, answered, sentAt: att.sentAt, thread: !!(att.thread && replyTask), ...(att.channel ? { channel: att.channel } : {}) });
+    const answered = !words && !noAmend && !replyTask && lastAnswer && Date.now() - lastAnswer.at < AMEND_MS ? lastAnswer.id : undefined;
+    await ownerTask(words ? `${id} ${answer}` : text, { reply: replyTask, answered, sentAt: att.sentAt, thread: !!(att.thread && replyTask), ...(att.channel ? { channel: att.channel } : {}) });
   }
 }
 
@@ -433,7 +455,7 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
   };
   const json = (d: unknown, status = 200) => Response.json(d, { status });
 
-  const server = Bun.serve({
+  const server = Bun.serve<{ status?: boolean }>({
     hostname: s.host ?? "0.0.0.0",
     port: s.port ?? 8787,
     async fetch(req, srv) {
@@ -449,7 +471,7 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
       if (url.pathname === "/manifest.webmanifest")
         return new Response(Bun.file(join(import.meta.dir, "..", "web", "manifest.webmanifest")));
       if (!auth(req)) return json({ error: "unauthorized" }, 401);
-      if (url.pathname === "/api/stream" && srv.upgrade(req)) return undefined as unknown as Response;
+      if (url.pathname === "/api/stream" && srv.upgrade(req, { data: { status: url.searchParams.get("v") === "2" } })) return undefined as unknown as Response;
       if (url.pathname.startsWith("/media/")) {
         const f = join(MEDIA, basename(url.pathname));
         if (!existsSync(f)) return json({ error: "not found" }, 404);
@@ -536,8 +558,13 @@ export function startServer(cfg: Cfg, onOwnerTask: OwnerTask) {
       return json({ error: "not found" }, 404);
     },
     websocket: {
-      open(ws) { sockets.add(ws); },
-      close(ws) { sockets.delete(ws); },
+      open(ws) {
+        sockets.add(ws);
+        if (!ws.data?.status) return;
+        pushStatus(); // the dashboard as of now, then on every change while this client watches
+        statusTimer ??= setInterval(pushStatus, STATUS_PUSH_MS);
+      },
+      close(ws) { sockets.delete(ws); pushStatus(); }, // the last watcher leaving also stops the timer
       message() {},
     },
   });

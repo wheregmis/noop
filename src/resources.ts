@@ -204,6 +204,16 @@ function cleanupSteps(cfg: Cfg, busyRepos: Set<string>): Step[] {
 
 let lastCleanup = 0;
 
+// Debounce the low-disk alert: no point paging the owner every 30 min about a disk that is not getting worse
+// (observed: 12 identical alerts in 6h, each having freed 0.0GB).
+let lastDiskAlert = { at: 0, freeGB: Infinity };
+
+/** Re-alert when never alerted, 6h since the last one, or free space dropped another 5GB. Pure, so it is testable. */
+export function diskAlertDue(prev: { at: number; freeGB: number }, now: number, freeGB: number, everyMs = 6 * 3600_000, dropGB = 5): boolean {
+  return now - prev.at >= everyMs || freeGB <= prev.freeGB - dropGB;
+}
+
+
 /** Runs tiered cleanup until disk is back above target. Returns a human summary or null if nothing needed. */
 export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>, alert: (t: string) => Promise<unknown>) {
   const r = cfg.resources ?? {};
@@ -222,6 +232,9 @@ export async function ensureDisk(cfg: Cfg, host: string, busyRepos: Set<string>,
   }
   const msg = `🧹 disk cleanup freed ${gb(total)}GB → ${s.diskFreeGB}GB free (${lines.join("; ") || "nothing big"})`;
   journal(host, msg);
-  if (low(s)) await alert(L(`⚠️ ${host} is still low on disk: ${s.diskFreeGB}GB free (${s.diskFreePct}%) after automatic cleanup freed ${gb(total)}GB. Needs your attention.`, `⚠️ ${host} 磁盘仍不足：剩余 ${s.diskFreeGB}GB（${s.diskFreePct}%），自动清理已尽力（${gb(total)}GB）。需要你处理。`));
+  if (low(s) && diskAlertDue(lastDiskAlert, Date.now(), s.diskFreeGB)) {
+    lastDiskAlert = { at: Date.now(), freeGB: s.diskFreeGB };
+    await alert(L(`⚠️ ${host} is still low on disk: ${s.diskFreeGB}GB free (${s.diskFreePct}%) after automatic cleanup freed ${gb(total)}GB. Needs your attention.`, `⚠️ ${host} 磁盘仍不足：剩余 ${s.diskFreeGB}GB（${s.diskFreePct}%），自动清理已尽力（${gb(total)}GB）。需要你处理。`));
+  }
   return msg;
 }

@@ -460,6 +460,95 @@ export function Input(props: {
 }
 
 /**
+ * A search box in the field look: a magnifier at the leading edge, the query, and at the trailing edge a spinner
+ * while results load, else a clear button once there is text. Return searches (the keyboard's Search key on phones);
+ * `hint` names that key at the trailing edge on desktops while the typed query has not been searched yet.
+ */
+export function SearchField(props: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  /** Empties the field; also what the clear button does. */
+  onClear: () => void;
+  placeholder?: string;
+  /** The clear button's accessible name, in the app's language. */
+  clearLabel?: string;
+  loading?: boolean;
+  /** Show the Return hint (the query differs from what was searched). */
+  hint?: boolean;
+  testID?: string;
+  /** Layout only. */
+  style?: ViewStyle;
+}): JSX.Element {
+  const over = signal(false);
+  return (
+    <View
+      hoverStyle={{ borderColor: alpha(colors.text, 0.28) }}
+      focusWithinStyle={focusRing()}
+      style={{
+        minHeight: size.field,
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.md,
+        paddingLeft: space.lg,
+        paddingRight: space.sm,
+        borderRadius: corner.field,
+        borderCurve: "continuous",
+        borderWidth: 1,
+        borderColor: colors.fieldBorder,
+        backgroundColor: colors.field,
+        transitionProperty: "border-color",
+        transitionDuration: duration.quick,
+        ...props.style,
+      }}
+    >
+      <Icon name="search" size={touch ? 18 : 15} tint={colors.faint} />
+      <BaseInput
+        testID={props.testID}
+        value={props.value}
+        placeholder={props.placeholder}
+        accessibilityLabel={props.placeholder}
+        returnKeyType="search"
+        submitBehavior="submit"
+        autoCapitalize="none"
+        autoCorrect={false}
+        class="placeholder:text-faint"
+        onChange={({ value }) => props.onChange(value)}
+        onSubmit={() => props.onSubmit()}
+        style={{ flex: 1, alignSelf: "stretch", color: colors.text, fontSize: font.md, backgroundColor: "transparent", borderWidth: 0 }}
+      />
+      {props.loading ? (
+        <View style={{ width: 24, alignItems: "center" }}><Spinner size={14} tint={colors.faint} /></View>
+      ) : (
+        <>
+          {!touch && props.hint && props.value.trim() ? <Kbd keys="↵" /> : null}
+          {props.value ? (
+            <View
+              role="button"
+              accessibilityLabel={props.clearLabel ?? "Clear"}
+              testID={props.testID ? `${props.testID}-clear` : undefined}
+              onPress={() => props.onClear()}
+              onMouseEnter={() => over.set(true)}
+              onMouseLeave={() => over.set(false)}
+              style={{
+                width: touch ? 32 : 24,
+                height: touch ? 32 : 24,
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: (touch ? 32 : 24) / 2,
+                backgroundColor: over() ? alpha(colors.text, fill.hover) : "transparent",
+              }}
+            >
+              <Icon name="close" size={touch ? 16 : 13} tint={colors.muted} />
+            </View>
+          ) : null}
+        </>
+      )}
+    </View>
+  );
+}
+
+/**
  * A number typed or stepped (`nsh/base`'s `NumberInput`) in the field's frame: the value in the middle, a minus and a
  * plus at the ends, each set off by a hairline and taking the ghost fills, as gpui-component's `NumberInput`.
  */

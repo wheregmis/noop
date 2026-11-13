@@ -36,6 +36,22 @@ test("flags age, wake count and macOS checks that can never run on the Linux pri
   expect(m.cause).toBe("platform:os:macos");
 });
 
+test("a Windows path under Users is a local path on a Windows primary, not a macOS path", () => {
+  const win = { host: "winbox", caps: ["os:windows", "host:winbox"], seen: "", busy: 0, version: "1" };
+  // Git Bash, MSYS, WSL and drive-letter spellings all contain the text "/Users/" but are ordinary local paths.
+  expect(checkUnrunnable("bash -c 'grep -q DONE /c/Users/testuser/work/chain.log'", "windows")).toBe(false);
+  expect(checkUnrunnable("grep -q DONE C:/Users/testuser/work/chain.log", "windows")).toBe(false);
+  expect(checkUnrunnable("test -f /mnt/c/Users/testuser/a", "linux")).toBe(false);
+  // A real macOS home path is still unrunnable anywhere but macOS, at the start of the command or after a quote or space.
+  expect(checkUnrunnable("/Users/jason/bin/check.sh", "windows")).toBe(true);
+  expect(checkUnrunnable("cat '/Users/jason/a'", "linux")).toBe(true);
+  expect(checkUnrunnable("test -f /Users/jason/a", "windows")).toBe(true);
+  // The incident: a young Windows task whose check reads a Git Bash path was handed back to the inbox ("cannot run on
+  // the primary"), lost its state, and later became a "Windows tasks not advancing" card. It must be left alone.
+  const young = task({ id: "T-1", requires: "os:windows", wakes: "1", wait_check: "bash -c 'grep -q DONE /c/Users/testuser/chain.log'" });
+  expect(classify(young, ctx({ primaryOs: "windows", online: [win] }))).toBeNull();
+});
+
 test("keep going first: retired host → reroute, answered card → resume, no waiting_on → requeue once", () => {
   const r = classify(task({ id: "T-1", requires: "host:omarchy-jason", claimed_by: "omarchy-jason" }), ctx())!;
   expect([r.action, r.requires]).toEqual(["reroute", ""]);
@@ -120,4 +136,37 @@ test("macOS host online + wait_check unrunnable on the primary: hand back to the
   const m = { id: "T-1", requires: "os:macos", created: new Date(NOW - 10 * H).toISOString(), waiting_on: "x", wait_check: "test -f /Users/j/done" };
   expect(classify(task(m), ctx())!.action).toBe("reroute");
   expect(classify(task({ ...m, supervisor_requeued: "yes" }), ctx())!.action).toBe("escalate");
+});
+
+import { trackedPrs } from "../src/supervisor";
+test("trackedPrs reads PR urls from spec and repo #N from title, not from run logs", () => {
+  const body = "PR: https://github.com/huacnlee/noop/pull/182 (branch x)\n\n## Run 2026\nsee https://github.com/longbridge/nsh/pull/9";
+  expect(trackedPrs({ title: "Noop #182：验收并合并", repo: "huacnlee/noop" }, body)).toEqual(["huacnlee/noop#182"]);
+  expect(trackedPrs({ title: "NSH #1846：放大后变糊" }, "no pr yet")).toEqual([]);
+});
+
+
+test("merged PRs wake a task once for acceptance checks instead of completing it", () => {
+  const id = "T-9406-test";
+  const waiting = P("tasks", "waiting", `${id}.md`);
+  const inbox = P("tasks", "inbox", `${id}.md`);
+  const done = P("tasks", "done", `${id}.md`);
+  try {
+    writeDoc(waiting, { id, title: "Verify screenshot", waiting_on: "Need screenshot", wait_kind: "human", created: new Date(NOW).toISOString() }, "PR: https://github.com/huacnlee/noop/pull/182");
+    supervise({}, "test", NOW, () => "OPEN");
+    expect(existsSync(waiting)).toBe(true);
+    supervise({}, "test", NOW, () => "MERGED");
+    expect(existsSync(waiting)).toBe(false);
+    expect(existsSync(done)).toBe(false);
+    const resumed = readDoc(inbox);
+    expect(resumed.meta.resumed).toBe("yes");
+    expect(resumed.body).toContain("Check remaining acceptance criteria");
+    rmSync(inbox);
+    writeDoc(waiting, { ...resumed.meta, waiting_on: "Need screenshot" }, resumed.body!);
+    supervise({}, "test", NOW, () => { throw new Error("Must not recheck a handled merge"); });
+    expect(existsSync(waiting)).toBe(true);
+    expect(existsSync(inbox)).toBe(false);
+  } finally {
+    for (const path of [waiting, inbox, done]) rmSync(path, { force: true });
+  }
 });

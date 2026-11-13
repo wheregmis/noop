@@ -1,5 +1,6 @@
 // noop: the server's shapes and the pure logic of the timeline (no UI, no I/O), shared by App.tsx and the tests.
 import { L } from "./i18n";
+import { isWaiting } from "./badge";
 
 export type Kind = "notice" | "decision" | "menu" | "proposals" | "login" | "owner" | "system";
 
@@ -222,7 +223,7 @@ export function merge(events: HubEvent[], incoming: HubEvent[]): HubEvent[] {
 }
 
 /** Decisions waiting for the owner (held decisions and proposals). */
-export const waiting = (s: Status | null) => (s?.decisions ?? []).filter((d) => d.held || d.kind === "proposals");
+export const waiting = (s: Status | null) => (s?.decisions ?? []).filter(isWaiting);
 
 export const osOf = (h: HostInfo) => (h.caps.find((c) => c.startsWith("os:")) ?? "").slice(3);
 export const loadOf = (h: HostInfo) => Math.max(0, Math.min(100, Math.round((h.stats?.loadRatio ?? 0) * 100)));

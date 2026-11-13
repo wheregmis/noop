@@ -26,6 +26,28 @@ export function accounts(cfg: Cfg, cli: string): Account[] {
   return list.length ? list : [{ cli, name: "default", dir: "", default: true }];
 }
 
+/** Claude Code can authenticate through an API gateway instead of an Anthropic OAuth login: the `env` block of
+ *  settings.json (or the inherited environment) sets ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN. `claude
+ *  setup-token` only performs the OAuth dance and cannot finish there, so an auth-shaped failure must not park
+ *  the account behind a login link that can never complete. Returns what makes the account gateway-backed. */
+export function gatewayAuth(dir: string, env: Record<string, string | undefined> = process.env): string | null {
+  let fileEnv: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))?.env;
+    if (parsed && typeof parsed === "object") fileEnv = Object.fromEntries(Object.entries(parsed).filter(([, v]) => typeof v === "string")) as Record<string, string>;
+  } catch {}
+  const merged = { ...fileEnv, ...env };
+  if (merged.ANTHROPIC_AUTH_TOKEN) return "auth-token";
+  if (merged.ANTHROPIC_API_KEY) return "api-key";
+  const base = merged.ANTHROPIC_BASE_URL;
+  return base && !/^https?:\/\/api\.anthropic\.com(\/|$)/.test(base) ? "base-url" : null;
+}
+
+function usesGateway(a: Account): boolean {
+  if (a.cli !== "claude") return false;
+  return !!gatewayAuth(a.default ? join(homedir(), ".claude") : a.dir);
+}
+
 /** When the CLI's login was last written: a new login (another account) changes it. */
 function credStamp(a: Account): number {
   const dir = a.default ? join(homedir(), a.cli === "claude" ? ".claude" : ".codex") : a.dir;
@@ -115,6 +137,7 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
   const host = hostName(cfg);
   st.last_error = output.slice(-300);
   st.cred = credStamp(a);
+  const gateway = kind === "auth" && usesGateway(a);
   if (kind === "quota") {
     st.cooldown_until = resetTime(output).toISOString();
     journal(host, `${key(a)} hit usage limit → cooldown until ${st.cooldown_until.slice(11, 16)}Z`);
@@ -127,12 +150,24 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
         L(`To recover now: run ${a.cli === "claude" ? "claude /login" : "codex login"} on this machine to switch account; it is picked up automatically.`, `想马上恢复：在这台机器上运行 ${a.cli === "claude" ? "claude /login" : "codex login"} 换个账号，登录后会自动接着用，不用等。`)].join("\n"),
         cfg, { kind: "notice" });
     }
+  } else if (gateway) {
+    // Gateway/API-key auth has no OAuth login to refresh. Retrying `claude setup-token` against a gateway 401s,
+    // which used to mail a dead login link every 30 minutes while parking the account forever.
+    st.needs_login = false;
+    st.cooldown_until = new Date(Date.now() + 60 * 60_000).toISOString();
+    const day = new Date().toISOString().slice(0, 10);
+    if (st.told !== `gateway:${day}`) {
+      st.told = `gateway:${day}`;
+      journal(host, `${key(a)} gateway auth failed → cooldown 1h (no OAuth login for gateway accounts)`);
+      void notify([L(`Claude (${host}) uses an API gateway (ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN) and the gateway rejected the token. Tasks go to Codex for now. No login link will be sent: fix the gateway or the token in ~/.claude/settings.json.`,
+        `Claude（${host}）使用 API 网关鉴权（ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN），网关拒绝了令牌，任务暂时交给 Codex。这里不适用 OAuth 登录，不会再发登录链接；请检查网关是否在运行，以及 ~/.claude/settings.json 里的令牌。`)].join("\n"), cfg, { kind: "notice" });
+    }
   } else {
     st.needs_login = true;
     journal(host, `🔑 ${key(a)} needs login`);
   }
   save(s);
-  if (kind === "auth") await startLogin(a, cfg);
+  if (kind === "auth" && !gateway) await startLogin(a, cfg);
   await alertIfAllExhausted(cfg);
 }
 
@@ -238,9 +273,20 @@ export async function retryLogins(cfg: Cfg) {
   const s = load();
   for (const cli of ["claude", "codex"]) for (const a of accounts(cfg, cli)) {
     const st = s.accounts[key(a)];
+    if (!st?.needs_login || pending.size || !Bun.which(cli)) continue;
+    if (usesGateway(a)) {
+      // A gateway account signs in with its gateway token; setup-token can never finish. Clear a stale flag
+      // (left by an older build) and let the next task try instead of sending another dead link.
+      const cur = load();
+      cur.accounts[key(a)] = { ...st, needs_login: false, told: undefined };
+      save(cur);
+      journal(hostName(cfg), `${key(a)} is gateway-authenticated; cleared the stale login flag instead of sending an OAuth link`);
+      continue;
+    }
     // back off: a login that exits immediately would otherwise send a new link every tick
     if (Date.now() - (lastLoginTry.get(key(a)) ?? 0) < 30 * 60_000) continue;
-    if (st?.needs_login && !pending.size && Bun.which(cli)) { lastLoginTry.set(key(a), Date.now()); await startLogin(a, cfg); }
+    lastLoginTry.set(key(a), Date.now());
+    await startLogin(a, cfg);
   }
 }
 

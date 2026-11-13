@@ -44,8 +44,6 @@ command = ["$W/fake-agent"]
 cli = "claude"
 [autonomy]
 batch_minutes = 0
-[clis]
-routine_agents = []
 [idle]
 enabled = false
 F
