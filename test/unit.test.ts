@@ -362,6 +362,55 @@ test("an empty completion (no text, no tool call, exit 0) is retried once instea
   }
 }, 20_000);
 
+test("a run that never reached the API is retried once instead of failing the task", async () => {
+  // A DNS or connection blip makes the CLI exit non-zero after burning no tokens and touching nothing; without a
+  // rerun one blip ends every task running at that moment with no result and wakes the medic.
+  const dir = mkdtempSync(`${tmpdir()}/noop-unreachable-`);
+  const mark = `${dir}/ran`;
+  const down = JSON.stringify({ type: "result", is_error: true, api_error: "connection_failed",
+    result: "API Error: Can't reach the API server \u2014 check your internet or DNS (ENOTFOUND)" });
+  const block = JSON.stringify({ type: "result", result: '```json\n{"status":"done","summary":"second try"}\n```' });
+  // first spawn: the connection failure and exit 1; second one: the normal result (a marker file carries the state)
+  const script = `const fs = require("node:fs");`
+    + `if (fs.existsSync(${JSON.stringify(mark)})) process.stdout.write(${JSON.stringify(`${block}\n`)});`
+    + `else { fs.writeFileSync(${JSON.stringify(mark)}, ""); process.stdout.write(${JSON.stringify(`${down}\n`)}); process.exit(1); }`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const res = parseResult(await runAgent("fake", "prompt", dir, cfg, log));
+    expect(res).toMatchObject({ status: "done", summary: "second try" });
+    expect(readFileSync(log, "utf8")).toContain("[retried after an unreachable API]");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("a failed run that already did work is not retried, however its text reads", async () => {
+  // The medic reports connection errors in its own result text. Replaying a run that ran a tool would repeat its
+  // side effects, so only a run that did nothing at all may be spawned again.
+  const dir = mkdtempSync(`${tmpdir()}/noop-unreachable-work-`);
+  const counter = `${dir}/n`;
+  const lines = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "curl api" } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "down" }] } },
+    { type: "result", result: "the host could not resolve the API (ENOTFOUND)" },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const script = `const fs = require("node:fs");`
+    + `const p = ${JSON.stringify(counter)};`
+    + `fs.writeFileSync(p, String(Number(fs.existsSync(p) ? fs.readFileSync(p, "utf8") : 0) + 1));`
+    + `process.stdout.write(${JSON.stringify(`${lines}\n`)}); process.exit(1);`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script, "stream-json"] } } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const out = await runAgent("fake", "prompt", dir, cfg, log);
+    expect(out).toContain("ENOTFOUND");
+    expect(Number(readFileSync(counter, "utf8"))).toBe(1);
+    expect(readFileSync(log, "utf8")).not.toContain("[retried after");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
 test("a completed tool call with an empty result is not retried", async () => {
   // A stream that already ran a tool and then ended with result:"" must not be replayed: the first run may have
   // posted, committed, or done other work, and a fresh prompt would repeat it.

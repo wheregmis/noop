@@ -27,7 +27,7 @@ env:
   # `nightly` builds against the commit of the current NSH nightly release and reuses its prebuilt CLI and runtimes,
   # so a release does not compile NSH. Pin a commit only when Noop needs NSH changes the nightly does not have yet.
   # Every job resolves it the same way, so all client runtimes and the OTA package share one commit.
-  NSH_REF: e3155be6f1b59f0b6e0b7c912aa679d1f20a74ac
+  NSH_REF: nightly
 
 defaults:
   run:

@@ -10,7 +10,7 @@
             email OTP login · Web Push
                 ▲                                  ▲
                 │ outbound HTTPS                   │
-       primary (always-on Linux)            workers (macOS, Windows)
+       primary (macOS / Linux, always on)  workers (macOS, Linux, Windows)
        routines, triage, judge, agents      claim tasks when online
 ```
 

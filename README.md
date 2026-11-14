@@ -17,13 +17,15 @@ Noop runs a small team of Claude Code and Codex agents on your own computers. Th
 
 ## Install
 
-On an always-on Linux machine, once — it becomes the primary:
+On an always-on macOS or Linux machine, once — it becomes the primary:
 
 ```bash
 curl -fsSL https://huacnlee.github.io/noop/install.sh | bash -s -- --primary
 ```
 
 You'll be asked to log in to your Cloudflare account once (the free plan is enough).
+
+On macOS, install from a terminal in your logged-in desktop session. Noop starts at login using a launchd agent and prevents idle sleep while running. Keep the primary Mac logged in and awake; sleep, logout or closing the lid pauses scheduling and chat processing until it returns. The same `--primary` command works on both platforms.
 
 Add more machines whenever you like — they help when they're online and are never waited for:
 

@@ -173,6 +173,9 @@ export function stripImages(line: string): string {
   return hit ? JSON.stringify(e) : line;
 }
 
+/** A run that died before reaching the provider — no tokens spent, no tool ran, so it is safe to spawn again. */
+const UNREACHABLE = /Can't reach the API server|connection_failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|getaddrinfo/i;
+
 /** Marker runAgent appends when it stopped a run that went quiet (see stall_minutes). */
 export const STALLED = "\n[stalled]";
 
@@ -272,10 +275,16 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   // Do not retry when the run already used a tool or printed visible assistant text: an empty final result can still
   // sit on top of side effects (a posted comment, a commit), and replaying the prompt would repeat them. `out` is only
   // the final/assistant text, so also require act.steps === 0 and no accumulated assistantText.
-  if (retryEmpty && !out.trim() && !code && !act.steps && !assistantText.trim()) {
+  // The same holds for a run that never reached the provider: a DNS or connection failure kills every task running at
+  // that moment, and the CLI exits non-zero having burnt no tokens and touched nothing, so replaying is free of side
+  // effects. The second spawn re-resolves DNS and walks the CLI's own connect retries again.
+  const nothingRan = !act.steps && !assistantText.trim();
+  const unreachable = nothingRan && !!code && UNREACHABLE.test(`${out}\n${err}`);
+  if (retryEmpty && nothingRan && (unreachable || (!out.trim() && !code))) {
     const first = readFileSync(logFile, "utf8");
     const again = await runAgent(cli, prompt, cwd, cfg, logFile, gateOverride, extraEnv, false);
-    writeFileSync(logFile, `${first}\n\n[retried after an empty response]\n${readFileSync(logFile, "utf8")}`); // keep both attempts
+    const why = unreachable ? "an unreachable API" : "an empty response";
+    writeFileSync(logFile, `${first}\n\n[retried after ${why}]\n${readFileSync(logFile, "utf8")}`); // keep both attempts
     return again;
   }
   return out + (code ? `\n[exit ${code}] ${err.slice(-2000)}` : "");

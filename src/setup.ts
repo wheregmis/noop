@@ -155,6 +155,28 @@ export async function selfUpdate(opts: { busy?: number; force?: boolean; deploy?
 /** Machines installed before the rename keep their service name. */
 export const SERVICE = existsSync(join(homedir(), ".config/systemd/user/agent-hub.service")) || existsSync(join(homedir(), "Library/LaunchAgents/com.agent-hub.daemon.plist")) ? "agent-hub" : "noop";
 const LABEL = SERVICE === "agent-hub" ? "com.agent-hub.daemon" : "dev.noop.daemon";
+/** Write a launch agent without loading it; also supports fresh macOS accounts. */
+export function writeMacAgent(home: string, data: string, bun: string, cli: string, path: string, label: string): string {
+  const xml = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+  const plist = join(home, `Library/LaunchAgents/${label}.plist`);
+  mkdirSync(join(plist, ".."), { recursive: true });
+  mkdirSync(join(data, "logs"), { recursive: true });
+  writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${xml(label)}</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>${xml(bun)}</string><string>${xml(cli)}</string><string>daemon</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(path)}</string><key>HUB_DATA</key><string>${xml(data)}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${xml(join(data, "logs", "daemon.log"))}</string>
+  <key>StandardErrorPath</key><string>${xml(join(data, "logs", "daemon.log"))}</string>
+</dict></plist>
+`);
+  return plist;
+}
+
 export async function install() {
   const bun = Bun.which("bun") ?? join(homedir(), ".bun/bin/bun");
   const cli = join(CODE, "src", "cli.ts");
@@ -194,24 +216,10 @@ WantedBy=default.target
   24/7:   linger enabled (runs with no one logged in). To prevent sleep on this always-on box:
           sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`);
   } else if (process.platform === "darwin") {
-    const plist = join(homedir(), `Library/LaunchAgents/${LABEL}.plist`);
-    writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>${bun}</string><string>${cli}</string><string>daemon</string></array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${path}</string><key>HUB_DATA</key><string>${DATA}</string></dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>${join(DATA, "logs", "daemon.log")}</string>
-  <key>StandardErrorPath</key><string>${join(DATA, "logs", "daemon.log")}</string>
-</dict></plist>
-`);
-    mkdirSync(join(DATA, "logs"), { recursive: true });
+    const plist = writeMacAgent(homedir(), DATA, bun, cli, path, LABEL);
     await $`launchctl bootout gui/${process.getuid!()} ${plist}`.quiet().nothrow();
-    await $`launchctl bootstrap gui/${process.getuid!()} ${plist}`.nothrow();
-    console.log(`✔ launchd agent installed: ${plist} (caffeinate -i keeps it awake while plugged in; when the lid closes the fleet simply continues without this Mac)`);
+    await $`launchctl bootstrap gui/${process.getuid!()} ${plist}`;
+    console.log(`✔ launchd agent installed: ${plist} (starts at login; caffeinate -i prevents idle sleep). Keep a primary Mac logged in and awake: sleep, logout or closing the lid pauses coordination until it returns.`);
   } else if (process.platform === "win32") {
     const cmd = `"${bun}" "${cli}" daemon`;
     await $`schtasks /Create /F /SC ONLOGON /RL LIMITED /TN ${SERVICE} /TR ${cmd}`.nothrow();

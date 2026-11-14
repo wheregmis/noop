@@ -12,7 +12,7 @@ const canonical = new URL(asset(language === 'en' ? '' : 'zh-CN/'), Astro.site);
 const site = 'https://huacnlee.github.io/noop';
 const latest = `${repo}/releases/latest/download`;
 const panels = [
-  { id: 'first', label: t.first, note: t.firstNote, requirements: t.requirements, rows: [{ label: 'Linux', script: 'install.sh', command: `curl -fsSL ${site}/install.sh | bash -s -- --primary` }] },
+  { id: 'first', label: t.first, note: t.firstNote, requirements: t.requirements, rows: [{ label: 'macOS / Linux', script: 'install.sh', command: `curl -fsSL ${site}/install.sh | bash -s -- --primary` }] },
   { id: 'more', label: t.more, note: t.moreNote, requirements: t.requirements, rows: [
     { label: 'macOS / Linux', script: 'install.sh', command: `curl -fsSL ${site}/install.sh | bash` },
     { label: 'Windows', script: 'install.ps1', command: `irm ${site}/install.ps1 | iex` },
